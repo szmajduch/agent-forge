@@ -17,6 +17,12 @@ forge_root() {
 }
 
 ROOT="$(forge_root)"
+
+# forge is itself a git repo, so running forge-* inside the tool directory would
+# treat the tool as the project and create state there. Catch that early.
+if [[ "$ROOT" == "$FORGE_HOME" ]]; then
+  die "run forge-* from your project repo, not from the forge tool directory ($FORGE_HOME)"
+fi
 STATE="$ROOT/.forge"
 WT_ROOT="${FORGE_WT_ROOT:-$(dirname "$ROOT")/.forge-wt/$(basename "$ROOT")}"
 

@@ -20,6 +20,9 @@ Folder `forge` to narzędzie wspólne dla wszystkich projektów. Trzymaj go w je
 miejscu (np. `~/tools/forge`), **nie kopiuj go do repo**. Do projektów trafiają tylko pliki
 z `forge-init` (sekcja niżej).
 
+Komendy `forge-*` uruchamiaj **w repozytorium projektu**, nie w katalogu narzędzia —
+inaczej forge potraktowałby sam siebie jako projekt. Jest na to blokada z komunikatem.
+
 ```bash
 # zależności
 brew install tmux jq git python
