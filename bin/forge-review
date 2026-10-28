@@ -2,7 +2,21 @@
 # forge-review <name> [--stat]  — diff of the worker's branch against where it started.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 [[ $# -ge 1 ]] || die "usage: forge-review <name> [--stat]"
-name="$1"; valid_name "$name"
+
+# Parsed like the other commands: a flag is accepted on either side of the name
+# and a misspelled one is refused, rather than silently printing the full diff.
+stat_only=0; name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --stat) stat_only=1; shift ;;
+    --) shift ;;
+    --*) die "unknown option $1 (usage: forge-review <name> [--stat])" ;;
+    *) [[ -z "$name" ]] || die "too many arguments: '$1' (usage: forge-review <name> [--stat])"
+       name="$1"; shift ;;
+  esac
+done
+[[ -n "$name" ]] || die "usage: forge-review <name> [--stat]"
+valid_name "$name"
 base_sha="$(agent_get "$name" base_sha)"
 branch="$(agent_get "$name" branch)"
 
@@ -14,5 +28,5 @@ rp="$(agent_get "$name" report_path)"
 [[ -n "$rp" ]] && { echo "(full report committed at: $rp)"; echo; }
 echo "## commits"; git -C "$ROOT" log --oneline "$base_sha..$branch"
 echo "## diffstat"; git -C "$ROOT" diff --stat "$base_sha...$branch"
-[[ "${2:-}" == "--stat" ]] && exit 0
+[[ $stat_only -eq 1 ]] && exit 0
 echo "## diff"; git -C "$ROOT" diff "$base_sha...$branch"

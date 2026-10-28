@@ -7,6 +7,7 @@
 #   analysis  — reads and reasons. The deliverable IS the report, so it is kept
 #               in the tree (reports/<name>.md) and committed like any artifact.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
+[[ $# -ge 1 ]] || die "usage: forge-run <name>   (internal: started by forge-spawn)"
 name="$1"; valid_name "$name"
 
 wt="$(agent_get "$name" worktree)"

@@ -6,11 +6,20 @@ json=0
 [[ "${1:-}" == "--json" ]] && { json=1; shift; }
 
 shopt -s nullglob
-files=("$STATE"/agents/*.json)
-[[ -n "${1:-}" ]] && files=("$(agent_file "$1")")
+files=()
+if [[ -n "${1:-}" ]]; then
+  valid_name "$1"
+  f="$(agent_file "$1")"
+  [[ -f "$f" ]] || die "no such agent: $1"
+  files=("$f")
+else
+  files=("$STATE"/agents/*.json)
+fi
 
+# With no agents the array is empty, so it must not be expanded unquoted under
+# `set -u`, and jq must still produce valid JSON for --json consumers.
 if [[ $json -eq 1 ]]; then
-  jq -s '.' "${files[@]}" 2>/dev/null || echo '[]'
+  if [[ ${#files[@]} -eq 0 ]]; then echo '[]'; else jq -s '.' "${files[@]}"; fi
   exit 0
 fi
 

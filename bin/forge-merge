@@ -5,7 +5,21 @@
 # and branch unless --keep. Aborts cleanly on conflicts.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 [[ $# -ge 1 ]] || die "usage: forge-merge <name> [--keep]"
-name="$1"; valid_name "$name"; keep="${2:-}"
+
+# Removing the worktree and branch is the default, so an unrecognised flag must
+# not be read as "no --keep" — a typo like --kep would silently discard them.
+keep=0; name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --keep) keep=1; shift ;;
+    --) shift ;;
+    --*) die "unknown option $1 (usage: forge-merge <name> [--keep])" ;;
+    *) [[ -z "$name" ]] || die "too many arguments: '$1' (usage: forge-merge <name> [--keep])"
+       name="$1"; shift ;;
+  esac
+done
+[[ -n "$name" ]] || die "usage: forge-merge <name> [--keep]"
+valid_name "$name"
 
 status="$(agent_get "$name" status)"
 [[ "$status" == "done" || "$status" == "conflict" ]] || die "agent '$name' is '$status' — only done (or conflict, after you fixed it) can be merged"
@@ -16,6 +30,7 @@ git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet \
   || die "main repo has uncommitted changes; commit or stash them first"
 
 target="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+
 if ! git -C "$ROOT" merge --no-ff -q -m "forge: merge $branch ($(agent_get "$name" title))" "$branch"; then
   git -C "$ROOT" merge --abort || true
   agent_set "$name" status=conflict
@@ -25,7 +40,7 @@ fi
 agent_set "$name" status=merged merged_into="$target" merged_sha="$(git -C "$ROOT" rev-parse --short HEAD)"
 echo "merged $branch into $target"
 
-if [[ "$keep" != "--keep" ]]; then
+if [[ $keep -eq 0 ]]; then
   tmux kill-window -t "$FORGE_SESSION:$name" 2>/dev/null || true
   git -C "$ROOT" worktree remove --force "$wt"
   git -C "$ROOT" branch -q -d "$branch"

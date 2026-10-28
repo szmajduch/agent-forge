@@ -3,7 +3,9 @@
 # Irreversible for uncommitted/unmerged work. The orchestrator must ask the
 # operator before calling this.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
-[[ $# -ge 1 ]] || die "usage: forge-drop <name>"
+# This discards work, so it takes exactly one name: an extra argument means the
+# caller meant something else and should see that, not have a worker dropped.
+[[ $# -eq 1 ]] || die "usage: forge-drop <name>   (exactly one agent)"
 name="$1"; valid_name "$name"
 branch="$(agent_get "$name" branch)"
 wt="$(agent_get "$name" worktree)"
