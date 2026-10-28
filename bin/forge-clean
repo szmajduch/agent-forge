@@ -1,0 +1,126 @@
+#!/usr/bin/env bash
+# forge-clean [--merged|--dropped|--finished|--all] [--yes] [--dry-run]
+#
+# Removes finished workers' leftovers: state files in .forge/, and the worktree
+# and branch of workers that kept them (a `failed` worker keeps both on purpose,
+# for inspection — nothing else clears them).
+#
+# Default scope is --merged: the one case where the work is provably safe to
+# forget, because it is in the target branch's history.
+#
+#   --merged    merged workers only                       (default)
+#   --dropped   merged + dropped
+#   --finished  the above + done / nochanges / failed      — unmerged work!
+#   --all       every worker, including queued and running — stops them first
+#
+# A scope that can destroy unmerged work asks before acting unless --yes.
+# --dry-run prints what would go and changes nothing.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+
+scope="merged"; assume_yes=0; dry=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --merged|--dropped|--finished|--all) scope="${1#--}"; shift ;;
+    --yes|-y) assume_yes=1; shift ;;
+    --dry-run|-n) dry=1; shift ;;
+    --) shift ;;
+    *) die "unknown option $1 (usage: forge-clean [--merged|--dropped|--finished|--all] [--yes] [--dry-run])" ;;
+  esac
+done
+
+case "$scope" in
+  merged)   statuses="merged" ;;
+  dropped)  statuses="merged dropped" ;;
+  finished) statuses="merged dropped done nochanges failed" ;;
+  all)      statuses="merged dropped done nochanges failed conflict queued running" ;;
+esac
+
+in_scope() { # in_scope <status>
+  local s
+  for s in $statuses; do [[ "$1" == "$s" ]] && return 0; done
+  return 1
+}
+
+shopt -s nullglob
+names=(); risky=()
+for f in "$STATE"/agents/*.json; do
+  n="$(jq -r '.name // empty' "$f")"
+  [[ -n "$n" ]] || continue
+  st="$(jq -r '.status // empty' "$f")"
+  in_scope "$st" || continue
+  names+=("$n")
+  # Anything not merged or dropped may hold work that exists nowhere else.
+  case "$st" in merged|dropped) ;; *) risky+=("$n ($st)") ;; esac
+done
+
+if [[ ${#names[@]} -eq 0 ]]; then
+  echo "nothing to clean (scope: --$scope)"
+  exit 0
+fi
+
+echo "would remove ${#names[@]} worker(s) — scope --$scope:"
+for n in "${names[@]}"; do
+  st="$(agent_get "$n" status)"
+  wt="$(agent_get "$n" worktree)"
+  br="$(agent_get "$n" branch)"
+  extra=""
+  [[ -n "$wt" && -d "$wt" ]] && extra="$extra worktree"
+  git -C "$ROOT" show-ref --quiet "refs/heads/$br" 2>/dev/null && extra="$extra branch"
+  tmux list-windows -t "$FORGE_SESSION" -F '#W' 2>/dev/null | grep -qxF "$n" && extra="$extra tmux-window"
+  printf '  %-18s %-10s state%s\n' "$n" "$st" "$extra"
+done
+
+if [[ $dry -eq 1 ]]; then
+  echo
+  echo "(--dry-run: nothing was changed)"
+  exit 0
+fi
+
+# Unmerged work is irreplaceable, so it is never removed on a bare command.
+if [[ ${#risky[@]} -gt 0 && $assume_yes -eq 0 ]]; then
+  echo
+  echo "WARNING: these are not merged — their work exists only in their branch:"
+  printf '  %s\n' "${risky[@]}"
+  echo
+  printf 'Type the word "delete" to proceed: '
+  # A closed stdin (a script, a pipe) must abort rather than fall through: read
+  # fails without setting answer, and `set -e` would otherwise end the script
+  # here silently, with no explanation of why nothing was removed.
+  answer=""
+  read -r answer || true
+  echo
+  [[ "$answer" == "delete" ]] || die "aborted — nothing removed"
+fi
+
+removed=0
+for n in "${names[@]}"; do
+  st="$(agent_get "$n" status)"
+  wt="$(agent_get "$n" worktree)"
+  br="$(agent_get "$n" branch)"
+
+  # A running worker must be stopped first, or it would keep writing state
+  # files back after we delete them.
+  tmux kill-window -t "$FORGE_SESSION:$n" 2>/dev/null || true
+
+  if [[ -n "$wt" && -d "$wt" ]]; then
+    git -C "$ROOT" worktree remove --force "$wt" 2>/dev/null \
+      || { rm -rf "$wt"; git -C "$ROOT" worktree prune; }
+  fi
+  if [[ -n "$br" ]] && git -C "$ROOT" show-ref --quiet "refs/heads/$br" 2>/dev/null; then
+    # -D, not -d: by this point the operator has confirmed the scope, and -d
+    # would refuse exactly the unmerged branches they asked to remove.
+    git -C "$ROOT" branch -q -D "$br" 2>/dev/null || true
+  fi
+
+  rm -f "$STATE/agents/$n.json" "$STATE/tasks/$n.md" \
+        "$STATE/logs/$n.log" "$STATE/logs/$n.report.md"
+  removed=$((removed+1))
+  echo "removed $n ($st)"
+done
+
+git -C "$ROOT" worktree prune
+echo
+echo "cleaned $removed worker(s)"
+# An empty worktree namespace left behind is just noise.
+[[ -d "$WT_ROOT" ]] && rmdir "$WT_ROOT" 2>/dev/null || true
+exit 0

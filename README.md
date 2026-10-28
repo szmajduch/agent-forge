@@ -57,6 +57,7 @@ Wszystkie komendy `forge-*` to skrypty z katalogu `bin/` tego zestawu (nie zewn�
 cd ~/code/moj-projekt
 forge-init                       # PROJECT.md, CLAUDE.md, AGENTS.md, FORGE.md, .claude/settings.json
 git add -A && git commit -m "forge setup"   # ważne: workerzy startują z commita, muszą widzieć AGENTS.md
+forge-doctor                     # sprawdza, czy wszystko jest gotowe (zależności, pliki ról, modele)
 forge-up                         # otwiera sesję tmux z Claude Code w oknie 0
 ```
 
@@ -207,11 +208,16 @@ przyjęte są wszystkie sześć poziomów, a nazwa spoza listy jest odrzucana.
 | `forge-status [--json] [name]` | tabela workerów; z nazwą — raport i ostatnie linie logu |
 | `forge-review <name> [--stat]` | raport workera, commity, diff względem punktu startu |
 | `forge-merge <name> [--keep]` | `merge --no-ff` do bieżącego brancha; przy konflikcie robi abort i oznacza `conflict` |
+| `forge-cancel <name>` | zatrzymuje workera, ale **zachowuje** branch i commituje to, co już zrobił |
 | `forge-drop <name>` | **odrzuca** pracę workera (okno, worktree, branch) — Claude musi pytać |
+| `forge-clean [--merged\|--dropped\|--finished\|--all] [--yes] [--dry-run]` | sprząta po skończonych workerach: pliki stanu, worktree, branche |
+| `forge-doctor [--spawn]` | sprawdza, czy wszystko jest gotowe, zanim zlecisz pierwsze zadanie |
 | `forge-up [-d]` | startuje całą sesję |
 | `forge-init` | instaluje pliki ról w repo |
+| `test/forge-test [filtr]` | testy end-to-end całego zestawu (atrapa `codex`, nic nie dzwoni do modelu) |
 
-Statusy workera: `queued → running → done | nochanges | failed`, potem `merged | conflict | dropped`.
+Statusy workera: `queued → running → done | nochanges | failed`, potem
+`merged | conflict | cancelled | dropped`.
 `nochanges` znaczy, że worker nic nie wniósł — dla typu build brak zmian w kodzie,
 dla analysis brak raportu. Worker analityczny, który napisał raport, kończy jako `done`.
 Stan leży w `.forge/` (automatycznie wykluczone z gita przez `.git/info/exclude`),
@@ -257,12 +263,27 @@ to decyzja operatora.
 ## Zanim zlecisz pierwsze zadanie
 
 Cztery awarie na pięć uruchomień w sesji 2026-10-28 wyszłyby na jednym
-próbnym spawnie. Sprawdź po kolei:
+próbnym spawnie. Dlatego jest `forge-doctor` — jedna komenda zamiast listy
+ręcznych sprawdzeń:
 
 ```bash
-forge-models                 # czy komenda istnieje (jeśli nie: ./install.sh)
-codex exec -s workspace-write "echo ok"   # czy CLI przyjmuje te flagi
+forge-doctor            # zależności, pliki ról, czy są scommitowane, modele, końce linii
+forge-doctor --spawn    # dodatkowo jedno prawdziwe wywołanie codexa (kilka sekund)
 ```
+
+Kody wyjścia: `0` wszystko gra, `2` tylko ostrzeżenia, `1` coś jest zepsute.
+Dwa ostrzeżenia warte uwagi, bo nie widać ich inaczej niż po śmierci workera:
+
+- **„invisible to workers"** — pliki ról nie są scommitowane. Worker startuje
+  z commita, więc niescommitowany `AGENTS.md` dla niego nie istnieje.
+- **„PROJECT.md is still the unfilled stub"** — nie ma zdefiniowanego checku
+  akceptacyjnego, więc każdy worker build wymyśli własny.
+
+Co `forge-doctor` wyłapuje poza tym: brakujące zależności, launchery w
+`~/.local/bin` wskazujące na przeniesiony katalog forge, `CLAUDE.md` jako
+symlink do `AGENTS.md` (oba narzędzia dostają wtedy rolę drugiego), `@FORGE.md`
+w `AGENTS.md`, `default` w `models.conf` spoza listy modeli, oraz
+`core.autocrlf`, który psuje testy tylko u workerów.
 
 - **`error: unexpected argument '--full-auto'`** — masz Codex CLI ≥ 0.163.0,
   gdzie tej flagi już nie ma. Domyślna wartość w forge to teraz
@@ -286,6 +307,63 @@ codex exec -s workspace-write "echo ok"   # czy CLI przyjmuje te flagi
 **Status `done` nie znaczy, że jest produkt.** Worker może skończyć z commitem,
 którego jedyną treścią jest raport „nie dało się nic zmierzyć". Zawsze czytaj
 raport, nie tylko status.
+
+## Zatrzymywanie i sprzątanie
+
+**`forge-cancel` vs `forge-drop`.** Oba zatrzymują workera, ale różnią się tym,
+co zostaje:
+
+| | worker | branch i worktree | to, co już zrobił |
+|---|---|---|---|
+| `forge-cancel <name>` | zatrzymany | **zostają** | **commitowane** jako `[agent:<name>] cancelled: partial work` |
+| `forge-drop <name>` | zatrzymany | usunięte | przepada bezpowrotnie |
+
+`forge-cancel` jest do sytuacji „idzie w złą stronę / utknął / zadanie się
+zmieniło, ale chcę zobaczyć, co zrobił". Status `cancelled` można zmergować
+(`forge-merge` ostrzega, że check akceptacyjny nigdy nie przeszedł) albo
+odrzucić później przez `forge-drop`.
+
+**`forge-clean`** sprząta po skończonych workerach — pliki stanu w `.forge/`
+oraz worktree i branche tych, które je zachowały. Worker ze statusem `failed`
+zostawia worktree **celowo**, do wglądu, i nic innego go nie usuwa.
+
+```bash
+forge-clean                       # tylko zmergowane — bezpieczne, to domyślny zakres
+forge-clean --dry-run             # pokaż, co by poszło, nie zmieniaj nic
+forge-clean --dropped             # + porzucone
+forge-clean --finished            # + done/nochanges/failed — TO JEST NIEZMERGOWANA PRACA
+forge-clean --all                 # + queued/running (najpierw je zatrzyma)
+```
+
+Każdy zakres szerszy niż `--merged` może usunąć pracę, która nie istnieje nigdzie
+indziej, więc pyta o potwierdzenie — trzeba wpisać słowo `delete`. `--yes`
+pomija pytanie (do skryptów).
+
+**Limit równoległych workerów.** `forge-spawn` odmawia startu, gdy biegnie już
+`FORGE_MAX_WORKERS` (domyślnie 4):
+
+```
+forge: 4 worker(s) already active (limit 4): a b c d
+```
+
+To limit w kodzie, nie prośba w prompcie — każdy worker to model plus jego check
+akceptacyjny, więc niekontrolowany fan-out potrafi położyć maszynę. Podnieś go
+przez `FORGE_MAX_WORKERS=6`, albo obejdź jednorazowo przez `--force`.
+`FORGE_MAX_WORKERS=0` wyłącza limit.
+
+## Testy
+
+```bash
+test/forge-test             # wszystko
+test/forge-test merge       # tylko testy, których nazwa zawiera "merge"
+```
+
+Każdy test dostaje własne repo w katalogu tymczasowym i **atrapę `codex`**, więc
+nic nie dzwoni do modelu i nic nie dotyka twoich projektów. Sesja tmux i katalog
+worktree są unikalne per uruchomienie, więc testy nie kolidują z działającą
+sesją `forge`. Pokrycie: obsługa argumentów każdej komendy, cykl życia workera
+(build/analysis/nochanges/failed), merge z konfliktem i abortem, `--base`,
+`--link`, limit równoległości, `forge-cancel`, `forge-clean`, `forge-doctor`.
 
 ## Wrażliwe dane
 
@@ -336,6 +414,7 @@ rundą, ale traktuje jako sugestie — prośby o zmianę uprawnień czy uruchomi
 | `FORGE_ORCH_CMD` | `claude` | komenda w oknie orkiestratora |
 | `FORGE_KEEP_WINDOW` | `1` | okno workera zostaje otwarte po zakończeniu |
 | `FORGE_REPORT_DIR` | `reports` | katalog na raporty workerów (commitowane) |
+| `FORGE_MAX_WORKERS` | `4` | limit równolegle biegnących workerów (`0` = bez limitu, `--force` = obejście) |
 | `FORGE_WT_ROOT` | `../.forge-wt/<repo>` | gdzie trzymać worktree |
 | `FORGE_DASH_PORT` | `8787` | port dashboardu |
 | `FORGE_DASH_TOKEN` | — | token dostępu do dashboardu |

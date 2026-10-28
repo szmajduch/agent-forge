@@ -1,0 +1,928 @@
+#!/usr/bin/env bash
+# forge-test [name-filter] — end-to-end tests for the forge-* commands.
+#
+# Each test gets a throwaway git repo in a temp dir and a fake `codex` (see
+# fake_codex below), so nothing talks to a real model and nothing touches your
+# projects. The worktree root and tmux session are per-run, so a failed test
+# cannot leave state that breaks the next one.
+#
+# Run:  test/forge-test            all tests
+#       test/forge-test merge      only tests whose name contains "merge"
+set -uo pipefail
+
+HERE="$(cd "$(dirname "$0")" && pwd)"
+FORGE_HOME="$(cd "$HERE/.." && pwd)"
+BIN="$FORGE_HOME/bin"
+FILTER="${1:-}"
+
+# A unique session/worktree namespace per run, so a real "forge" session and a
+# parallel run of this script are never touched.
+RUN_ID="t$$"
+export FORGE_SESSION="forge-test-$RUN_ID"
+TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-test.XXXXXX")"
+
+pass=0; fail=0; failed_names=()
+
+cleanup() {
+  tmux kill-session -t "$FORGE_SESSION" 2>/dev/null || true
+  # Worktrees hold no state we need; force-remove the whole namespace.
+  rm -rf "$TMPROOT"
+}
+trap cleanup EXIT
+
+red()   { printf '\033[31m%s\033[0m\n' "$*"; }
+green() { printf '\033[32m%s\033[0m\n' "$*"; }
+dim()   { printf '\033[2m%s\033[0m\n' "$*"; }
+# Assertion diagnostics go to stderr so a test's own stdout can be suppressed
+# without hiding why it failed.
+err()   { printf '\033[31m%s\033[0m\n' "$*" >&2; }
+
+# --- assertions ---------------------------------------------------------------
+# Every assertion prints what it expected and what it got, so a failure is
+# diagnosable from the log alone without rerunning.
+
+ok() { pass=$((pass+1)); }
+no() { # no <message>
+  fail=$((fail+1)); failed_names+=("$CURRENT_TEST")
+  err "
+    FAIL [$CURRENT_TEST]: $*"
+}
+
+assert_rc() { # assert_rc <expected> <actual> <what>
+  [[ "$1" == "$2" ]] && { ok; return; }
+  no "$3: expected exit $1, got $2"
+}
+
+assert_contains() { # assert_contains <haystack> <needle> <what>
+  case "$1" in *"$2"*) ok ;; *) no "$3: expected to contain '$2', got: $(printf '%s' "$1" | head -3)" ;; esac
+}
+
+assert_eq() { # assert_eq <expected> <actual> <what>
+  [[ "$1" == "$2" ]] && { ok; return; }
+  no "$3: expected '$1', got '$2'"
+}
+
+assert_file() { # assert_file <path> <what>
+  [[ -f "$1" ]] && { ok; return; }
+  no "$2: expected file to exist: $1"
+}
+
+assert_no_file() { # assert_no_file <path> <what>
+  [[ ! -e "$1" ]] && { ok; return; }
+  no "$2: expected path NOT to exist: $1"
+}
+
+# --- fixtures ----------------------------------------------------------------
+
+# A fake codex honouring the same CLI shape forge uses: `codex exec [args] <prompt>`.
+# Behaviour is driven by the mode baked into the script (see write_fake_codex).
+#   ok       — writes a report + a code change, exits 0
+#   report   — writes only a report (analysis worker), exits 0
+#   noop     — changes nothing, exits 0  → expect status "nochanges"
+#   fail     — writes nothing, exits 7   → expect status "failed"
+# The mode and argv-log path are written INTO the script, not passed through the
+# environment: forge-spawn forwards only a whitelist of FORGE_* variables into
+# the worker's tmux window, so an exported FAKE_CODEX_* would never arrive.
+write_fake_codex() { # write_fake_codex <path> [mode] [argv-log]
+  local path="$1" mode="${2:-ok}" argv_log="${3:-}"
+  cat > "$path" <<EOF
+#!/usr/bin/env bash
+MODE="$mode"
+ARGV_LOG="$argv_log"
+EOF
+  cat >> "$path" <<'EOF'
+# Fake codex for forge tests. Records its argv so tests can assert on flags.
+echo "ARGV: $*"
+[[ -n "$ARGV_LOG" ]] && printf '%s\n' "$*" > "$ARGV_LOG"
+name="$(basename "$PWD")"
+case "$MODE" in
+  ok)     mkdir -p reports; echo "# report $name" > "reports/$name.md"
+          echo "change by $name" > "changed-$name.txt" ;;
+  report) mkdir -p reports; echo "# analysis $name" > "reports/$name.md" ;;
+  legacy) echo "# legacy root report" > FORGE_REPORT.md ;;
+  noop)   : ;;
+  fail)   echo "fake codex failure" >&2; exit 7 ;;
+esac
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+# new_repo <dir> — a minimal committed git repo to act as the "project".
+new_repo() {
+  local d="$1"
+  mkdir -p "$d"
+  git -C "$d" init -q -b main
+  git -C "$d" config user.email forge-test@example.invalid
+  git -C "$d" config user.name "forge test"
+  echo "seed" > "$d/README.md"
+  git -C "$d" add -A
+  git -C "$d" commit -qm "init"
+}
+
+# Runs a forge command inside the test repo. Captures stdout+stderr into $OUT
+# and the exit code into $RC, so a failing command never aborts the suite.
+forge() { # forge <command-without-prefix> [args...]
+  local cmd="$1"; shift
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" "$BIN/forge-$cmd" "$@" 2>&1)"
+  RC=$?
+  set -e
+}
+
+# Waits until an agent leaves queued/running, or gives up. forge-run executes
+# asynchronously in tmux, so tests must not assume it finished.
+await() { # await <name> [max_seconds]
+  local name="$1" max="${2:-30}" i=0 st
+  while [[ $i -lt $((max * 4)) ]]; do
+    st="$(cd "$REPO" && "$BIN/forge-status" --json 2>/dev/null \
+          | jq -r --arg n "$name" '.[] | select(.name==$n) | .status' 2>/dev/null)"
+    case "$st" in queued|running|"") ;; *) echo "$st"; return 0 ;; esac
+    sleep 0.25; i=$((i+1))
+  done
+  echo "TIMEOUT(status=$st)"
+  return 1
+}
+
+status_of() { # status_of <name>
+  (cd "$REPO" && "$BIN/forge-status" --json 2>/dev/null \
+    | jq -r --arg n "$1" '.[] | select(.name==$n) | .status')
+}
+
+# --- test driver -------------------------------------------------------------
+# Each test runs in its own repo + worktree namespace. Isolation is per-test on
+# purpose: a test that corrupts state must not cascade into the others.
+run_test() { # run_test <name> <function>
+  local name="$1" fn="$2"
+  case "$name" in *"$FILTER"*) ;; *) return 0 ;; esac
+  CURRENT_TEST="$name"
+  local before_fail=$fail
+
+  REPO="$TMPROOT/$name/repo"
+  FAKEBIN="$TMPROOT/$name/bin"
+  export FORGE_WT_ROOT="$TMPROOT/$name/wt"
+  export FORGE_KEEP_WINDOW=0
+  unset FORGE_CODEX_ARGS FORGE_REPORT_DIR FORGE_BASE FORGE_LINK 2>/dev/null || true
+  mkdir -p "$FAKEBIN"
+  write_fake_codex "$FAKEBIN/codex"           # default mode: ok
+  ARGV_LOG="$TMPROOT/$name/argv.txt"
+  new_repo "$REPO"
+
+  printf '  %-34s' "$name"
+  # Assertion failures print via no(); a test's own stray output is hidden so
+  # the summary stays readable.
+  "$fn" >/dev/null || true
+  if [[ $fail -gt $before_fail ]]; then red "FAIL"; else green "ok"; fi
+}
+
+# A variant that shows assertion messages inline (they are printed by no()).
+run_test_verbose() { run_test "$@"; }
+
+# =============================================================================
+# Tests
+# =============================================================================
+
+# --- regression tests for the argument-handling bugs -------------------------
+
+t_status_json_empty() {
+  forge status --json
+  assert_rc 0 "$RC" "forge-status --json with no agents"
+  assert_eq "[]" "$(printf '%s' "$OUT" | tr -d '[:space:]')" "empty JSON array"
+  # Must be parseable: the orchestrator reads worktree paths out of this.
+  printf '%s' "$OUT" | jq -e 'type == "array"' >/dev/null \
+    && ok || no "forge-status --json output is not valid JSON"
+}
+
+t_status_plain_empty() {
+  forge status
+  assert_rc 0 "$RC" "forge-status with no agents"
+  assert_contains "$OUT" "no agents yet" "empty status message"
+}
+
+t_status_unknown_agent() {
+  forge status nope
+  assert_rc 1 "$RC" "forge-status <unknown>"
+  assert_contains "$OUT" "no such agent" "unknown agent message"
+}
+
+t_status_invalid_name() {
+  forge status "BAD NAME"
+  assert_rc 1 "$RC" "forge-status <invalid name>"
+  assert_contains "$OUT" "invalid agent name" "invalid name message"
+}
+
+t_wait_timeout_missing_value() {
+  forge wait --timeout
+  assert_rc 1 "$RC" "forge-wait --timeout with no value"
+  assert_contains "$OUT" "needs a value" "missing timeout value message"
+}
+
+t_wait_timeout_not_a_number() {
+  forge wait --timeout abc
+  assert_rc 1 "$RC" "forge-wait --timeout abc"
+  assert_contains "$OUT" "whole number" "non-numeric timeout message"
+}
+
+t_wait_timeout_equals_form() {
+  forge wait --timeout=5
+  assert_rc 0 "$RC" "forge-wait --timeout=5 with no agents"
+}
+
+t_wait_unknown_option() {
+  forge wait --bogus
+  assert_rc 1 "$RC" "forge-wait --bogus"
+  assert_contains "$OUT" "unknown option" "unknown option message"
+}
+
+t_run_without_name() {
+  forge run
+  assert_rc 1 "$RC" "forge-run with no argument"
+  assert_contains "$OUT" "usage" "forge-run usage message"
+}
+
+t_drop_rejects_extra_args() {
+  forge drop a b
+  assert_rc 1 "$RC" "forge-drop with two names"
+  assert_contains "$OUT" "exactly one agent" "drop arity message"
+}
+
+# The regression that mattered most: a typo in --keep must not delete the
+# worktree and branch, because removal is the default.
+t_merge_rejects_typo_flag() {
+  forge spawn k1 "typo test"
+  assert_rc 0 "$RC" "spawn for typo test"
+  assert_eq "done" "$(await k1)" "k1 finished"
+
+  forge merge k1 --kep
+  assert_rc 1 "$RC" "forge-merge --kep (typo)"
+  assert_contains "$OUT" "unknown option" "typo flag message"
+  # The whole point: nothing was destroyed.
+  assert_file "$FORGE_WT_ROOT/k1/changed-k1.txt" "worktree kept after refused merge"
+  assert_eq "done" "$(status_of k1)" "status unchanged after refused merge"
+}
+
+t_merge_rejects_two_names() {
+  forge merge a b
+  assert_rc 1 "$RC" "forge-merge with two names"
+  assert_contains "$OUT" "too many arguments" "merge arity message"
+}
+
+# --- lifecycle ---------------------------------------------------------------
+
+t_build_worker_commits() {
+  forge spawn b1 "build something"
+  assert_rc 0 "$RC" "spawn build worker"
+  assert_eq "done" "$(await b1)" "build worker reached done"
+
+  # The commit must carry both the code change and the report.
+  local files
+  files="$(git -C "$REPO" show --name-only --format= "agent/b1")"
+  assert_contains "$files" "changed-b1.txt" "code change committed"
+  assert_contains "$files" "reports/b1.md" "report committed alongside the change"
+  assert_file "$REPO/.forge/logs/b1.log" "worker log written"
+}
+
+t_analysis_worker_commits_report() {
+  write_fake_codex "$FAKEBIN/codex" report
+  forge spawn --kind analysis a1 "analyse something"
+  assert_rc 0 "$RC" "spawn analysis worker"
+  assert_eq "done" "$(await a1)" "analysis worker reached done"
+  assert_contains "$(git -C "$REPO" show --name-only --format= agent/a1)" \
+    "reports/a1.md" "analysis report committed"
+}
+
+# A worker that changes nothing is not a success: the status must say so,
+# because "done" is what the orchestrator is told to trust.
+t_noop_worker_is_nochanges() {
+  write_fake_codex "$FAKEBIN/codex" noop
+  forge spawn n1 "do nothing"
+  assert_eq "nochanges" "$(await n1)" "no-op worker reported nochanges"
+}
+
+t_failed_worker_keeps_worktree() {
+  write_fake_codex "$FAKEBIN/codex" fail
+  forge spawn f1 "fail please"
+  assert_eq "failed" "$(await f1)" "failing worker reported failed"
+  local rc_field
+  rc_field="$(cd "$REPO" && "$BIN/forge-status" --json | jq -r '.[] | select(.name=="f1") | .exit_code')"
+  assert_eq "7" "$rc_field" "exit code recorded"
+  # Left for inspection — that is the documented contract.
+  assert_file "$FORGE_WT_ROOT/f1/.git" "failed worker's worktree kept for inspection"
+}
+
+t_legacy_root_report_is_moved() {
+  write_fake_codex "$FAKEBIN/codex" legacy
+  forge spawn l1 "legacy report"
+  assert_eq "done" "$(await l1)" "legacy-report worker finished"
+  local files
+  files="$(git -C "$REPO" show --name-only --format= agent/l1)"
+  assert_contains "$files" "reports/l1.md" "FORGE_REPORT.md moved to reports/"
+  case "$files" in *FORGE_REPORT.md*) no "FORGE_REPORT.md left in the repo root" ;; *) ok ;; esac
+}
+
+t_merge_removes_by_default() {
+  forge spawn m1 "merge me"
+  assert_eq "done" "$(await m1)" "worker finished"
+  forge merge m1
+  assert_rc 0 "$RC" "forge-merge"
+  assert_eq "merged" "$(status_of m1)" "status merged"
+  assert_no_file "$FORGE_WT_ROOT/m1" "worktree removed by default"
+  git -C "$REPO" show-ref --quiet refs/heads/agent/m1 \
+    && no "branch agent/m1 still exists after merge" || ok
+  # --no-ff: the merge is its own commit, so the worker stays one visible unit.
+  assert_contains "$(git -C "$REPO" log -1 --format=%s)" "forge: merge agent/m1" "merge commit subject"
+}
+
+t_merge_keep_preserves() {
+  forge spawn m2 "keep me"
+  assert_eq "done" "$(await m2)" "worker finished"
+  forge merge m2 --keep
+  assert_rc 0 "$RC" "forge-merge --keep"
+  assert_file "$FORGE_WT_ROOT/m2/changed-m2.txt" "worktree kept with --keep"
+  git -C "$REPO" show-ref --quiet refs/heads/agent/m2 && ok \
+    || no "branch agent/m2 removed despite --keep"
+}
+
+t_merge_flag_before_name() {
+  forge spawn m3 "flag first"
+  assert_eq "done" "$(await m3)" "worker finished"
+  forge merge --keep m3
+  assert_rc 0 "$RC" "forge-merge --keep <name> (flag first)"
+  assert_file "$FORGE_WT_ROOT/m3/changed-m3.txt" "worktree kept with leading --keep"
+}
+
+t_merge_refuses_non_done() {
+  write_fake_codex "$FAKEBIN/codex" fail
+  forge spawn m4 "will fail"
+  assert_eq "failed" "$(await m4)" "worker failed"
+  forge merge m4
+  assert_rc 1 "$RC" "merging a failed worker"
+  assert_contains "$OUT" "only done" "refusal mentions the allowed states"
+}
+
+t_merge_refuses_dirty_repo() {
+  forge spawn m5 "dirty test"
+  assert_eq "done" "$(await m5)" "worker finished"
+  echo "uncommitted" >> "$REPO/README.md"
+  forge merge m5
+  assert_rc 1 "$RC" "merge with a dirty main repo"
+  assert_contains "$OUT" "uncommitted changes" "dirty-repo refusal"
+}
+
+t_merge_conflict_aborts_cleanly() {
+  # Both sides change the same file, so the merge must conflict.
+  forge spawn c1 "conflict side" >/dev/null 2>&1
+  await c1 >/dev/null
+  # Make the worker's change conflict: it wrote changed-c1.txt, so write the
+  # same path on main with different content.
+  echo "main version" > "$REPO/changed-c1.txt"
+  git -C "$REPO" add -A && git -C "$REPO" commit -qm "main writes the same file"
+
+  forge merge c1
+  assert_rc 1 "$RC" "conflicting merge exits non-zero"
+  assert_eq "conflict" "$(status_of c1)" "status set to conflict"
+  # A left-behind MERGE_HEAD would block every later git operation.
+  assert_no_file "$REPO/.git/MERGE_HEAD" "merge aborted cleanly (no MERGE_HEAD)"
+  # And a conflict must be recoverable: forge-merge accepts "conflict" again.
+  forge merge c1
+  assert_contains "$OUT" "conflict" "re-merge still reports the conflict"
+}
+
+t_drop_discards_work() {
+  forge spawn d1 "drop me"
+  assert_eq "done" "$(await d1)" "worker finished"
+  forge drop d1
+  assert_rc 0 "$RC" "forge-drop"
+  assert_eq "dropped" "$(status_of d1)" "status dropped"
+  assert_no_file "$FORGE_WT_ROOT/d1" "worktree removed"
+  git -C "$REPO" show-ref --quiet refs/heads/agent/d1 \
+    && no "branch still exists after drop" || ok
+}
+
+# --- spawn behaviour ---------------------------------------------------------
+
+t_spawn_refuses_duplicate_name() {
+  forge spawn dup "first"
+  assert_eq "done" "$(await dup)" "first worker finished"
+  forge spawn dup "second"
+  assert_rc 1 "$RC" "spawning a duplicate name"
+  assert_contains "$OUT" "already exists" "duplicate-name refusal"
+}
+
+t_spawn_allows_name_reuse_after_merge() {
+  forge spawn re "first"
+  assert_eq "done" "$(await re)" "first worker finished"
+  forge merge re
+  assert_rc 0 "$RC" "merge before reuse"
+  forge spawn re "second"
+  assert_rc 0 "$RC" "name reusable after merge"
+}
+
+t_spawn_rejects_bad_name() {
+  forge spawn "Bad_Name" "x"
+  assert_rc 1 "$RC" "spawn with an invalid name"
+  assert_contains "$OUT" "invalid agent name" "invalid name refusal"
+}
+
+t_spawn_rejects_unknown_kind() {
+  forge spawn --kind buidl x1 "x"
+  assert_rc 1 "$RC" "spawn with a misspelled --kind"
+  assert_contains "$OUT" "unknown --kind" "kind refusal"
+}
+
+t_spawn_rejects_unknown_model() {
+  forge spawn --model no-such-model x2 "x"
+  assert_rc 1 "$RC" "spawn with a model outside models.conf"
+  assert_contains "$OUT" "not allowed" "model refusal"
+}
+
+t_spawn_rejects_unknown_effort() {
+  forge spawn --effort turbo x3 "x"
+  assert_rc 1 "$RC" "spawn with an invalid --effort"
+  assert_contains "$OUT" "unknown --effort" "effort refusal"
+}
+
+t_spawn_rejects_empty_task() {
+  forge spawn e1 "   "
+  assert_rc 1 "$RC" "spawn with a whitespace-only task"
+  assert_contains "$OUT" "empty task" "empty task refusal"
+}
+
+t_spawn_reads_task_from_stdin() {
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" "$BIN/forge-spawn" s1 <<<"task from stdin" 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 0 "$RC" "spawn with the task on stdin"
+  assert_eq "done" "$(await s1)" "stdin worker finished"
+  assert_contains "$(cat "$REPO/.forge/tasks/s1.md")" "task from stdin" "task text stored"
+}
+
+# The effort flag has no dedicated codex flag; it must arrive as a -c override
+# with the model_reasoning_effort key, or it is silently ignored.
+t_effort_passed_as_config_override() {
+  write_fake_codex "$FAKEBIN/codex" ok "$ARGV_LOG"
+  forge spawn --model gpt-6-luna --effort high ef1 "check flags"
+  assert_eq "done" "$(await ef1)" "worker finished"
+  local argv; argv="$(cat "$ARGV_LOG" 2>/dev/null || echo MISSING)"
+  assert_contains "$argv" "model_reasoning_effort" "effort passed as a -c override"
+  assert_contains "$argv" "high" "effort level present"
+  assert_contains "$argv" "-m gpt-6-luna" "model passed with -m"
+  assert_contains "$argv" "-s workspace-write" "default sandbox flag present"
+}
+
+t_base_ref_sets_start_point() {
+  # A second commit on main; the worker starts from the first one.
+  local first; first="$(git -C "$REPO" rev-parse HEAD)"
+  echo "later" > "$REPO/later.txt"
+  git -C "$REPO" add -A && git -C "$REPO" commit -qm "second commit"
+
+  forge spawn --base "$first" bs1 "start from the first commit"
+  assert_rc 0 "$RC" "spawn with --base"
+  assert_eq "done" "$(await bs1)" "worker finished"
+  # The worker must not see the later commit's file.
+  assert_no_file "$FORGE_WT_ROOT/bs1/later.txt" "worker started from the given base"
+  local recorded
+  recorded="$(cd "$REPO" && "$BIN/forge-status" --json | jq -r '.[] | select(.name=="bs1") | .base_sha')"
+  assert_eq "$first" "$recorded" "base_sha recorded"
+}
+
+t_spawn_rejects_unknown_base() {
+  forge spawn --base no/such/ref x4 "x"
+  assert_rc 1 "$RC" "spawn with a nonexistent base ref"
+  assert_contains "$OUT" "no such base ref" "base refusal"
+}
+
+# A worktree holds only tracked files, so a gitignored path a task needs must be
+# linked in — and must not then show up as untracked and get committed.
+t_link_exposes_gitignored_path() {
+  mkdir -p "$REPO/.venv" && echo "payload" > "$REPO/.venv/marker.txt"
+  printf '.venv/\n' > "$REPO/.gitignore"
+  git -C "$REPO" add .gitignore && git -C "$REPO" commit -qm "ignore .venv"
+
+  forge spawn --link .venv ln1 "needs the venv"
+  assert_rc 0 "$RC" "spawn with --link"
+  assert_eq "done" "$(await ln1)" "worker finished"
+  assert_contains "$(cat "$FORGE_WT_ROOT/ln1/.venv/marker.txt" 2>/dev/null || echo MISSING)" \
+    "payload" "linked path readable in the worktree"
+  # The symlink must not land in the commit.
+  case "$(git -C "$REPO" show --name-only --format= agent/ln1)" in
+    *.venv*) no "linked .venv was committed" ;; *) ok ;;
+  esac
+}
+
+t_link_rejects_absolute_and_escaping_paths() {
+  forge spawn --link /etc x5 "x"
+  assert_rc 1 "$RC" "--link with an absolute path"
+  assert_contains "$OUT" "relative path" "absolute link refusal"
+
+  forge spawn --link ../outside x6 "x"
+  assert_rc 1 "$RC" "--link escaping the repo"
+  assert_contains "$OUT" "relative path" "escaping link refusal"
+}
+
+t_link_rejects_missing_target() {
+  forge spawn --link nope-not-here x7 "x"
+  assert_rc 1 "$RC" "--link with a missing target"
+  assert_contains "$OUT" "does not exist" "missing link refusal"
+}
+
+# --- state and isolation -----------------------------------------------------
+
+t_forge_state_is_git_excluded() {
+  forge status >/dev/null
+  assert_contains "$(cat "$REPO/.git/info/exclude")" "/.forge/" ".forge added to info/exclude"
+  # It must not show up as untracked, or every worker could commit it.
+  case "$(git -C "$REPO" status --porcelain)" in *.forge*) no ".forge shows as untracked" ;; *) ok ;; esac
+}
+
+t_refuses_to_run_in_the_tool_directory() {
+  set +e
+  OUT="$(cd "$FORGE_HOME" && "$BIN/forge-status" 2>&1)"; RC=$?
+  set -e
+  assert_rc 1 "$RC" "forge-status inside the forge tool directory"
+  assert_contains "$OUT" "not from the forge tool directory" "self-as-project guard"
+}
+
+t_works_from_inside_a_worktree() {
+  forge spawn wt1 "worktree cwd test"
+  assert_eq "done" "$(await wt1)" "worker finished"
+  # forge_root() must resolve the main repo even when called from a worktree.
+  set +e
+  OUT="$(cd "$FORGE_WT_ROOT/wt1" && "$BIN/forge-status" 2>&1)"; RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-status from inside a worktree"
+  assert_contains "$OUT" "wt1" "sees the same state from the worktree"
+}
+
+t_wait_returns_when_worker_finishes() {
+  forge spawn w1 "wait test"
+  forge wait w1 --timeout 60
+  assert_rc 0 "$RC" "forge-wait on a finishing worker"
+  assert_contains "$OUT" "w1" "forge-wait prints the status table"
+}
+
+t_review_shows_diff_and_report() {
+  forge spawn r1 "review test"
+  assert_eq "done" "$(await r1)" "worker finished"
+  forge review r1
+  assert_rc 0 "$RC" "forge-review"
+  assert_contains "$OUT" "report" "review shows the report section"
+  assert_contains "$OUT" "changed-r1.txt" "review shows the changed file"
+
+  # "## diffstat" contains "## diff", so the check must anchor on the line.
+  forge review r1 --stat
+  assert_rc 0 "$RC" "forge-review --stat"
+  if printf '%s\n' "$OUT" | grep -qx '## diff'; then
+    no "--stat printed the full diff"
+  else ok; fi
+  assert_contains "$OUT" "## diffstat" "--stat still prints the diffstat"
+
+  # A flag on either side of the name, and a refused typo.
+  forge review --stat r1
+  assert_rc 0 "$RC" "forge-review --stat <name> (flag first)"
+  forge review r1 --stats
+  assert_rc 1 "$RC" "forge-review with a misspelled --stat"
+  assert_contains "$OUT" "unknown option" "review typo refusal"
+}
+
+t_report_preview_is_truncated_in_json() {
+  # A report larger than the 4KB preview must be committed whole, with the JSON
+  # carrying only a preview plus a pointer.
+  cat > "$FAKEBIN/codex" <<'EOF'
+#!/usr/bin/env bash
+mkdir -p reports
+{ echo "# big report"; head -c 9000 /dev/zero | tr '\0' 'x'; } > "reports/$(basename "$PWD").md"
+exit 0
+EOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn big "big report"
+  assert_eq "done" "$(await big)" "worker finished"
+  local preview full
+  preview="$(cd "$REPO" && "$BIN/forge-status" --json | jq -r '.[] | select(.name=="big") | .report')"
+  full="$(git -C "$REPO" show "agent/big:reports/big.md" | wc -c | tr -d ' ')"
+  assert_contains "$preview" "truncated preview" "JSON preview marks the truncation"
+  [[ "$full" -gt 8000 ]] && ok || no "full report not committed whole (got $full bytes)"
+}
+
+# --- concurrency cap --------------------------------------------------------
+
+# The limit must be enforced in code: FORGE.md asks the orchestrator to keep to
+# four workers, but guidance in a prompt does not stop a fan-out.
+t_spawn_enforces_worker_limit() {
+  # A fake codex that blocks, so the workers stay "running".
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+sleep 30
+XEOF
+  chmod +x "$FAKEBIN/codex"
+
+  FORGE_MAX_WORKERS=2 forge spawn lim1 "one"
+  assert_rc 0 "$RC" "first worker within the limit"
+  FORGE_MAX_WORKERS=2 forge spawn lim2 "two"
+  assert_rc 0 "$RC" "second worker within the limit"
+
+  # Wait for both to actually be running before testing the cap.
+  local i=0
+  while [[ $i -lt 40 ]]; do
+    [[ "$(cd "$REPO" && "$BIN/forge-status" --json | jq '[.[] | select(.status=="running")] | length')" -ge 2 ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+
+  FORGE_MAX_WORKERS=2 forge spawn lim3 "three"
+  assert_rc 1 "$RC" "third worker refused at the limit"
+  assert_contains "$OUT" "already active" "limit message names the active count"
+  assert_contains "$OUT" "--force" "limit message offers the override"
+  # A refused spawn must leave nothing behind.
+  assert_no_file "$FORGE_WT_ROOT/lim3" "refused spawn created no worktree"
+  git -C "$REPO" show-ref --quiet refs/heads/agent/lim3 \
+    && no "refused spawn left a branch behind" || ok
+
+  # --force overrides it.
+  FORGE_MAX_WORKERS=2 forge spawn --force lim4 "four"
+  assert_rc 0 "$RC" "--force overrides the limit"
+
+  # Clean up the blocked workers so the suite does not wait on them.
+  for n in lim1 lim2 lim4; do
+    tmux kill-window -t "$FORGE_SESSION:$n" 2>/dev/null || true
+  done
+}
+
+t_spawn_limit_rejects_bad_value() {
+  FORGE_MAX_WORKERS=abc forge spawn bad1 "x"
+  assert_rc 1 "$RC" "non-numeric FORGE_MAX_WORKERS"
+  assert_contains "$OUT" "whole number" "limit validation message"
+}
+
+# --- forge-cancel -----------------------------------------------------------
+
+t_cancel_keeps_partial_work() {
+  # Writes a file, then blocks — so there is partial work to preserve.
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+echo "partial output" > partial.txt
+sleep 30
+XEOF
+  chmod +x "$FAKEBIN/codex"
+
+  forge spawn cx1 "cancel me"
+  assert_rc 0 "$RC" "spawn worker to cancel"
+  local i=0
+  while [[ $i -lt 40 ]]; do
+    [[ -f "$FORGE_WT_ROOT/cx1/partial.txt" ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+
+  forge cancel cx1
+  assert_rc 0 "$RC" "forge-cancel"
+  assert_eq "cancelled" "$(status_of cx1)" "status cancelled"
+  # The point of cancel vs drop: the work survives.
+  assert_file "$FORGE_WT_ROOT/cx1/partial.txt" "worktree kept"
+  git -C "$REPO" show-ref --quiet refs/heads/agent/cx1 && ok \
+    || no "branch removed by cancel (should be kept)"
+  assert_contains "$(git -C "$REPO" show --name-only --format= agent/cx1)" \
+    "partial.txt" "partial work committed so it is reviewable"
+}
+
+t_cancel_refuses_finished_worker() {
+  forge spawn cx2 "already done"
+  assert_eq "done" "$(await cx2)" "worker finished"
+  forge cancel cx2
+  assert_rc 1 "$RC" "cancelling a finished worker"
+  assert_contains "$OUT" "not running" "cancel refusal"
+}
+
+t_cancelled_worker_is_mergeable() {
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+echo "partial" > partial.txt
+sleep 30
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn cx3 "cancel then merge"
+  local i=0
+  while [[ $i -lt 40 ]]; do
+    [[ -f "$FORGE_WT_ROOT/cx3/partial.txt" ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+  forge cancel cx3 >/dev/null 2>&1
+  forge merge cx3
+  assert_rc 0 "$RC" "merging a cancelled worker's reviewed work"
+  assert_contains "$OUT" "acceptance check never ran" "merge warns about the skipped check"
+  assert_eq "merged" "$(status_of cx3)" "status merged"
+}
+
+# --- forge-clean ------------------------------------------------------------
+
+t_clean_default_scope_is_merged_only() {
+  forge spawn cl1 "merge me"; await cl1 >/dev/null
+  forge merge cl1 >/dev/null 2>&1
+  forge spawn cl2 "leave me"; await cl2 >/dev/null
+
+  forge clean
+  assert_rc 0 "$RC" "forge-clean"
+  assert_contains "$OUT" "cl1" "merged worker cleaned"
+  case "$OUT" in *cl2*) no "clean touched an unmerged worker by default" ;; *) ok ;; esac
+  assert_no_file "$REPO/.forge/agents/cl1.json" "merged worker state removed"
+  assert_file "$REPO/.forge/agents/cl2.json" "unmerged worker state kept"
+}
+
+t_clean_dry_run_changes_nothing() {
+  forge spawn cl3 "merge me"; await cl3 >/dev/null
+  forge merge cl3 >/dev/null 2>&1
+  forge clean --dry-run
+  assert_rc 0 "$RC" "forge-clean --dry-run"
+  assert_contains "$OUT" "nothing was changed" "dry-run says so"
+  assert_file "$REPO/.forge/agents/cl3.json" "dry-run kept the state file"
+}
+
+t_clean_reports_nothing_to_do() {
+  forge clean
+  assert_rc 0 "$RC" "forge-clean with nothing in scope"
+  assert_contains "$OUT" "nothing to clean" "empty-scope message"
+}
+
+# Unmerged work must never go without an explicit confirmation.
+t_clean_requires_confirmation_for_unmerged() {
+  forge spawn cl4 "unmerged"; await cl4 >/dev/null
+  # Empty stdin: the prompt gets no "delete", so it must abort.
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" "$BIN/forge-clean" --finished </dev/null 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 1 "$RC" "clean --finished without confirmation"
+  assert_contains "$OUT" "aborted" "abort message"
+  assert_file "$REPO/.forge/agents/cl4.json" "unmerged work survived the abort"
+}
+
+t_clean_finished_scope_with_yes() {
+  forge spawn cl5 "unmerged"; await cl5 >/dev/null
+  forge clean --finished --yes
+  assert_rc 0 "$RC" "clean --finished --yes"
+  assert_no_file "$REPO/.forge/agents/cl5.json" "state removed"
+  assert_no_file "$FORGE_WT_ROOT/cl5" "worktree removed"
+  git -C "$REPO" show-ref --quiet refs/heads/agent/cl5 \
+    && no "branch left behind after clean" || ok
+}
+
+# A failed worker keeps its worktree by design; clean is the only thing that
+# clears it, which is the leak this command exists to fix.
+t_clean_removes_failed_worker_leftovers() {
+  write_fake_codex "$FAKEBIN/codex" fail
+  forge spawn cl6 "will fail"
+  assert_eq "failed" "$(await cl6)" "worker failed"
+  assert_file "$FORGE_WT_ROOT/cl6/.git" "failed worker kept its worktree"
+  forge clean --finished --yes
+  assert_rc 0 "$RC" "clean after a failure"
+  assert_no_file "$FORGE_WT_ROOT/cl6" "failed worker's worktree cleaned"
+}
+
+t_clean_rejects_unknown_option() {
+  forge clean --bogus
+  assert_rc 1 "$RC" "forge-clean --bogus"
+  assert_contains "$OUT" "unknown option" "clean option refusal"
+}
+
+# --- forge-doctor -----------------------------------------------------------
+
+t_doctor_flags_missing_role_files() {
+  forge doctor
+  # Exit 1 = something broken: the role files are absent in a bare test repo.
+  assert_rc 1 "$RC" "forge-doctor on a repo without forge-init"
+  assert_contains "$OUT" "PROJECT.md is missing" "doctor names the missing file"
+  assert_contains "$OUT" "forge-init" "doctor says how to fix it"
+}
+
+t_doctor_passes_after_init() {
+  forge init >/dev/null 2>&1
+  git -C "$REPO" add -A && git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm "forge setup"
+  forge doctor
+  # 0 or 2: 2 means warnings only (the PROJECT.md stub is one), never broken.
+  case "$RC" in 0|2) ok ;; *) no "doctor after init: expected rc 0 or 2, got $RC: $(printf '%s' "$OUT" | grep BROKEN | head -3)" ;; esac
+  assert_contains "$OUT" "role files are committed" "doctor confirms worker visibility"
+}
+
+t_doctor_detects_uncommitted_role_files() {
+  forge init >/dev/null 2>&1
+  forge doctor
+  assert_contains "$OUT" "invisible to workers" "doctor warns about uncommitted role files"
+}
+
+t_doctor_rejects_unknown_option() {
+  forge doctor --bogus
+  assert_rc 1 "$RC" "forge-doctor --bogus"
+  assert_contains "$OUT" "usage" "doctor usage message"
+}
+
+t_models_lists_default() {
+  forge models
+  assert_rc 0 "$RC" "forge-models"
+  assert_contains "$OUT" "(default)" "default model marked"
+}
+
+# =============================================================================
+
+echo
+echo "forge tests — $FORGE_HOME"
+dim "  temp: $TMPROOT   session: $FORGE_SESSION"
+echo
+
+for dep in git tmux jq; do
+  command -v "$dep" >/dev/null || { red "missing dependency: $dep"; exit 1; }
+done
+
+echo "argument handling (regressions)"
+run_test status-json-empty              t_status_json_empty
+run_test status-plain-empty             t_status_plain_empty
+run_test status-unknown-agent           t_status_unknown_agent
+run_test status-invalid-name            t_status_invalid_name
+run_test wait-timeout-missing-value     t_wait_timeout_missing_value
+run_test wait-timeout-not-a-number      t_wait_timeout_not_a_number
+run_test wait-timeout-equals-form       t_wait_timeout_equals_form
+run_test wait-unknown-option            t_wait_unknown_option
+run_test run-without-name               t_run_without_name
+run_test drop-rejects-extra-args        t_drop_rejects_extra_args
+run_test merge-rejects-typo-flag        t_merge_rejects_typo_flag
+run_test merge-rejects-two-names        t_merge_rejects_two_names
+
+echo
+echo "worker lifecycle"
+run_test build-worker-commits           t_build_worker_commits
+run_test analysis-worker-report         t_analysis_worker_commits_report
+run_test noop-worker-is-nochanges       t_noop_worker_is_nochanges
+run_test failed-worker-keeps-worktree   t_failed_worker_keeps_worktree
+run_test legacy-root-report-moved       t_legacy_root_report_is_moved
+
+echo
+echo "merge and drop"
+run_test merge-removes-by-default       t_merge_removes_by_default
+run_test merge-keep-preserves           t_merge_keep_preserves
+run_test merge-flag-before-name         t_merge_flag_before_name
+run_test merge-refuses-non-done         t_merge_refuses_non_done
+run_test merge-refuses-dirty-repo       t_merge_refuses_dirty_repo
+run_test merge-conflict-aborts          t_merge_conflict_aborts_cleanly
+run_test drop-discards-work             t_drop_discards_work
+
+echo
+echo "spawn behaviour"
+run_test spawn-refuses-duplicate        t_spawn_refuses_duplicate_name
+run_test spawn-reuse-after-merge        t_spawn_allows_name_reuse_after_merge
+run_test spawn-rejects-bad-name         t_spawn_rejects_bad_name
+run_test spawn-rejects-unknown-kind     t_spawn_rejects_unknown_kind
+run_test spawn-rejects-unknown-model    t_spawn_rejects_unknown_model
+run_test spawn-rejects-unknown-effort   t_spawn_rejects_unknown_effort
+run_test spawn-rejects-empty-task       t_spawn_rejects_empty_task
+run_test spawn-task-from-stdin          t_spawn_reads_task_from_stdin
+run_test effort-as-config-override      t_effort_passed_as_config_override
+run_test base-ref-sets-start-point      t_base_ref_sets_start_point
+run_test spawn-rejects-unknown-base     t_spawn_rejects_unknown_base
+run_test link-exposes-gitignored        t_link_exposes_gitignored_path
+run_test link-rejects-bad-paths         t_link_rejects_absolute_and_escaping_paths
+run_test link-rejects-missing-target    t_link_rejects_missing_target
+
+echo
+echo "concurrency limit"
+run_test spawn-enforces-worker-limit    t_spawn_enforces_worker_limit
+run_test spawn-limit-rejects-bad-value  t_spawn_limit_rejects_bad_value
+
+echo
+echo "forge-cancel"
+run_test cancel-keeps-partial-work      t_cancel_keeps_partial_work
+run_test cancel-refuses-finished        t_cancel_refuses_finished_worker
+run_test cancelled-is-mergeable         t_cancelled_worker_is_mergeable
+
+echo
+echo "forge-clean"
+run_test clean-default-scope-merged     t_clean_default_scope_is_merged_only
+run_test clean-dry-run                  t_clean_dry_run_changes_nothing
+run_test clean-nothing-to-do            t_clean_reports_nothing_to_do
+run_test clean-confirms-unmerged        t_clean_requires_confirmation_for_unmerged
+run_test clean-finished-with-yes        t_clean_finished_scope_with_yes
+run_test clean-removes-failed-leftovers t_clean_removes_failed_worker_leftovers
+run_test clean-rejects-unknown-option   t_clean_rejects_unknown_option
+
+echo
+echo "forge-doctor"
+run_test doctor-flags-missing-roles     t_doctor_flags_missing_role_files
+run_test doctor-passes-after-init       t_doctor_passes_after_init
+run_test doctor-detects-uncommitted     t_doctor_detects_uncommitted_role_files
+run_test doctor-rejects-unknown-option  t_doctor_rejects_unknown_option
+
+echo
+echo "state, isolation, reporting"
+run_test forge-state-git-excluded       t_forge_state_is_git_excluded
+run_test refuses-tool-directory         t_refuses_to_run_in_the_tool_directory
+run_test works-from-worktree            t_works_from_inside_a_worktree
+run_test wait-returns-on-finish         t_wait_returns_when_worker_finishes
+run_test review-shows-diff              t_review_shows_diff_and_report
+run_test report-preview-truncated       t_report_preview_is_truncated_in_json
+run_test models-lists-default           t_models_lists_default
+
+echo
+if [[ $fail -eq 0 ]]; then
+  green "$pass assertions passed, 0 failures"
+  exit 0
+fi
+red "$pass assertions passed, $fail FAILED"
+printf '  failed tests: %s\n' "$(printf '%s\n' "${failed_names[@]}" | sort -u | tr '\n' ' ')"
+exit 1

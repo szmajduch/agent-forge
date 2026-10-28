@@ -30,6 +30,11 @@ STATE = os.path.join(ROOT, ".forge")
 TOKEN = os.environ.get("FORGE_DASH_TOKEN", "")
 SHOW_LOGS = os.environ.get("FORGE_DASH_LOGS", "1") != "0"
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+FEEDBACK_MAX_BYTES = 1_000_000
+FEEDBACK_KEEP = 500          # entries retained when the file is trimmed
+FEEDBACK_MIN_INTERVAL = 2.0  # seconds between posts from one address
+
+_last_post = {}
 
 
 def git(*a):
@@ -37,6 +42,28 @@ def git(*a):
         return subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True, timeout=10).stdout.strip()
     except Exception:
         return ""
+
+
+# Every open tab polls /api/state every 3s, and each agent costs two git
+# subprocesses per poll. The answer only changes when a worker rewrites its
+# JSON, so the newest mtime under .forge/agents is a sufficient cache key.
+_CACHE = {"key": None, "value": None, "at": 0.0}
+_CACHE_TTL = 2.0
+
+
+def state_cache_key():
+    try:
+        newest = max(
+            (os.path.getmtime(p) for p in glob.glob(os.path.join(STATE, "agents", "*.json"))),
+            default=0.0,
+        )
+    except OSError:
+        newest = 0.0
+    try:
+        fb = os.path.getmtime(os.path.join(STATE, "feedback.jsonl"))
+    except OSError:
+        fb = 0.0
+    return (newest, fb, git("rev-parse", "HEAD"))
 
 
 def tail(path, n=40):
@@ -51,6 +78,19 @@ def tail(path, n=40):
 
 
 def state():
+    """Cached snapshot. The TTL bounds how stale a reply can be even while
+    workers write continuously; the key makes a real change show up at once."""
+    now = time.monotonic()
+    if _CACHE["value"] is not None and now - _CACHE["at"] < _CACHE_TTL:
+        key = state_cache_key()
+        if key == _CACHE["key"]:
+            return _CACHE["value"]
+    value = build_state()
+    _CACHE.update(key=state_cache_key(), value=value, at=now)
+    return value
+
+
+def build_state():
     agents = []
     for p in sorted(glob.glob(os.path.join(STATE, "agents", "*.json"))):
         try:
@@ -63,7 +103,8 @@ def state():
             a["diffstat"] = git("diff", "--shortstat", f"{base}...{br}")
         a["log"] = tail(os.path.join(STATE, "logs", f"{name}.log")) if SHOW_LOGS else ""
         agents.append(a)
-    order = {"running": 0, "queued": 1, "conflict": 2, "failed": 3, "done": 4, "nochanges": 5, "merged": 6, "dropped": 7}
+    order = {"running": 0, "queued": 1, "conflict": 2, "failed": 3, "done": 4,
+             "cancelled": 5, "nochanges": 6, "merged": 7, "dropped": 8}
     agents.sort(key=lambda a: (order.get(a.get("status"), 9), a.get("created", "")))
     feedback = []
     try:
@@ -121,6 +162,13 @@ class H(BaseHTTPRequestHandler):
             return self.send(401, '{"error":"unauthorized"}')
         if urlparse(self.path).path != "/api/feedback":
             return self.send(404, '{"error":"not found"}')
+        # One note every couple of seconds per address is plenty for a human and
+        # stops a loop from filling the disk.
+        who = self.client_address[0]
+        now = time.monotonic()
+        if now - _last_post.get(who, 0.0) < FEEDBACK_MIN_INTERVAL:
+            return self.send(429, '{"error":"too many requests"}')
+        _last_post[who] = now
         try:
             n = min(int(self.headers.get("Content-Length", 0)), 20_000)
             d = json.loads(self.rfile.read(n))
@@ -134,8 +182,19 @@ class H(BaseHTTPRequestHandler):
                 "text": text,
             }
             os.makedirs(STATE, exist_ok=True)
-            with open(os.path.join(STATE, "feedback.jsonl"), "a") as f:
+            path = os.path.join(STATE, "feedback.jsonl")
+            # The endpoint is reachable by anyone holding the URL, so the file
+            # must not grow without bound. Keep the newest entries only.
+            with open(path, "a") as f:
                 f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            try:
+                if os.path.getsize(path) > FEEDBACK_MAX_BYTES:
+                    with open(path) as f:
+                        kept = f.readlines()[-FEEDBACK_KEEP:]
+                    with open(path, "w") as f:
+                        f.writelines(kept)
+            except OSError:
+                pass
             self.send(200, '{"ok":true}')
         except Exception:
             self.send(400, '{"error":"bad request"}')
@@ -196,7 +255,7 @@ padding:8px 14px;cursor:pointer}button:disabled{opacity:.5}
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';
 const q=p=>p+(T?(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T):'');
-const C={running:'--run',queued:'--idle',done:'--ok',merged:'--ok',failed:'--bad',conflict:'--warn',nochanges:'--idle',dropped:'--idle'};
+const C={running:'--run',queued:'--idle',done:'--ok',merged:'--ok',failed:'--bad',conflict:'--warn',cancelled:'--warn',nochanges:'--idle',dropped:'--idle'};
 const el=(t,cls,txt)=>{const e=document.createElement(t);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
 const open=new Set();
 try{document.getElementById('author').value=localStorage.getItem('forge-author')||''}catch(e){}

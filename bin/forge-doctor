@@ -1,0 +1,198 @@
+#!/usr/bin/env bash
+# forge-doctor [--spawn] — checks everything that must work before you brief the
+# first worker of a session.
+#
+# This exists because the failures it looks for are invisible until a worker
+# dies: a CLI that dropped a flag, launchers pointing at a moved forge, a model
+# name the server no longer accepts, a line-ending setup that only breaks in a
+# fresh worktree. Each is cheap to check here and expensive to debug as four
+# dead workers.
+#
+# --spawn also runs a real `codex exec` smoke test (a few seconds, one tiny
+# model call). Without it, no model is called.
+#
+# Exit: 0 all good, 1 something is broken, 2 only warnings.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+
+run_spawn=0
+case "${1:-}" in
+  "") ;;
+  --spawn) run_spawn=1 ;;
+  *) die "usage: forge-doctor [--spawn]" ;;
+esac
+
+bad=0; warn=0
+
+ok()     { printf '  \033[32mok\033[0m       %s\n' "$*"; }
+nope()   { printf '  \033[31mBROKEN\033[0m   %s\n' "$*"; bad=$((bad+1)); }
+caution(){ printf '  \033[33mwarn\033[0m     %s\n' "$*"; warn=$((warn+1)); }
+note()   { printf '           \033[2m%s\033[0m\n' "$*"; }
+head2()  { printf '\n\033[1m%s\033[0m\n' "$*"; }
+
+head2 "dependencies"
+for c in git tmux jq python3; do
+  if command -v "$c" >/dev/null; then ok "$c — $(command -v "$c")"
+  else nope "$c is missing"; note "brew install tmux jq git python"; fi
+done
+if command -v codex >/dev/null; then
+  ok "codex — $(codex --version 2>/dev/null | head -1)"
+else
+  nope "codex is missing (workers cannot run)"
+  note "npm i -g @openai/codex && codex login"
+fi
+if command -v claude >/dev/null; then ok "claude — $(command -v claude)"
+else caution "claude is missing (the orchestrator window will not start)"; fi
+
+head2 "installed launchers"
+# A launcher left over from a previous location silently runs the old forge, or
+# nothing at all. It is the one failure whose error message points nowhere.
+missing_cmds=(); stale_cmds=()
+for cmd in spawn status wait review merge drop models init up doctor clean cancel; do
+  src="$FORGE_HOME/bin/forge-$cmd"
+  [[ -f "$src" ]] || continue
+  found="$(command -v "forge-$cmd" 2>/dev/null || true)"
+  if [[ -z "$found" ]]; then missing_cmds+=("forge-$cmd"); continue; fi
+  # The launcher is a two-line shim holding the absolute path to this checkout.
+  grep -qF "$src" "$found" 2>/dev/null || stale_cmds+=("forge-$cmd")
+done
+if [[ ${#missing_cmds[@]} -eq 0 && ${#stale_cmds[@]} -eq 0 ]]; then
+  ok "all forge-* commands resolve to $FORGE_HOME"
+else
+  [[ ${#missing_cmds[@]} -gt 0 ]] && nope "not on PATH: ${missing_cmds[*]}"
+  [[ ${#stale_cmds[@]} -gt 0 ]] && nope "pointing at another forge copy: ${stale_cmds[*]}"
+  note "run $FORGE_HOME/install.sh   (and check ~/.local/bin is on PATH)"
+fi
+
+head2 "project files"
+cd "$ROOT"
+for f in PROJECT.md CLAUDE.md AGENTS.md FORGE.md; do
+  if [[ -f "$f" ]]; then ok "$f"
+  else nope "$f is missing"; note "run: forge-init"; fi
+done
+[[ -f .claude/settings.json ]] && ok ".claude/settings.json" \
+  || caution ".claude/settings.json missing — the orchestrator will ask about every command"
+
+# Role separation: the whole point of the three-file layout is that neither tool
+# reads the other's role. These two states quietly break it.
+if [[ -L CLAUDE.md ]]; then
+  nope "CLAUDE.md is a symlink to '$(readlink CLAUDE.md)' — both tools get each other's role"
+elif [[ -f CLAUDE.md ]] && grep -q '<!-- forge:worker -->' CLAUDE.md 2>/dev/null; then
+  nope "CLAUDE.md contains the worker rules — move them to AGENTS.md"
+fi
+[[ -f AGENTS.md ]] && grep -qxF '@FORGE.md' AGENTS.md 2>/dev/null && \
+  nope "AGENTS.md imports @FORGE.md — that is the orchestrator's role; remove it"
+
+# PROJECT.md still being the stub means no acceptance check is defined, and
+# every build worker will invent its own.
+if [[ -f PROJECT.md ]] && grep -q 'make check' PROJECT.md 2>/dev/null \
+   && grep -q 'How to run the app:$' PROJECT.md 2>/dev/null; then
+  caution "PROJECT.md is still the unfilled stub — workers have no acceptance check"
+  note "state the exact test/lint command a worker must pass before finishing"
+fi
+
+head2 "worker visibility (what a fresh worktree would contain)"
+# Workers start from a commit, so an uncommitted role file does not exist for
+# them — this is the single most common "but I wrote the rules" surprise.
+uncommitted=()
+for f in PROJECT.md CLAUDE.md AGENTS.md FORGE.md .claude/settings.json; do
+  [[ -e "$f" ]] || continue
+  git -C "$ROOT" ls-files --error-unmatch "$f" >/dev/null 2>&1 || { uncommitted+=("$f"); continue; }
+  git -C "$ROOT" diff --quiet -- "$f" 2>/dev/null || uncommitted+=("$f (modified)")
+done
+if [[ ${#uncommitted[@]} -eq 0 ]]; then
+  ok "role files are committed — workers will see them"
+else
+  caution "not committed, so invisible to workers: ${uncommitted[*]}"
+  note "git add -A && git commit -m 'forge setup'"
+fi
+
+head2 "git state"
+if git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet; then
+  ok "clean working tree (forge-merge needs this)"
+else
+  caution "uncommitted changes — forge-merge will refuse until you commit or stash"
+fi
+ok "branch: $(git -C "$ROOT" rev-parse --abbrev-ref HEAD)   worktrees under: $WT_ROOT"
+
+# core.autocrlf rewrites bytes on commit, so hash-comparing tests pass in your
+# checkout and fail for every worker. Worth catching before four of them die.
+crlf="$(git -C "$ROOT" config --get core.autocrlf || true)"
+if [[ "$crlf" == "true" || "$crlf" == "input" ]]; then
+  exposed=0
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    head -c 8000 "$f" 2>/dev/null | grep -q $'\r' && exposed=$((exposed+1))
+  done < <(git -C "$ROOT" ls-files --eol 2>/dev/null \
+    | awk '$3 !~ /-text/ {sub(/^[^\t]*\t/,""); print}' \
+    | grep -iE '\.(xsd|xsl|xslt|xml|json|csv|txt|html?|pds|dtd|sgml?)$' || true)
+  caution "core.autocrlf=$crlf — a fresh worktree can get different bytes than your checkout"
+  [[ "$exposed" -gt 0 ]] && note "$exposed data file(s) hold CRLF with no -text exemption"
+  note "byte-exact paths need '<path>/** -text' in .gitattributes + git add --renormalize"
+else
+  ok "core.autocrlf=${crlf:-unset} — worktrees get the same bytes as your checkout"
+fi
+
+head2 "models ($MODELS_FILE)"
+if [[ ! -f "$MODELS_FILE" ]]; then
+  caution "no models.conf — workers will use codex's own default model"
+else
+  count="$(models_list | grep -c . || true)"
+  def="$(model_default)"
+  if [[ "$count" -eq 0 ]]; then
+    caution "models.conf lists no models — --model is disabled, codex uses its default"
+  else
+    ok "$count model(s) configured"
+    if [[ -z "$def" ]]; then
+      caution "no 'default' line — a spawn without --model uses codex's default"
+    elif model_allowed "$def"; then
+      ok "default: $def"
+    else
+      nope "default '$def' is not in the model list — every spawn without --model fails"
+    fi
+  fi
+fi
+
+head2 "tmux"
+if [[ -n "${TMUX:-}" ]]; then ok "running inside tmux"; else note "not inside tmux (forge-up will start a session)"; fi
+if tmux has-session -t "$FORGE_SESSION" 2>/dev/null; then
+  ok "session '$FORGE_SESSION' exists ($(tmux list-windows -t "$FORGE_SESSION" 2>/dev/null | wc -l | tr -d ' ') window(s))"
+else
+  note "session '$FORGE_SESSION' not started yet (forge-up)"
+fi
+
+head2 "codex launcher"
+if ! command -v "${FORGE_CODEX_CMD:-codex}" >/dev/null; then
+  nope "FORGE_CODEX_CMD='${FORGE_CODEX_CMD:-codex}' not found"
+elif [[ $run_spawn -eq 1 ]]; then
+  # The decisive check: the flags forge actually passes, against the real CLI.
+  args="${FORGE_CODEX_ARGS:--s workspace-write}"
+  note "running: ${FORGE_CODEX_CMD:-codex} exec $args 'Reply with exactly: FORGE_OK'"
+  out="$("${FORGE_CODEX_CMD:-codex}" exec $args "Reply with exactly: FORGE_OK" 2>&1 </dev/null || true)"
+  if printf '%s' "$out" | grep -q FORGE_OK; then
+    ok "codex accepted the flags and answered"
+  elif printf '%s' "$out" | grep -qi "unexpected argument\|unrecognized\|invalid value"; then
+    nope "codex rejected forge's flags"
+    note "$(printf '%s' "$out" | grep -i "unexpected argument\|unrecognized\|invalid value" | head -1)"
+    note "Codex CLI >= 0.163.0 dropped --full-auto; use -s workspace-write"
+  elif printf '%s' "$out" | grep -qi "not logged in\|unauthorized\|authentication"; then
+    nope "codex is not logged in"; note "run: codex login"
+  else
+    caution "codex ran but did not answer as asked — check the output below"
+    printf '%s\n' "$out" | tail -5 | sed 's/^/           /'
+  fi
+else
+  note "flags not verified — rerun with --spawn to call codex once for real"
+fi
+
+head2 "summary"
+if [[ $bad -gt 0 ]]; then
+  printf '  \033[31m%d broken\033[0m, %d warning(s) — fix the broken items before spawning.\n' "$bad" "$warn"
+  exit 1
+fi
+if [[ $warn -gt 0 ]]; then
+  printf '  \033[33m%d warning(s)\033[0m, nothing broken — you can spawn, but read them.\n' "$warn"
+  exit 2
+fi
+printf '  \033[32mall good\033[0m — ready to spawn.\n'
+[[ $run_spawn -eq 0 ]] && note "flags not verified against the real CLI; 'forge-doctor --spawn' does that"
+exit 0

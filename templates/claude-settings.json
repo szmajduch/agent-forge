@@ -7,11 +7,15 @@
       "Bash(forge-review:*)",
       "Bash(forge-merge:*)",
       "Bash(forge-models:*)",
+      "Bash(forge-cancel:*)",
+      "Bash(forge-clean:--dry-run)",
+      "Bash(forge-doctor:*)",
       "Bash(git status:*)",
       "Bash(git diff:*)",
       "Bash(git log:*)"
     ],
     "ask": [
+      "Bash(forge-clean:*)",
       "Bash(forge-drop:*)",
       "Bash(git push:*)",
       "Bash(git reset:*)",

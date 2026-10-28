@@ -22,7 +22,13 @@ done
 valid_name "$name"
 
 status="$(agent_get "$name" status)"
-[[ "$status" == "done" || "$status" == "conflict" ]] || die "agent '$name' is '$status' — only done (or conflict, after you fixed it) can be merged"
+case "$status" in
+  done|conflict) ;;
+  # A cancelled worker's partial work is mergeable, but only deliberately: the
+  # acceptance check never ran, so the operator must have read the diff.
+  cancelled) info "'$name' was cancelled — its acceptance check never ran. Merging its partial work." ;;
+  *) die "agent '$name' is '$status' — only done, cancelled or conflict (after you fixed it) can be merged" ;;
+esac
 branch="$(agent_get "$name" branch)"
 wt="$(agent_get "$name" worktree)"
 
@@ -30,6 +36,17 @@ git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet \
   || die "main repo has uncommitted changes; commit or stash them first"
 
 target="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+
+# How far the worker's starting point has drifted from where it is going. A
+# large number is the usual explanation for a conflict, and it is worth seeing
+# before the merge rather than inferring it from the failure.
+base_sha="$(agent_get "$name" base_sha)"
+if [[ -n "$base_sha" ]]; then
+  behind="$(git -C "$ROOT" rev-list --count "$base_sha..HEAD" 2>/dev/null || echo 0)"
+  if [[ "${behind:-0}" -gt 0 ]]; then
+    info "$target has moved $behind commit(s) since '$name' started; conflicts are possible"
+  fi
+fi
 
 if ! git -C "$ROOT" merge --no-ff -q -m "forge: merge $branch ($(agent_get "$name" title))" "$branch"; then
   git -C "$ROOT" merge --abort || true

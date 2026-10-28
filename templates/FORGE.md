@@ -27,9 +27,12 @@ told to change code will change code it should only have read.
      must pass); for analysis, the question the report must answer and the
      evidence it must carry.
    Show the plan to the operator and wait for "ok" before spawning more than 3 workers.
-2. **Spawn.** Before the first spawn of a session, check a worker can start at
-   all: `codex exec -s workspace-write "echo ok"`. A broken launcher wastes
-   every worker you then queue.
+2. **Spawn.** Before the first spawn of a session run `forge-doctor`. It checks
+   the dependencies, the role files, whether they are committed (a worker starts
+   from a commit, so an uncommitted `AGENTS.md` does not exist for it), the model
+   list and the line-ending setup. Fix anything it calls BROKEN first — a broken
+   launcher wastes every worker you then queue. `forge-doctor --spawn` also calls
+   codex once for real; use it if a worker died on a CLI flag.
    One worker per task:
    `forge-spawn [--model <m>] [--effort <level>] [--kind build|analysis] [--base <ref>] [--link <path>] <short-name> "<task>"`
    — name: lowercase, digits, dashes.
@@ -63,6 +66,9 @@ told to change code will change code it should only have read.
    - `failed` → read `forge-status <name>` log, re-brief, respawn under a new name.
    - `nochanges` → for build, the worker produced nothing: re-brief and respawn.
      For analysis it means no report was written, which is the same thing.
+   - `cancelled` → stopped mid-task, so its acceptance check never ran. Read the
+     partial diff: salvage it with `forge-merge` only if it stands on its own,
+     otherwise re-brief the remaining work as a new task.
    When an analysis worker is meant to check another worker's output
    **independently**, spawn it with `--base` pointing at the original base rather
    than at that worker's branch, so it does not inherit its reasoning — give it
@@ -120,13 +126,21 @@ higher effort before you re-scope the task.
 ## Rules
 
 - `forge-drop` discards work irreversibly — ask the operator first.
+- To stop a worker that is going the wrong way, prefer `forge-cancel <name>`:
+  it kills the model but keeps the branch and commits whatever it had produced,
+  so you can still read it. `forge-drop` is for when the work is worthless.
+- `forge-clean` removes finished workers' leftovers. Plain `forge-clean` only
+  touches merged ones and is safe; any wider scope can delete unmerged work, so
+  ask the operator before using one.
 - Never `git push`, force-push, rewrite history, or touch remote branches. The operator pushes.
 - Merge a build worker only after you have read the diff and the acceptance
   check passed; an analysis worker only after you have read its report.
 - Never present a worker's conclusion to the operator as established fact
   without saying what evidence backs it. If a report says something is
   unresolved, it stays unresolved in your summary.
-- Max parallel workers: 4 unless the operator says otherwise.
+- Max parallel workers: 4 unless the operator says otherwise. `forge-spawn`
+  enforces this (`FORGE_MAX_WORKERS`), so a refused spawn means wait, don't
+  retry with `--force`: ask the operator if you think the limit should be higher.
 
 ## Sensitive data
 

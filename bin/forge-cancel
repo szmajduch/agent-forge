@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+# forge-cancel <name> — stop a running worker but KEEP its branch and worktree.
+#
+# The difference from forge-drop: drop discards the work, cancel only stops the
+# model. Whatever the worker had already written stays on disk and, if it is
+# worth keeping, is committed to agent/<name> so it survives review.
+#
+# Use it when a worker is going the wrong way, is stuck, or the task changed —
+# you still want to see what it did.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+[[ $# -eq 1 ]] || die "usage: forge-cancel <name>   (exactly one agent)"
+name="$1"; valid_name "$name"
+
+status="$(agent_get "$name" status)"
+case "$status" in
+  queued|running) ;;
+  *) die "agent '$name' is '$status', not running — nothing to cancel" ;;
+esac
+
+wt="$(agent_get "$name" worktree)"
+
+# Killing the window takes the whole process group with it, including codex.
+tmux kill-window -t "$FORGE_SESSION:$name" 2>/dev/null || true
+
+# forge-run commits on a clean exit; a cancelled worker never gets there, so
+# whatever it produced is committed here instead. Without this the work sits
+# uncommitted in the worktree and forge-review shows nothing.
+committed=""
+if [[ -n "$wt" && -d "$wt" ]]; then
+  git -C "$wt" add -A 2>/dev/null || true
+  if ! git -C "$wt" diff --cached --quiet 2>/dev/null; then
+    git -C "$wt" commit -q -m "[agent:$name] cancelled: partial work" \
+      -m "Committed by forge-cancel so the partial result is reviewable." 2>/dev/null \
+      && committed="$(git -C "$wt" rev-parse --short HEAD)"
+  fi
+fi
+
+if [[ -n "$committed" ]]; then
+  agent_set "$name" status=cancelled commit="$committed" \
+    finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "cancelled $name — partial work committed as $committed on $(agent_get "$name" branch)"
+  echo "  review it:  forge-review $name"
+  echo "  keep it:    git -C $ROOT merge --no-ff $(agent_get "$name" branch)"
+  echo "  discard it: forge-drop $name"
+else
+  agent_set "$name" status=cancelled finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+  echo "cancelled $name — it had produced nothing to commit"
+  echo "  the worktree and branch are kept: $wt"
+  echo "  discard them with: forge-drop $name"
+fi

@@ -10,13 +10,14 @@
 # --effort reasoning effort: low|medium|high|xhigh|max|ultra. Higher spends more
 #         reasoning on a hard task; it is not a guarantee of correctness.
 #         Passed to codex as -c model_reasoning_effort=<level>.
+# --force ignore the parallel-worker limit (FORGE_MAX_WORKERS, default 4).
 # --link  symlink a gitignored path from the main repo into the worktree, e.g.
 #         --link .venv --link .work. A worktree contains only tracked files, so
 #         anything gitignored (a virtualenv, large data) is otherwise missing.
 #         Repeatable; also settable as FORGE_LINK=".venv .work".
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 
-model=""; kind="build"; base_opt=""; effort=""
+model=""; kind="build"; base_opt=""; effort=""; force=0
 links=(); [[ -n "${FORGE_LINK:-}" ]] && read -r -a links <<< "$FORGE_LINK"
 
 # Options are accepted both before and after the name, so a flag written after
@@ -34,6 +35,7 @@ parse_opts() {
       --effort=*) effort="${1#--effort=}"; shift ;;
       --link) [[ -n "${2:-}" ]] || die "--link needs a value"; links+=("$2"); shift 2 ;;
       --link=*) links+=("${1#--link=}"); shift ;;
+      --force) force=1; shift ;;
       --) shift; break ;;
       *) die "unknown option $1" ;;
     esac
@@ -43,7 +45,7 @@ parse_opts() {
 
 parse_opts "$@"; shift $(( $# - OPTS_LEFT ))
 
-[[ $# -ge 1 ]] || die 'usage: forge-spawn [--model <m>] [--kind build|analysis] [--base <ref>] [--link <path>] <name> "<task>"   (task may also come on stdin)'
+[[ $# -ge 1 ]] || die 'usage: forge-spawn [--model <m>] [--kind build|analysis] [--base <ref>] [--link <path>] [--force] <name> "<task>"   (task may also come on stdin)'
 name="$1"; shift
 
 parse_opts "$@"; shift $(( $# - OPTS_LEFT ))
@@ -66,6 +68,29 @@ else
 fi
 
 valid_name "$name"
+
+# A limit the orchestrator cannot talk its way past: each worker is a model plus
+# whatever its acceptance check runs, so an unbounded fan-out can take the
+# machine down. FORGE.md states the same number as guidance; this enforces it.
+max_workers="${FORGE_MAX_WORKERS:-4}"
+[[ "$max_workers" =~ ^[0-9]+$ ]] || die "FORGE_MAX_WORKERS must be a whole number, got '$max_workers'"
+if [[ $force -eq 0 && "$max_workers" -gt 0 ]]; then
+  shopt -s nullglob
+  active=0; active_names=""
+  for f in "$STATE"/agents/*.json; do
+    case "$(jq -r '.status // empty' "$f")" in
+      queued|running)
+        active=$((active+1))
+        active_names="$active_names $(jq -r '.name // empty' "$f")" ;;
+    esac
+  done
+  if [[ "$active" -ge "$max_workers" ]]; then
+    die "$active worker(s) already active (limit $max_workers):$active_names
+  Wait for one to finish (forge-wait), stop one (forge-cancel <name>),
+  raise the limit (FORGE_MAX_WORKERS=<n>), or override once with --force."
+  fi
+fi
+
 if [[ $# -gt 0 ]]; then task="$*"; else task="$(cat)"; fi
 [[ -n "${task//[[:space:]]/}" ]] || die "empty task"
 

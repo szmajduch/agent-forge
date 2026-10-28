@@ -27,4 +27,7 @@ macOS install hints:
   brew install tmux jq git python
   npm i -g @anthropic-ai/claude-code @openai/codex
   brew install cloudflared                 # optional
+
+next:
+  cd <your project> && forge-init && forge-doctor
 EOF
