@@ -819,6 +819,52 @@ t_doctor_rejects_unknown_option() {
   assert_contains "$OUT" "usage" "doctor usage message"
 }
 
+# --- forge-up tmux options --------------------------------------------------
+
+# Mouse mode must stay off: with it on, tmux's WheelUpPane binding throws the
+# orchestrator window into copy-mode instead of scrolling it, because Claude
+# Code sets neither the alternate screen nor a mouse-tracking flag.
+t_up_leaves_mouse_off() {
+  local sess="forge-up-test-$RUN_ID"
+  tmux kill-session -t "$sess" 2>/dev/null || true
+  set +e
+  OUT="$(cd "$REPO" && FORGE_SESSION="$sess" FORGE_DASH_PORT=8894 \
+         FORGE_ORCH_CMD="sleep 30" "$BIN/forge-up" -d 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-up -d"
+  assert_eq "off" "$(tmux show-options -t "$sess" -v mouse 2>/dev/null)" "mouse off by default"
+  tmux kill-session -t "$sess" 2>/dev/null || true
+}
+
+t_up_mouse_override() {
+  local sess="forge-up-test2-$RUN_ID"
+  tmux kill-session -t "$sess" 2>/dev/null || true
+  set +e
+  (cd "$REPO" && FORGE_SESSION="$sess" FORGE_DASH_PORT=8895 FORGE_MOUSE=on \
+     FORGE_ORCH_CMD="sleep 30" "$BIN/forge-up" -d >/dev/null 2>&1)
+  set -e
+  assert_eq "on" "$(tmux show-options -t "$sess" -v mouse 2>/dev/null)" "FORGE_MOUSE=on honoured"
+  tmux kill-session -t "$sess" 2>/dev/null || true
+}
+
+# A bad value must be refused before the session exists: tmux exits 1 on one,
+# which would otherwise abort forge-up with a half-configured session.
+t_up_rejects_bad_mouse_value() {
+  local sess="forge-up-test3-$RUN_ID"
+  tmux kill-session -t "$sess" 2>/dev/null || true
+  set +e
+  OUT="$(cd "$REPO" && FORGE_SESSION="$sess" FORGE_DASH_PORT=8896 FORGE_MOUSE=bogus \
+         "$BIN/forge-up" -d 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 1 "$RC" "forge-up with FORGE_MOUSE=bogus"
+  assert_contains "$OUT" "must be 'on' or 'off'" "mouse validation message"
+  tmux has-session -t "$sess" 2>/dev/null \
+    && { no "a session was created despite the bad value"; tmux kill-session -t "$sess" 2>/dev/null; } \
+    || ok
+}
+
 t_models_lists_default() {
   forge models
   assert_rc 0 "$RC" "forge-models"
@@ -912,6 +958,12 @@ run_test doctor-flags-missing-roles     t_doctor_flags_missing_role_files
 run_test doctor-passes-after-init       t_doctor_passes_after_init
 run_test doctor-detects-uncommitted     t_doctor_detects_uncommitted_role_files
 run_test doctor-rejects-unknown-option  t_doctor_rejects_unknown_option
+
+echo
+echo "forge-up session options"
+run_test up-leaves-mouse-off            t_up_leaves_mouse_off
+run_test up-mouse-override              t_up_mouse_override
+run_test up-rejects-bad-mouse-value     t_up_rejects_bad_mouse_value
 
 echo
 echo "state, isolation, reporting"

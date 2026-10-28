@@ -5,17 +5,43 @@
 #   dashboard    : status page on 127.0.0.1:$FORGE_DASH_PORT (default 8787)
 #   tunnel       : cloudflared tunnel     (only if FORGE_TUNNEL=1)
 # -d : don't attach.
+#
+# Mouse support is left OFF on purpose; FORGE_MOUSE=on turns it on. See the
+# comment at the set-option below — with it on, the wheel stops working in the
+# orchestrator window.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 attach=1; [[ "${1:-}" == "-d" ]] && attach=0
 port="${FORGE_DASH_PORT:-8787}"
+
+# Validated here rather than at the set-option below: tmux exits 1 on a bad
+# value, which under `set -e` would abort forge-up with the session already
+# created but only half configured.
+mouse="${FORGE_MOUSE:-off}"
+case "$mouse" in
+  on|off) ;;
+  *) die "FORGE_MOUSE must be 'on' or 'off', got '$mouse'" ;;
+esac
 
 if tmux has-session -t "$FORGE_SESSION" 2>/dev/null; then
   info "session '$FORGE_SESSION' already exists"
 else
   tmux new-session -d -s "$FORGE_SESSION" -n orchestrator -c "$ROOT" "${FORGE_ORCH_CMD:-claude}; exec ${SHELL:-bash}"
-  # Friendlier defaults for this session only: mouse scroll/click/select windows,
-  # bigger scrollback, and the window list kept visible at the bottom.
-  tmux set-option -t "$FORGE_SESSION" mouse on
+  # Mouse mode is OFF by default, because with it on the wheel does not scroll
+  # the orchestrator window — it throws it into tmux copy-mode instead.
+  #
+  # tmux's own WheelUpPane binding is:
+  #   if -F "#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}" \
+  #     { send-keys -M } { copy-mode -e }
+  # i.e. the wheel reaches the application only if the pane is on the alternate
+  # screen or the application asked for mouse events. Claude Code 2.1.312 does
+  # neither (measured: all three flags 0), so tmux takes the copy-mode branch:
+  # the view jumps to the scrollback, keystrokes go to copy-mode, and the text
+  # you wanted to read is out of reach. Mouse off keeps the terminal's own
+  # scrolling and text selection in every window.
+  #
+  # The cost is the wheel in worker windows; their logs are on the dashboard,
+  # and Ctrl-b [ still scrolls a pane. Set FORGE_MOUSE=on to get it back.
+  tmux set-option -t "$FORGE_SESSION" mouse "$mouse"
   tmux set-option -t "$FORGE_SESSION" history-limit 50000
   tmux set-option -t "$FORGE_SESSION" status on
   # Esc is used by Claude Code to cancel; tmux's default 500ms delay makes it feel stuck.

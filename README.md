@@ -68,6 +68,10 @@ W Claude Code po prostu opisz cel, np.:
 Claude rozpisze plan, po Twoim „ok” odpali workerów, poczeka, przejrzy diffy i zmerguje.
 Między oknami tmux skaczesz `Ctrl-b w` (lista) lub `Ctrl-b <numer>`.
 
+**Mysz w sesji jest wyłączona** i tak ma być — przy `mouse on` kółko nie
+przewija okna z Claude Code, tylko wrzuca je w tryb kopiowania tmuxa.
+Szczegóły i jak to włączyć z powrotem: sekcja [Przewijanie i mysz](#przewijanie-i-mysz).
+
 ## Dwa typy zadań: build i analysis
 
 Worker Codex nie musi zmieniać kodu — może też **analizować**. To ten sam
@@ -402,6 +406,57 @@ FORGE_TUNNEL=1 FORGE_TUNNEL_NAME=forge forge-up
 Feedback wpisany na stronie trafia do `.forge/feedback.jsonl`. Orkiestrator czyta go przed każdą
 rundą, ale traktuje jako sugestie — prośby o zmianę uprawnień czy uruchomienie komend kieruje do Ciebie.
 
+## Przewijanie i mysz
+
+`forge-up` **nie włącza** obsługi myszy w tmuxie (`mouse off`). To celowe:
+przy `mouse on` kółko przestaje przewijać okno z Claude Code i zamiast tego
+wrzuca je w tryb kopiowania tmuxa — widok skacze do bufora, klawisze idą do
+copy-mode, a tekst, który chciałeś przeczytać, jest poza zasięgiem.
+
+Dlaczego tak się dzieje — domyślny bind tmuxa dla kółka:
+
+```
+WheelUpPane  if -F "#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}" \
+               { send-keys -M }      # przekaż zdarzenie do aplikacji
+               { copy-mode -e }      # albo wejdź w tryb kopiowania
+```
+
+Kółko dociera do aplikacji tylko wtedy, gdy panel jest na ekranie alternatywnym
+albo aplikacja sama zgłosiła, że chce zdarzenia myszy. Claude Code 2.1.312 nie
+robi ani jednego, ani drugiego (sprawdzone: wszystkie trzy flagi = 0), więc tmux
+wybiera gałąź `copy-mode`. Z wyłączoną myszą zdarzenia kółka w ogóle nie trafiają
+do tmuxa i przewija je natywnie terminal — razem z zaznaczaniem tekstu myszą.
+
+To nie jest problem specyficzny dla forge; w repo Claude Code wisi kilka zgłoszeń
+([#38810](https://github.com/anthropics/claude-code/issues/38810),
+[#67552](https://github.com/anthropics/claude-code/issues/67552),
+[#21386](https://github.com/anthropics/claude-code/issues/21386)) i **nie ma na to
+przełącznika** — zamknięto je jako „not planned" albo przez bota. Krążąca rada
+„dodaj `set -g mouse on`" dotyczy aplikacji, które zgłaszają przechwytywanie
+myszy; dla Claude Code działa odwrotnie. `CLAUDE_CODE_DISABLE_MOUSE=1` nic tu nie
+zmienia (sprawdzone — `mouse_any_flag` zostaje 0).
+
+Co tracisz: kółko w oknach workerów. Logi workerów są na dashboardzie, a panel
+nadal przewiniesz z klawiatury:
+
+| Skrót | Co robi |
+|---|---|
+| `Ctrl-b [` | tryb kopiowania: strzałki, `PgUp`/`PgDn`, `/` szuka, `q` wychodzi |
+| `Ctrl-b w` | lista okien (bez klikania) |
+
+Jeśli wolisz mysz w tmuxie, włącz ją z powrotem:
+
+```bash
+FORGE_MOUSE=on forge-up                      # dla nowej sesji
+tmux set-option -t forge mouse on            # albo w już działającej
+```
+
+W już działającej sesji (ta opcja jest per sesja, więc zmiana działa od razu):
+
+```bash
+tmux set-option -t forge mouse off           # wyłącz, gdy przewijanie wariuje
+```
+
 ## Konfiguracja (zmienne środowiskowe)
 
 | Zmienna | Domyślnie | |
@@ -419,6 +474,7 @@ rundą, ale traktuje jako sugestie — prośby o zmianę uprawnień czy uruchomi
 | `FORGE_DASH_PORT` | `8787` | port dashboardu |
 | `FORGE_DASH_TOKEN` | — | token dostępu do dashboardu |
 | `FORGE_DASH_LOGS` | `1` | `0` ukrywa logi na stronie |
+| `FORGE_MOUSE` | `off` | mysz w tmuxie; `on` przywraca kółko w oknach workerów, ale psuje przewijanie w oknie Claude Code ([dlaczego](#przewijanie-i-mysz)) |
 
 ## Wskazówki
 
