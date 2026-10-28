@@ -2,7 +2,11 @@
 # Shared helpers for forge-* commands. Sourced, not executed.
 set -euo pipefail
 
-FORGE_HOME="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# -P resolves symlinks, because the guard below compares this against a path
+# from git, which is always fully resolved. On macOS /tmp and /var are symlinks
+# into /private, so an unresolved FORGE_HOME would never match and the guard
+# would silently stop protecting.
+FORGE_HOME="$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
 FORGE_SESSION="${FORGE_SESSION:-forge}"
 
 die()  { echo "forge: $*" >&2; exit 1; }
