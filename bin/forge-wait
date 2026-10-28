@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# forge-wait [name ...] [--timeout SEC]
+# Blocks until the given workers (default: all active) leave queued/running,
+# then prints forge-status. Exit 2 on timeout. Default timeout: 1800s.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+timeout=1800; names=()
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --timeout) timeout="$2"; shift 2 ;;
+    *) valid_name "$1"; names+=("$1"); shift ;;
+  esac
+done
+
+active() {
+  local f s
+  shopt -s nullglob
+  if [[ ${#names[@]} -gt 0 ]]; then
+    for n in "${names[@]}"; do s="$(agent_get "$n" status)"; [[ "$s" == queued || "$s" == running ]] && echo "$n"; done
+  else
+    for f in "$STATE"/agents/*.json; do jq -r 'select(.status=="queued" or .status=="running") | .name' "$f"; done
+  fi
+  return 0
+}
+
+start=$SECONDS
+while [[ -n "$(active)" ]]; do
+  (( SECONDS - start >= timeout )) && { echo "timeout; still active: $(active | tr '\n' ' ')"; exit 2; }
+  sleep 5
+done
+"$FORGE_HOME/bin/forge-status"

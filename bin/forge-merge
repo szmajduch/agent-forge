@@ -1,0 +1,33 @@
+#!/usr/bin/env bash
+# forge-merge <name> [--keep]
+# Merges agent/<name> into the branch currently checked out in the main repo
+# (--no-ff, so each worker stays one visible unit). Then removes the worktree
+# and branch unless --keep. Aborts cleanly on conflicts.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+[[ $# -ge 1 ]] || die "usage: forge-merge <name> [--keep]"
+name="$1"; valid_name "$name"; keep="${2:-}"
+
+status="$(agent_get "$name" status)"
+[[ "$status" == "done" || "$status" == "conflict" ]] || die "agent '$name' is '$status' — only done (or conflict, after you fixed it) can be merged"
+branch="$(agent_get "$name" branch)"
+wt="$(agent_get "$name" worktree)"
+
+git -C "$ROOT" diff --quiet && git -C "$ROOT" diff --cached --quiet \
+  || die "main repo has uncommitted changes; commit or stash them first"
+
+target="$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)"
+if ! git -C "$ROOT" merge --no-ff -q -m "forge: merge $branch ($(agent_get "$name" title))" "$branch"; then
+  git -C "$ROOT" merge --abort || true
+  agent_set "$name" status=conflict
+  die "merge conflict with $target — merge aborted. Rebase the worker or spawn a fix-up worker."
+fi
+
+agent_set "$name" status=merged merged_into="$target" merged_sha="$(git -C "$ROOT" rev-parse --short HEAD)"
+echo "merged $branch into $target"
+
+if [[ "$keep" != "--keep" ]]; then
+  tmux kill-window -t "$FORGE_SESSION:$name" 2>/dev/null || true
+  git -C "$ROOT" worktree remove --force "$wt"
+  git -C "$ROOT" branch -q -d "$branch"
+  echo "removed worktree and branch"
+fi

@@ -1,0 +1,347 @@
+# forge — Claude Code orkiestruje, Codex buduje
+
+Zestaw skryptów do workflow: **tmux + git worktree + Claude Code (orkiestrator) + Codex CLI (workerzy)**,
+ze stroną statusu wystawianą przez Cloudflare.
+
+```
+tmux session "forge"
+├── orchestrator   Claude Code w katalogu repo — planuje, zleca, robi review, merguje
+├── dashboard      strona statusu na 127.0.0.1:8787 (+ feedback od klienta)
+├── <worker-1..N>  Codex `exec` — każdy na własnym branchu agent/<name> i worktree
+│                  (build = zmienia kod, analysis = czyta i pisze raport)
+└── tunnel         cloudflared → publiczny URL do dashboardu (FORGE_TUNNEL=1)
+```
+
+![dashboard](docs/dashboard.png)
+
+## Instalacja (macOS) — raz, nie w projekcie
+
+Folder `forge` to narzędzie wspólne dla wszystkich projektów. Trzymaj go w jednym stałym
+miejscu (np. `~/tools/forge`), **nie kopiuj go do repo**. Do projektów trafiają tylko pliki
+z `forge-init` (sekcja niżej).
+
+```bash
+# zależności
+brew install tmux jq git python
+npm i -g @anthropic-ai/claude-code @openai/codex
+claude          # zaloguj się raz
+codex login     # zaloguj się raz
+brew install cloudflared          # opcjonalnie, do wystawienia dashboardu
+
+# forge
+mkdir -p ~/tools && unzip forge.zip -d ~/tools   # → ~/tools/forge
+~/tools/forge/install.sh   # instaluje komendy forge-* do ~/.local/bin i sprawdza zależności
+```
+
+Jeśli później przeniesiesz folder `forge`, uruchom `install.sh` ponownie.
+
+`install.sh` nie zmienia zmiennych środowiskowych ani plików konfiguracyjnych powłoki. Jeśli
+`~/.local/bin` nie ma w `PATH` (na macOS domyślnie nie ma), wypisze linię do dodania ręcznie:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
+```
+
+Opcjonalnie [lemux](https://github.com/Photon48/lemux) — forkowanie rozmów z orkiestratorem
+w osobne okna tmux. Działa obok forge bez konfiguracji.
+
+## Start w projekcie
+
+Wszystkie komendy `forge-*` to skrypty z katalogu `bin/` tego zestawu (nie zewnętrzne narzędzia).
+`./install.sh` tworzy dla nich krótkie launchery w `~/.local/bin`, więc działają z dowolnego katalogu.
+
+```bash
+cd ~/code/moj-projekt
+forge-init                       # PROJECT.md, CLAUDE.md, AGENTS.md, FORGE.md, .claude/settings.json
+git add -A && git commit -m "forge setup"   # ważne: workerzy startują z commita, muszą widzieć AGENTS.md
+forge-up                         # otwiera sesję tmux z Claude Code w oknie 0
+```
+
+W Claude Code po prostu opisz cel, np.:
+
+> Dodaj endpoint /api/orders/export (CSV), testy i przycisk w UI. Rozdziel na workerów.
+
+Claude rozpisze plan, po Twoim „ok” odpali workerów, poczeka, przejrzy diffy i zmerguje.
+Między oknami tmux skaczesz `Ctrl-b w` (lista) lub `Ctrl-b <numer>`.
+
+## Dwa typy zadań: build i analysis
+
+Worker Codex nie musi zmieniać kodu — może też **analizować**. To ten sam
+agent, inny kontrakt na wynik:
+
+| Typ | `--kind` | Wynik | Gotowe, gdy |
+|---|---|---|---|
+| **build** | `build` (domyślny) | zmieniony kod | check akceptacyjny przechodzi |
+| **analysis** | `analysis` | raport | raport odpowiada na pytanie z dowodami |
+
+```bash
+forge-spawn --kind analysis audyt-cusip "Sprawdź pokrycie CUSIP→CIK w .work/..."
+```
+
+Typ `analysis` używaj, gdy zadanie polega na **ustaleniu**, nie na zmianie:
+audyt danych, weryfikacja wyniku innego workera, zbadanie buga przed naprawą,
+przegląd implementacji. Nie wciskaj takiego zadania w brief typu build — nie ma
+tam testu do przejścia, a worker, któremu kazano zmieniać kod, zmieni kod,
+który miał tylko przeczytać.
+
+**Raport jest wynikiem, nie notatką.** Worker pisze go do `reports/<name>.md`
+i harness **commituje go razem z pracą** — nie jest kasowany ani ucinany.
+W `.forge/agents/<name>.json` (a więc w `forge-status`, `forge-review`
+i na dashboardzie) ląduje tylko podgląd pierwszych 4 KB z odnośnikiem do
+pełnej treści. Starsze `FORGE_REPORT.md` w katalogu głównym nadal działa —
+harness przenosi go do `reports/<name>.md`.
+
+Dla zadań analitycznych `AGENTS.md` wymaga wprost: źródło przy każdym
+twierdzeniu (ścieżka, wiersz, hash), rozdzielenie obserwacji od wnioskowania
+oraz tego, że **„nierozstrzygnięte" jest poprawną odpowiedzią** — lepszą od
+zgadywania.
+
+### Niezależna weryfikacja
+
+Żeby worker sprawdził pracę innego **niezależnie**, daj mu bazę sprzed tej
+pracy, a nie jego branch — inaczej odziedziczy jego uzasadnienie:
+
+```bash
+forge-spawn --kind analysis weryfikacja --base main "Sprawdź raport z agent/audyt..."
+```
+
+`--base <ref>` działa jak `FORGE_BASE`, ale per worker. Flagi można podawać
+przed nazwą albo po niej.
+
+### Dostęp do danych poza repo (`--link`)
+
+Worktree zawiera **tylko pliki śledzone przez gita**, więc wszystko z
+`.gitignore` (virtualenv, duże dane) w nim nie istnieje. Dowiąż to jawnie:
+
+```bash
+forge-spawn --kind analysis audyt --link .venv --link .work "Sprawdź ..."
+```
+
+`--link` tworzy symlink z głównego repo do worktree i dopisuje ścieżkę do
+lokalnego `info/exclude` — wzorce typu `.venv/` ze slashem **nie łapią
+symlinków**, więc bez tego pokazywałyby się jako untracked i worker mógłby je
+scommitować. Można też ustawić `FORGE_LINK=".venv .work"`.
+
+Sandbox `-s workspace-write` **pozwala czytać** dowiązane katalogi, ale
+**blokuje zapis** poza worktree — sprawdzone: `mkdir` w dowiązanym `.work`
+zwraca `Operation not permitted`. Dlatego artefakty pisz do worktree, a po
+review przenieś je do docelowego katalogu. Nie używaj `--add-dir` na katalog
+tylko do czytania: dałoby prawo zapisu tam, gdzie nie wolno modyfikować.
+
+## Wybór modeli
+
+**Orkiestrator (Claude Code)** — model wybierasz Ty: `/model` w Claude Code albo
+`FORGE_ORCH_CMD="claude --model opus" forge-up`.
+
+**Workerzy (Codex)** — model dla każdego zadania wybiera Claude, ale tylko z listy, którą
+ustalasz w `~/tools/forge/models.conf`:
+
+```
+szybki-model      małe, dobrze opisane zmiany, testy, dokumentacja, boilerplate
+mocny-model       zmiany architektury, trudne bugi, refaktory między modułami
+default szybki-model
+```
+(to przykładowe nazwy — wpisz dokładnie te, które przyjmuje Twój `codex exec -m`).
+
+- Opis po nazwie to wskazówka dla Claude'a, kiedy użyć danego modelu — pisz go konkretnie.
+- `default` — model dla zadań bez `--model`. Bez tej linii Codex użyje swojego domyślnego.
+- Pusta lista = `--model` wyłączony, wszyscy workerzy na domyślnym modelu Codexa.
+- Nazwa spoza listy jest odrzucana, więc Claude nie wymyśli nieistniejącego modelu.
+- Model widać w `forge-status`, w logu workera i na dashboardzie.
+- Inny plik dla konkretnego projektu: `FORGE_MODELS_FILE=/ścieżka/models.conf forge-up`.
+
+**Lista modeli się zmienia.** Jest odświeżana z serwera, więc `models.conf`
+może się zdezaktualizować. Jak sprawdzić, co przyjmuje twoje CLI:
+
+```bash
+# co konto ma dostępne (lista z serwera, bywa nieaktualna w cache)
+python3 -c "import json,re;s=open('$HOME/.codex/.codex-global-state.json').read();\
+print(json.loads(re.search(r'"eligible_codex_model_slugs":\s*(\[[^]]*\])',s).group(1)))"
+
+# co faktycznie było używane
+grep -rho '"model":"[^"]*"' ~/.codex/sessions --include='*.jsonl' | sort | uniq -c | sort -rn
+
+# test rozstrzygający (w katalogu repo git); zła nazwa → model_not_found
+codex exec -s read-only -m <nazwa> "Reply with exactly: OK" < /dev/null
+```
+
+Tylko trzeci sposób jest dowodem — lista z cache i historia sesji mogą być
+niepełne albo przestarzałe.
+
+## Reasoning effort
+
+`--effort low|medium|high|xhigh|max|ultra` ustawia nakład rozumowania workera.
+Wyższy to więcej czasu i tokenów; **nie jest gwarancją poprawności** i nie
+zastępuje źródeł, testów ani oznaczania przypadków nierozstrzygniętych.
+Pominięty — model używa swojego domyślnego.
+
+```bash
+forge-spawn --model gpt-6-astra --effort xhigh --kind analysis audyt "Sprawdź ..."
+```
+
+| Effort | Kiedy |
+|---|---|
+| `low` | ekstrakcja danych, drobna edycja, jeden jednoznaczny krok |
+| `medium` | domyślny punkt startowy do zwykłego kodowania i analizy |
+| `high` | trudne błędy, projektowanie rozwiązania, wnioskowanie z kilku źródeł |
+| `xhigh` | złożone audyty, sprzeczne dowody, wiele zależności |
+| `max` | wyjątkowo trudne przypadki, gdy dodatkowy czas jest uzasadniony |
+| `ultra` | dostępny, ale bez udokumentowanej przewagi nad `max` |
+
+Technicznie: `codex exec` **nie ma** flagi effortu — forge przekazuje go jako
+`-c model_reasoning_effort="<poziom>"`. Klucz `reasoning_effort` (bez prefiksu
+`model_`) jest po cichu ignorowany z ostrzeżeniem o nierozpoznanym ustawieniu,
+więc nie wpisuj go z pamięci. Sprawdzone 2026-10-28 na codex-cli 0.163.0:
+przyjęte są wszystkie sześć poziomów, a nazwa spoza listy jest odrzucana.
+
+## Komendy
+
+| Komenda | Co robi |
+|---|---|
+| `forge-spawn [--model <m>] [--effort <poziom>] [--kind build\|analysis] [--base <ref>] [--link <path>] <name> "<zadanie>"` | branch `agent/<name>` + worktree + Codex w nowym oknie tmux. Zadanie może iść też przez stdin. `--model` tylko z listy w `models.conf`. `--effort` = nakład rozumowania. `--kind analysis` = worker pisze raport, nie zmienia kodu. `--base` = inny punkt startu. `--link` = dowiąż gitignorowaną ścieżkę. |
+| `forge-models` | lista modeli Codex, które orkiestrator może wybierać, z opisem kiedy który |
+| `forge-wait [names…] [--timeout s]` | czeka aż workerzy skończą, potem pokazuje status |
+| `forge-status [--json] [name]` | tabela workerów; z nazwą — raport i ostatnie linie logu |
+| `forge-review <name> [--stat]` | raport workera, commity, diff względem punktu startu |
+| `forge-merge <name> [--keep]` | `merge --no-ff` do bieżącego brancha; przy konflikcie robi abort i oznacza `conflict` |
+| `forge-drop <name>` | **odrzuca** pracę workera (okno, worktree, branch) — Claude musi pytać |
+| `forge-up [-d]` | startuje całą sesję |
+| `forge-init` | instaluje pliki ról w repo |
+
+Statusy workera: `queued → running → done | nochanges | failed`, potem `merged | conflict | dropped`.
+`nochanges` znaczy, że worker nic nie wniósł — dla typu build brak zmian w kodzie,
+dla analysis brak raportu. Worker analityczny, który napisał raport, kończy jako `done`.
+Stan leży w `.forge/` (automatycznie wykluczone z gita przez `.git/info/exclude`),
+worktree w `../.forge-wt/<repo>/<name>`.
+
+## Role — trzy pliki
+
+`forge-init` instaluje układ, w którym **żadne narzędzie nie czyta roli drugiego**:
+
+```
+PROJECT.md   zasady projektu — JEDYNE źródło prawdy
+   ↑ @PROJECT.md              ↑ @PROJECT.md
+CLAUDE.md                  AGENTS.md
+(orkiestrator)             (worker Codex)
+   ↑ @FORGE.md                + reguły workera
+FORGE.md
+```
+
+- **`PROJECT.md`** — zasady wspólne: środowisko, brama jakości, konwencje,
+  pułapki. **Tu piszesz zasady projektu.** `forge-init` tworzy go jako szkielet
+  do wypełnienia i **nigdy nie nadpisuje**, jeśli już istnieje.
+- **`CLAUDE.md`** — rola orkiestratora; importuje `@PROJECT.md` + `@FORGE.md`.
+- **`AGENTS.md`** — rola workera Codex; importuje `@PROJECT.md` i dokłada reguły
+  workera: tylko swój zakres, bez commitów (robi to harness), raport do
+  `reports/<name>.md`. Osobne reguły dla build (check akceptacyjny) i analysis
+  (dowód przy każdym twierdzeniu, „nierozstrzygnięte" dozwolone).
+- **`FORGE.md`** — pętla orkiestratora: plan → spawn → wait → review → merge →
+  raport. Zakazy: push, przepisywanie historii, merge bez przeczytania diffa,
+  `forge-drop` bez pytania. **Właścicielem jest forge** — `forge-init` odświeża
+  ten plik przy każdym uruchomieniu, więc nie dopisuj tu swoich zasad.
+- **`.claude/settings.json`** — komendy forge-* dozwolone bez pytania; `forge-drop`, `git push/reset/rebase`
+  wymagają potwierdzenia; `.env`, `secrets/`, `*.pem`, `*.key` zablokowane do czytania.
+
+Dostosuj do projektu: w `PROJECT.md` opisz, jak uruchamiać testy
+(`./gradlew test`, `npm test`, `pytest`) i co jest checkiem akceptacyjnym.
+
+`forge-init` można **uruchamiać wielokrotnie**. Nadpisuje tylko `FORGE.md`;
+pozostałe pliki tworzy, gdy ich nie ma, albo dokłada brakujący import. Jeśli
+wykryje stary układ jednoplikowy (`CLAUDE.md` jako symlink do `AGENTS.md`, albo
+`@FORGE.md` w `AGENTS.md`), **nie zmienia go sam** — wypisuje ostrzeżenie, bo
+to decyzja operatora.
+
+## Zanim zlecisz pierwsze zadanie
+
+Cztery awarie na pięć uruchomień w sesji 2026-10-28 wyszłyby na jednym
+próbnym spawnie. Sprawdź po kolei:
+
+```bash
+forge-models                 # czy komenda istnieje (jeśli nie: ./install.sh)
+codex exec -s workspace-write "echo ok"   # czy CLI przyjmuje te flagi
+```
+
+- **`error: unexpected argument '--full-auto'`** — masz Codex CLI ≥ 0.163.0,
+  gdzie tej flagi już nie ma. Domyślna wartość w forge to teraz
+  `-s workspace-write`; jeśli widzisz ten błąd, masz starą wersję forge.
+- **Zmienna przed `forge-spawn` nie działa?** `tmux new-window` dziedziczy
+  środowisko **serwera tmux**, nie twojej powłoki. `forge-spawn` przekazuje
+  dziś `FORGE_*` jawnie przez `-e`, ale dla innych zmiennych użyj
+  `tmux set-environment -t forge NAZWA wartość`.
+- **Worker nie znajduje `.venv` / danych?** To nie jest w gicie, więc nie ma
+  tego w worktree. Użyj `--link` (sekcja wyżej) **przed** spawnem.
+- **`forge-models: command not found`** — launchery w `~/.local/bin` są
+  nieaktualne; uruchom ponownie `./install.sh`.
+- **Testy porównujące hashe plików padają tylko u workerów?** To końce linii.
+  Przy `core.autocrlf=true|input` git normalizuje CRLF przy commicie: twój
+  katalog główny zachowuje oryginalne bajty i testy przechodzą, a worker
+  dostaje z gita wersję znormalizowaną. `forge-init` ostrzega o tym układzie.
+  Naprawa: `-text` w `.gitattributes` dla tych ścieżek **i** ponowny zapis
+  (`git add --renormalize -- <ścieżka>/`) — sam atrybut nie przywróci bajtów
+  usuniętych z istniejących blobów. Sprawdzaj w świeżym worktree.
+
+**Status `done` nie znaczy, że jest produkt.** Worker może skończyć z commitem,
+którego jedyną treścią jest raport „nie dało się nic zmierzyć". Zawsze czytaj
+raport, nie tylko status.
+
+## Wrażliwe dane
+
+Claude Code i Codex działają w chmurze, więc wszystko, co czytają, wychodzi z maszyny.
+Przed użyciem na repo firmowym sprawdź, czy polityka firmy na to pozwala. Ochrona w forge:
+
+- **Workerzy Codex widzą tylko śledzone pliki.** Worktree zawiera to, co jest w gicie, więc
+  `.env` i inne pliki z `.gitignore` do nich nie trafiają. Pilnuj, żeby sekrety nie były commitowane.
+- **Orkiestrator ma blokady odczytu** w `.claude/settings.json` (`deny`): `.env*`, `secrets/`,
+  `*.pem`, `*.key`. Dopisz tam swoje ścieżki (np. `Read(./config/prod/**)`).
+- **`FORGE.md` każe Claude'owi pytać**, zamiast czytać lub przekazywać workerom dane klientów,
+  logi produkcyjne itp. Wtedy podajesz zanonimizowaną próbkę albo opis.
+
+## Cloudflare — podgląd dla operatora i klienta
+
+Dashboard nasłuchuje tylko na localhost. Wystawienie:
+
+```bash
+export FORGE_DASH_TOKEN=$(openssl rand -hex 16)   # bez tokenu każdy z URL-em widzi logi
+export FORGE_DASH_LOGS=0                           # dla klienta: ukryj surowe logi workerów
+FORGE_TUNNEL=1 forge-up
+# w oknie "tunnel" pojawi się https://xxxx.trycloudflare.com → wysyłasz: <url>/?t=<token>
+```
+
+Szybki tunel (`trycloudflare.com`) jest tymczasowy. Na stałe: nazwany tunel + Cloudflare Access
+(logowanie mailem klienta):
+
+```bash
+cloudflared tunnel login
+cloudflared tunnel create forge
+cloudflared tunnel route dns forge forge.twojadomena.pl
+FORGE_TUNNEL=1 FORGE_TUNNEL_NAME=forge forge-up
+```
+…i w panelu Cloudflare Zero Trust dodaj aplikację Access dla `forge.twojadomena.pl`.
+
+Feedback wpisany na stronie trafia do `.forge/feedback.jsonl`. Orkiestrator czyta go przed każdą
+rundą, ale traktuje jako sugestie — prośby o zmianę uprawnień czy uruchomienie komend kieruje do Ciebie.
+
+## Konfiguracja (zmienne środowiskowe)
+
+| Zmienna | Domyślnie | |
+|---|---|---|
+| `FORGE_SESSION` | `forge` | nazwa sesji tmux |
+| `FORGE_BASE` | bieżący branch | z czego workerzy startują (per worker: `--base`) |
+| `FORGE_LINK` | — | gitignorowane ścieżki dowiązywane do worktree (per worker: `--link`) |
+| `FORGE_CODEX_ARGS` | `-s workspace-write` | argumenty `codex exec`. Codex CLI 0.163.0 **nie ma już `--full-auto`** — używa `-s read-only\|workspace-write\|danger-full-access` |
+| `FORGE_CODEX_CMD` | `codex` | inny CLI z interfejsem `exec <prompt>` |
+| `FORGE_ORCH_CMD` | `claude` | komenda w oknie orkiestratora |
+| `FORGE_KEEP_WINDOW` | `1` | okno workera zostaje otwarte po zakończeniu |
+| `FORGE_REPORT_DIR` | `reports` | katalog na raporty workerów (commitowane) |
+| `FORGE_WT_ROOT` | `../.forge-wt/<repo>` | gdzie trzymać worktree |
+| `FORGE_DASH_PORT` | `8787` | port dashboardu |
+| `FORGE_DASH_TOKEN` | — | token dostępu do dashboardu |
+| `FORGE_DASH_LOGS` | `1` | `0` ukrywa logi na stronie |
+
+## Wskazówki
+
+- Dziel pracę po granicach modułów — dwóch workerów na jednym pliku = konflikt przy merge.
+  Przy konflikcie: `FORGE_BASE=main forge-spawn <name>-fix "Przenieś zmiany z agent/<name> na aktualny main…"`
+  albo w oknie workera `git merge main`, rozwiąż konflikt, commit, i ponów `forge-merge <name>`.
+- Zacznij od 2–3 workerów; więcej zwykle oznacza więcej review niż oszczędności.
+- Okno workera po zakończeniu zostaje otwarte — możesz w nim od razu uruchomić testy.

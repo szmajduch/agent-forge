@@ -1,0 +1,28 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(forge-spawn:*)",
+      "Bash(forge-status:*)",
+      "Bash(forge-wait:*)",
+      "Bash(forge-review:*)",
+      "Bash(forge-merge:*)",
+      "Bash(forge-models:*)",
+      "Bash(git status:*)",
+      "Bash(git diff:*)",
+      "Bash(git log:*)"
+    ],
+    "ask": [
+      "Bash(forge-drop:*)",
+      "Bash(git push:*)",
+      "Bash(git reset:*)",
+      "Bash(git rebase:*)"
+    ],
+    "deny": [
+      "Read(./.env)",
+      "Read(./.env.*)",
+      "Read(./secrets/**)",
+      "Read(./**/*.pem)",
+      "Read(./**/*.key)"
+    ]
+  }
+}

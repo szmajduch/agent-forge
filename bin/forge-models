@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# forge-models — lists the Codex models the orchestrator may pass to
+# `forge-spawn --model`, with when to use each. Edit models.conf to change.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+
+list="$(models_list)"
+if [[ -z "$list" ]]; then
+  echo "No models configured ($MODELS_FILE)."
+  echo "Do not pass --model; workers use Codex's default model."
+  exit 0
+fi
+def="$(model_default)"
+printf '%-24s %s\n' MODEL "WHEN TO USE"
+while IFS=$'\t' read -r n d; do
+  [[ "$n" == "$def" ]] && n="$n (default)"
+  printf '%-24s %s\n' "$n" "$d"
+done <<< "$list"
+[[ -z "$def" ]] && echo "(no default: without --model, Codex uses its own default)"
+exit 0

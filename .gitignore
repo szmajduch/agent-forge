@@ -1,0 +1,4 @@
+# Lokalna lista modeli dla konkretnej instalacji.
+models.local.conf
+
+.DS_Store

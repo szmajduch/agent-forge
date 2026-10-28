@@ -1,0 +1,6 @@
+# Skrypty muszą zachować LF — w CRLF nie wykona ich żaden shell.
+*.sh    text eol=lf
+bin/*   text eol=lf
+
+# Binaria bez normalizacji.
+*.png   binary

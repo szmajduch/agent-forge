@@ -1,0 +1,40 @@
+#!/usr/bin/env bash
+# forge-up [-d]   — run from your project repo.
+# Starts tmux session "forge" with:
+#   orchestrator : Claude Code in the repo root
+#   dashboard    : status page on 127.0.0.1:$FORGE_DASH_PORT (default 8787)
+#   tunnel       : cloudflared tunnel     (only if FORGE_TUNNEL=1)
+# -d : don't attach.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+attach=1; [[ "${1:-}" == "-d" ]] && attach=0
+port="${FORGE_DASH_PORT:-8787}"
+
+if tmux has-session -t "$FORGE_SESSION" 2>/dev/null; then
+  info "session '$FORGE_SESSION' already exists"
+else
+  tmux new-session -d -s "$FORGE_SESSION" -n orchestrator -c "$ROOT" "${FORGE_ORCH_CMD:-claude}; exec ${SHELL:-bash}"
+  # Friendlier defaults for this session only: mouse scroll/click/select windows,
+  # bigger scrollback, and the window list kept visible at the bottom.
+  tmux set-option -t "$FORGE_SESSION" mouse on
+  tmux set-option -t "$FORGE_SESSION" history-limit 50000
+  tmux set-option -t "$FORGE_SESSION" status on
+  # Esc is used by Claude Code to cancel; tmux's default 500ms delay makes it feel stuck.
+  [[ "$(tmux show-options -sv escape-time 2>/dev/null)" -gt 50 ]] 2>/dev/null && tmux set-option -s escape-time 10
+  tmux new-window -d -t "$FORGE_SESSION:" -n dashboard -c "$ROOT" \
+    "python3 '$FORGE_HOME/bin/forge-dashboard' --root '$ROOT' --port $port; exec ${SHELL:-bash}"
+
+  if [[ "${FORGE_TUNNEL:-0}" == "1" ]]; then
+    [[ -n "${FORGE_DASH_TOKEN:-}" ]] || info "WARNING: tunnel without FORGE_DASH_TOKEN — anyone with the URL sees your logs"
+    if [[ -n "${FORGE_TUNNEL_NAME:-}" ]]; then
+      tcmd="cloudflared tunnel --url http://127.0.0.1:$port run '$FORGE_TUNNEL_NAME'"   # named tunnel (+ Cloudflare Access)
+    else
+      tcmd="cloudflared tunnel --url http://127.0.0.1:$port"                          # quick *.trycloudflare.com URL
+    fi
+    tmux new-window -d -t "$FORGE_SESSION:" -n tunnel "$tcmd; exec ${SHELL:-bash}"
+  fi
+  info "session '$FORGE_SESSION' started — dashboard: http://127.0.0.1:$port"
+fi
+
+if [[ $attach -eq 1 ]]; then
+  if [[ -n "${TMUX:-}" ]]; then tmux switch-client -t "$FORGE_SESSION"; else tmux attach -t "$FORGE_SESSION"; fi
+fi

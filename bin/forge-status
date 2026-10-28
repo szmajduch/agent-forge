@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# forge-status [--json] [name]  — overview of all workers (or one).
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+
+json=0
+[[ "${1:-}" == "--json" ]] && { json=1; shift; }
+
+shopt -s nullglob
+files=("$STATE"/agents/*.json)
+[[ -n "${1:-}" ]] && files=("$(agent_file "$1")")
+
+if [[ $json -eq 1 ]]; then
+  jq -s '.' "${files[@]}" 2>/dev/null || echo '[]'
+  exit 0
+fi
+
+if [[ ${#files[@]} -eq 0 ]]; then echo "no agents yet"; exit 0; fi
+
+printf '%-18s %-10s %-9s %-9s %-24s %s\n' NAME STATUS KIND COMMIT MODEL/EFFORT TITLE
+for f in "${files[@]}"; do
+  jq -r '[.name, .status, (.kind // "build"), (.commit // "-"), ((if (.model // "") == "" then "default" else .model end) + (if (.effort // "") == "" then "" else "/" + .effort end)), .title] | @tsv' "$f" |
+    while IFS=$'\t' read -r n s k c m t; do printf '%-18s %-10s %-9s %-9s %-24s %s\n' "$n" "$s" "$k" "$c" "$m" "$t"; done
+done
+
+if [[ -n "${1:-}" ]]; then
+  echo; echo "--- report ---"; agent_get "$1" report
+  rp="$(agent_get "$1" report_path)"
+  [[ -n "$rp" ]] && echo "(full report committed at: $rp)"
+  echo "--- last log lines ---"; tail -n 20 "$STATE/logs/$1.log" 2>/dev/null || true
+fi

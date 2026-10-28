@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# forge-init — run inside a project repo. Installs the role instructions as
+# three files, so neither tool reads the other's role:
+#
+#   PROJECT.md  shared project rules — the single source of truth.
+#               Created from a template only if missing; never overwritten.
+#   CLAUDE.md   Claude Code = orchestrator. Imports @PROJECT.md + @FORGE.md.
+#   AGENTS.md   Codex = worker. Imports @PROJECT.md + the worker rules.
+#   FORGE.md    orchestrator loop (owned by forge, always refreshed).
+#   .claude/settings.json  permissions (only if missing)
+#
+# Safe to re-run: only FORGE.md is overwritten. Everything else is created
+# when absent, or extended in place when it lacks a piece.
+#
+# It also warns about a line-ending setup that makes workers fail in a way that
+# is invisible in the main checkout — see the checks at the end.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+T="$FORGE_HOME/templates"
+cd "$ROOT"
+
+# --- FORGE.md: owned by forge, so it is the one file we refresh ---------------
+cp "$T/FORGE.md" FORGE.md && echo "wrote FORGE.md (refreshed)"
+
+# --- PROJECT.md: the project's own rules; never clobber them ------------------
+if [[ ! -f PROJECT.md ]]; then
+  cp "$T/PROJECT.md" PROJECT.md && echo "wrote PROJECT.md (fill it in — it is a stub)"
+else
+  echo "kept PROJECT.md (already exists)"
+fi
+
+# Appends an import line to a file unless some @<file> import is already there.
+# $1 = file, $2 = import target, $3 = text to append when the file has none.
+ensure_import() {
+  local file="$1" target="$2" block="$3"
+  if grep -qxF "@$target" "$file"; then
+    return 1
+  fi
+  printf '%s' "$block" >> "$file"
+  return 0
+}
+
+# --- CLAUDE.md: orchestrator role -------------------------------------------
+if [[ ! -f CLAUDE.md ]]; then
+  cp "$T/CLAUDE.md" CLAUDE.md && echo "wrote CLAUDE.md (orchestrator role)"
+else
+  # A symlink to AGENTS.md is the old single-file layout: following it would
+  # write the orchestrator's role into the worker's file.
+  if [[ -L CLAUDE.md ]]; then
+    echo "NOTE: CLAUDE.md is a symlink to '$(readlink CLAUDE.md)'."
+    echo "      That layout gives both tools each other's role. Replace it with a"
+    echo "      real file importing @PROJECT.md + @FORGE.md (see $T/CLAUDE.md)."
+  else
+    added=""
+    ensure_import CLAUDE.md PROJECT.md $'\n@PROJECT.md\n' && added="$added @PROJECT.md"
+    ensure_import CLAUDE.md FORGE.md   $'\n@FORGE.md\n'   && added="$added @FORGE.md"
+    if [[ -n "$added" ]]; then
+      echo "added import(s) to CLAUDE.md:$added"
+    else
+      echo "kept CLAUDE.md (imports already present)"
+    fi
+    grep -q '<!-- forge:worker -->' CLAUDE.md && \
+      echo "NOTE: CLAUDE.md contains the worker rules (<!-- forge:worker -->) — move them to AGENTS.md"
+  fi
+fi
+
+# --- AGENTS.md: worker role --------------------------------------------------
+if [[ ! -f AGENTS.md ]]; then
+  { printf '# Codex\n\nRole: **forge worker**.\n\nProject rules (shared by every agent):\n\n@PROJECT.md\n\n'
+    cat "$T/AGENTS.md"; } > AGENTS.md && echo "wrote AGENTS.md (worker role)"
+else
+  added=""
+  ensure_import AGENTS.md PROJECT.md $'\n@PROJECT.md\n' && added="$added @PROJECT.md"
+  if ! grep -q '<!-- forge:worker -->' AGENTS.md; then
+    { echo; cat "$T/AGENTS.md"; } >> AGENTS.md && added="$added worker-rules"
+  fi
+  if [[ -n "$added" ]]; then
+    echo "extended AGENTS.md:$added"
+  else
+    echo "kept AGENTS.md (worker rules and import already present)"
+  fi
+  grep -qxF '@FORGE.md' AGENTS.md && \
+    echo "NOTE: AGENTS.md imports @FORGE.md — that is the orchestrator's role. Remove it so Codex doesn't read it."
+fi
+
+# --- permissions -------------------------------------------------------------
+mkdir -p .claude
+if [[ ! -f .claude/settings.json ]]; then
+  cp "$T/claude-settings.json" .claude/settings.json && echo "wrote .claude/settings.json"
+else
+  echo "NOTE: .claude/settings.json exists — merge permissions from $T/claude-settings.json by hand"
+fi
+
+# --- line endings: a worktree-only failure mode ---------------------------------
+# With core.autocrlf=true/input git rewrites CRLF on commit, so the blob differs
+# from the file that was downloaded. The main checkout keeps its original bytes
+# and tests that hash files still pass there, while every worker — which gets a
+# fresh worktree, i.e. the blob — fails. Byte-exact fixtures are common in these
+# repos, so this is worth a warning. forge does not write .gitattributes itself:
+# only the project knows which paths must stay byte-exact.
+crlf_warn() {
+  local mode
+  mode="$(git -C "$ROOT" config --get core.autocrlf || true)"
+  [[ "$mode" == "true" || "$mode" == "input" ]] || return 0
+
+  # Count tracked files that currently hold CRLF in the working tree and have
+  # no -text exemption: exactly the files whose bytes a commit would change.
+  # Markdown and sources the project itself writes are not the concern here,
+  # so only data-ish extensions are counted — a wrong number is worse than none.
+  local exposed=0 f
+  while IFS= read -r f; do
+    [[ -f "$f" ]] || continue
+    head -c 8000 "$f" 2>/dev/null | grep -q $'\r' && exposed=$((exposed+1))
+  done < <(git -C "$ROOT" ls-files --eol 2>/dev/null \
+    | awk '$3 !~ /-text/ {sub(/^[^\t]*\t/,""); print}' \
+    | grep -iE '\.(xsd|xsl|xslt|xml|json|csv|txt|html?|pds|dtd|sgml?)$' || true)
+
+  echo
+  echo "WARNING: core.autocrlf=$mode in this repo."
+  echo "  git rewrites line endings on commit, so a fresh worktree can get bytes"
+  echo "  that differ from your checkout. Tests that compare file hashes then"
+  echo "  pass here and fail for every worker — the main checkout keeps the"
+  echo "  original bytes, a worker gets the normalized blob."
+  if [[ "${exposed:-0}" -gt 0 ]]; then
+    echo "  Data files holding CRLF with no -text exemption: $exposed"
+  fi
+  echo "  If any path must stay byte-exact (downloaded fixtures, specs, samples):"
+  echo "    echo '<path>/** -text' >> .gitattributes"
+  echo "    git add .gitattributes && git add --renormalize -- <path>/"
+  echo "  Then verify by running your test command in a FRESH WORKTREE, not here."
+}
+crlf_warn
+
+echo
+echo "Layout:  PROJECT.md (shared)  ←  CLAUDE.md (orchestrator) + AGENTS.md (worker)"
+echo "Put project rules in PROJECT.md only; keep the role files thin."
+echo "Commit PROJECT.md, CLAUDE.md, AGENTS.md, FORGE.md, .claude/settings.json"
+echo "so workers see them, then run: forge-up"

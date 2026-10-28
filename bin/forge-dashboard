@@ -1,0 +1,244 @@
+#!/usr/bin/env python3
+"""forge-dashboard --root <repo> [--port 8787] [--host 127.0.0.1]
+
+Live status page for forge workers + a feedback box for operator/client.
+Binds to localhost; expose it with Cloudflare Tunnel (see forge-up).
+
+If FORGE_DASH_TOKEN is set, every request needs ?t=<token> (the page keeps it
+in the URL) or header X-Forge-Token. ALWAYS set it before exposing via tunnel.
+Set FORGE_DASH_LOGS=0 to hide raw worker logs from viewers (recommended for clients).
+"""
+import argparse
+import glob
+import hmac
+import json
+import os
+import re
+import subprocess
+import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+ap = argparse.ArgumentParser()
+ap.add_argument("--root", required=True)
+ap.add_argument("--port", type=int, default=8787)
+ap.add_argument("--host", default="127.0.0.1")
+args = ap.parse_args()
+
+ROOT = os.path.abspath(args.root)
+STATE = os.path.join(ROOT, ".forge")
+TOKEN = os.environ.get("FORGE_DASH_TOKEN", "")
+SHOW_LOGS = os.environ.get("FORGE_DASH_LOGS", "1") != "0"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def git(*a):
+    try:
+        return subprocess.run(["git", "-C", ROOT, *a], capture_output=True, text=True, timeout=10).stdout.strip()
+    except Exception:
+        return ""
+
+
+def tail(path, n=40):
+    try:
+        with open(path, "rb") as f:
+            f.seek(0, 2)
+            f.seek(max(0, f.tell() - 64_000))
+            lines = f.read().decode("utf-8", "replace").splitlines()[-n:]
+        return ANSI.sub("", "\n".join(lines))
+    except FileNotFoundError:
+        return ""
+
+
+def state():
+    agents = []
+    for p in sorted(glob.glob(os.path.join(STATE, "agents", "*.json"))):
+        try:
+            a = json.load(open(p))
+        except Exception:
+            continue
+        name, base, br = a.get("name", ""), a.get("base_sha", ""), a.get("branch", "")
+        if a.get("status") not in ("merged", "dropped") and base and br:
+            a["commits"] = git("log", "--oneline", "-8", f"{base}..{br}").splitlines()
+            a["diffstat"] = git("diff", "--shortstat", f"{base}...{br}")
+        a["log"] = tail(os.path.join(STATE, "logs", f"{name}.log")) if SHOW_LOGS else ""
+        agents.append(a)
+    order = {"running": 0, "queued": 1, "conflict": 2, "failed": 3, "done": 4, "nochanges": 5, "merged": 6, "dropped": 7}
+    agents.sort(key=lambda a: (order.get(a.get("status"), 9), a.get("created", "")))
+    feedback = []
+    try:
+        with open(os.path.join(STATE, "feedback.jsonl")) as f:
+            feedback = [json.loads(l) for l in f if l.strip()][-50:]
+    except FileNotFoundError:
+        pass
+    return {
+        "repo": os.path.basename(ROOT),
+        "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
+        "head": git("log", "--oneline", "-6"),
+        "agents": agents,
+        "feedback": feedback,
+        "logs": SHOW_LOGS,
+        "now": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
+
+class H(BaseHTTPRequestHandler):
+    server_version = "forge"
+
+    def log_message(self, *a):
+        pass
+
+    def authed(self):
+        if not TOKEN:
+            return True
+        q = parse_qs(urlparse(self.path).query).get("t", [""])[0]
+        h = self.headers.get("X-Forge-Token", "")
+        return hmac.compare_digest(q, TOKEN) or hmac.compare_digest(h, TOKEN)
+
+    def send(self, code, body, ctype="application/json"):
+        b = body if isinstance(body, bytes) else body.encode()
+        self.send_response(code)
+        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Length", str(len(b)))
+        self.end_headers()
+        self.wfile.write(b)
+
+    def do_GET(self):
+        if not self.authed():
+            return self.send(401, "unauthorized — add ?t=<token>", "text/plain")
+        path = urlparse(self.path).path
+        if path == "/":
+            return self.send(200, PAGE, "text/html")
+        if path == "/api/state":
+            return self.send(200, json.dumps(state()))
+        self.send(404, "not found", "text/plain")
+
+    def do_POST(self):
+        if not self.authed():
+            return self.send(401, '{"error":"unauthorized"}')
+        if urlparse(self.path).path != "/api/feedback":
+            return self.send(404, '{"error":"not found"}')
+        try:
+            n = min(int(self.headers.get("Content-Length", 0)), 20_000)
+            d = json.loads(self.rfile.read(n))
+            text = str(d.get("text", "")).strip()[:4000]
+            if not text:
+                return self.send(400, '{"error":"empty"}')
+            entry = {
+                "time": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "author": str(d.get("author", "") or "anonymous").strip()[:60],
+                "agent": re.sub(r"[^a-z0-9-]", "", str(d.get("agent", "")))[:40],
+                "text": text,
+            }
+            os.makedirs(STATE, exist_ok=True)
+            with open(os.path.join(STATE, "feedback.jsonl"), "a") as f:
+                f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+            self.send(200, '{"ok":true}')
+        except Exception:
+            self.send(400, '{"error":"bad request"}')
+
+
+PAGE = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forge</title>
+<style>
+:root{--bg:#f4f2ee;--panel:#fffdf9;--ink:#1d1b18;--mute:#6f6a62;--line:#e2ddd4;
+--run:#2563eb;--ok:#15803d;--bad:#b91c1c;--warn:#b45309;--idle:#6b7280;--code:#f0ece4;
+--mono:ui-monospace,"SF Mono",Menlo,Consolas,monospace;--sans:-apple-system,"Segoe UI",Inter,system-ui,sans-serif}
+@media (prefers-color-scheme:dark){:root{--bg:#141311;--panel:#1c1a17;--ink:#ece8e1;--mute:#9a948a;
+--line:#2e2b27;--run:#60a5fa;--ok:#4ade80;--bad:#f87171;--warn:#fbbf24;--idle:#9ca3af;--code:#24211d}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 var(--sans)}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:baseline;justify-content:space-between;
+padding:20px 16px 12px;max-width:1200px;margin:0 auto}
+h1{font:600 20px var(--mono);margin:0;letter-spacing:-.02em}h1 span{color:var(--mute);font-weight:400}
+.meta{color:var(--mute);font:12px var(--mono)}
+.counts{display:flex;gap:14px;font:12px var(--mono)}.counts b{font-size:16px}
+main{max-width:1200px;margin:0 auto;padding:0 16px 40px;display:grid;gap:16px;grid-template-columns:1fr}
+@media(min-width:900px){main{grid-template-columns:minmax(0,1fr) 340px}}
+.grid{display:grid;gap:12px;grid-template-columns:repeat(auto-fill,minmax(320px,1fr));align-content:start}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:14px;min-width:0;
+border-left:3px solid var(--c,var(--idle))}
+.top{display:flex;justify-content:space-between;gap:8px;align-items:center}
+.name{font:600 14px var(--mono)}.pill{font:11px var(--mono);text-transform:uppercase;letter-spacing:.06em;
+color:var(--c);display:flex;align-items:center;gap:6px}
+.pill i{width:7px;height:7px;border-radius:50%;background:var(--c)}
+.running .pill i{animation:p 1.2s infinite}@keyframes p{50%{opacity:.25}}
+.title{margin:8px 0 6px}.sub{color:var(--mute);font:12px var(--mono);overflow-wrap:anywhere}
+pre{background:var(--code);border-radius:6px;padding:8px;font:11.5px/1.45 var(--mono);white-space:pre-wrap;
+overflow-wrap:anywhere;max-height:220px;overflow:auto;margin:8px 0 0}
+details summary{cursor:pointer;color:var(--mute);font:12px var(--mono);margin-top:8px}
+aside .card{border-left-color:var(--line)}h2{font:600 12px var(--mono);text-transform:uppercase;
+letter-spacing:.08em;color:var(--mute);margin:0 0 10px}
+textarea,input,select{width:100%;font:13px var(--sans);color:var(--ink);background:var(--bg);
+border:1px solid var(--line);border-radius:6px;padding:8px;margin-bottom:8px}
+textarea{min-height:90px;resize:vertical}
+button{font:600 13px var(--sans);background:var(--ink);color:var(--bg);border:0;border-radius:6px;
+padding:8px 14px;cursor:pointer}button:disabled{opacity:.5}
+.fb{border-top:1px solid var(--line);padding:8px 0;font-size:13px}.fb .sub{font-size:11px}
+.empty{color:var(--mute);padding:30px;text-align:center;border:1px dashed var(--line);border-radius:10px}
+</style></head><body>
+<header><div><h1>forge <span id="repo"></span></h1><div class="meta" id="meta"></div></div>
+<div class="counts" id="counts"></div></header>
+<main><section class="grid" id="agents"></section>
+<aside>
+<div class="card"><h2>Feedback</h2>
+<input id="author" placeholder="Your name" maxlength="60">
+<select id="target"><option value="">General</option></select>
+<textarea id="text" placeholder="What should change? The orchestrator reads this before the next round."></textarea>
+<button id="send">Send</button> <span class="sub" id="sent"></span>
+<div id="fbl" style="margin-top:12px"></div></div>
+<div class="card" style="margin-top:12px"><h2>Main branch</h2><pre id="head"></pre></div>
+</aside></main>
+<script>
+const T=new URLSearchParams(location.search).get('t')||'';
+const q=p=>p+(T?(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T):'');
+const C={running:'--run',queued:'--idle',done:'--ok',merged:'--ok',failed:'--bad',conflict:'--warn',nochanges:'--idle',dropped:'--idle'};
+const el=(t,cls,txt)=>{const e=document.createElement(t);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
+const open=new Set();
+try{document.getElementById('author').value=localStorage.getItem('forge-author')||''}catch(e){}
+function card(a){
+  const c=el('div','card '+a.status);c.style.setProperty('--c','var('+(C[a.status]||'--idle')+')');
+  const top=el('div','top');top.append(el('span','name',a.name));
+  const p=el('span','pill');p.append(el('i'),document.createTextNode(a.status));top.append(p);c.append(top);
+  c.append(el('div','title',a.title||''));
+  c.append(el('div','sub',[a.branch,(a.kind||'build'),'model: '+(a.model||'default')+(a.effort?' ('+a.effort+')':''),a.commit||a.merged_sha,a.diffstat].filter(Boolean).join(' · ')));
+  if(a.report){const d=el('details');d.open=true;d.append(el('summary',null,'report'+(a.report_path?' — '+a.report_path:'')),el('pre',null,a.report));c.append(d)}
+  if(a.commits&&a.commits.length){const d=el('details');d.append(el('summary',null,'commits ('+a.commits.length+')'),el('pre',null,a.commits.join('\n')));c.append(d)}
+  if(a.log){const d=el('details');d.open=open.has(a.name);d.ontoggle=()=>d.open?open.add(a.name):open.delete(a.name);
+    const pre=el('pre',null,a.log);d.append(el('summary',null,'log'),pre);c.append(d);
+    if(d.open)requestAnimationFrame(()=>pre.scrollTop=pre.scrollHeight)}
+  return c}
+async function load(){
+  try{const r=await fetch(q('/api/state'),{cache:'no-store'});if(!r.ok)throw r.status;const s=await r.json();
+  document.getElementById('repo').textContent='/ '+s.repo;
+  document.getElementById('meta').textContent=s.branch+' · updated '+s.now;
+  document.getElementById('head').textContent=s.head;
+  const cnt={};s.agents.forEach(a=>cnt[a.status]=(cnt[a.status]||0)+1);
+  const ce=document.getElementById('counts');ce.replaceChildren(...['running','done','failed','merged'].map(k=>{
+    const d=el('div');const b=el('b',null,cnt[k]||0);b.style.color='var('+C[k]+')';d.append(b,document.createTextNode(' '+k));return d}));
+  const g=document.getElementById('agents');
+  g.replaceChildren(...(s.agents.length?s.agents.map(card):[el('div','empty','No workers yet. The orchestrator spawns them with forge-spawn.')]));
+  const sel=document.getElementById('target'),cur=sel.value;
+  sel.replaceChildren(el('option',null,'General'),...s.agents.filter(a=>a.status!=='dropped').map(a=>{const o=el('option',null,a.name);o.value=a.name;return o}));
+  sel.options[0].value='';sel.value=cur;
+  document.getElementById('fbl').replaceChildren(...s.feedback.slice().reverse().map(f=>{
+    const d=el('div','fb');d.append(el('div','sub',f.time.replace('T',' ')+' · '+f.author+(f.agent?' → '+f.agent:'')),el('div',null,f.text));return d}));
+  }catch(e){document.getElementById('meta').textContent='connection lost ('+e+') — retrying'}}
+document.getElementById('send').onclick=async()=>{
+  const b=document.getElementById('send'),t=document.getElementById('text'),a=document.getElementById('author').value;
+  if(!t.value.trim())return;b.disabled=true;
+  try{localStorage.setItem('forge-author',a)}catch(e){}
+  const r=await fetch(q('/api/feedback'),{method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({author:a,agent:document.getElementById('target').value,text:t.value})});
+  b.disabled=false;document.getElementById('sent').textContent=r.ok?'sent':'failed';if(r.ok){t.value='';load()}};
+load();setInterval(load,3000);
+</script></body></html>"""
+
+if __name__ == "__main__":
+    srv = ThreadingHTTPServer((args.host, args.port), H)
+    print(f"forge dashboard: http://{args.host}:{args.port}" + (" (token required)" if TOKEN else ""))
+    srv.serve_forever()

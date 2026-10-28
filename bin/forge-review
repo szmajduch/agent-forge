@@ -1,0 +1,18 @@
+#!/usr/bin/env bash
+# forge-review <name> [--stat]  — diff of the worker's branch against where it started.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+[[ $# -ge 1 ]] || die "usage: forge-review <name> [--stat]"
+name="$1"; valid_name "$name"
+base_sha="$(agent_get "$name" base_sha)"
+branch="$(agent_get "$name" branch)"
+
+kind="$(agent_get "$name" kind)"; kind="${kind:-build}"
+eff="$(agent_get "$name" effort)"
+echo "# $name — $(agent_get "$name" status) [$kind${eff:+, effort: $eff}]"
+echo "## report"; agent_get "$name" report; echo
+rp="$(agent_get "$name" report_path)"
+[[ -n "$rp" ]] && { echo "(full report committed at: $rp)"; echo; }
+echo "## commits"; git -C "$ROOT" log --oneline "$base_sha..$branch"
+echo "## diffstat"; git -C "$ROOT" diff --stat "$base_sha...$branch"
+[[ "${2:-}" == "--stat" ]] && exit 0
+echo "## diff"; git -C "$ROOT" diff "$base_sha...$branch"

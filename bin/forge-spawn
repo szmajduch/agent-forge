@@ -1,0 +1,121 @@
+#!/usr/bin/env bash
+# forge-spawn [--model <m>] [--kind build|analysis] [--base <ref>] <name> "<task>"
+#                                               (or: ... <name> < task.md)
+# Creates branch agent/<name> in its own git worktree and starts a Codex
+# worker on it in a new tmux window. Returns immediately.
+# --model must be one of the models in models.conf (see forge-models).
+# --kind  build (default) changes code; analysis reads and reports instead.
+# --base  start from this ref instead of the current branch (same as FORGE_BASE).
+#         Use it to give a review/analysis worker an independent starting point.
+# --effort reasoning effort: low|medium|high|xhigh|max|ultra. Higher spends more
+#         reasoning on a hard task; it is not a guarantee of correctness.
+#         Passed to codex as -c model_reasoning_effort=<level>.
+# --link  symlink a gitignored path from the main repo into the worktree, e.g.
+#         --link .venv --link .work. A worktree contains only tracked files, so
+#         anything gitignored (a virtualenv, large data) is otherwise missing.
+#         Repeatable; also settable as FORGE_LINK=".venv .work".
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+
+model=""; kind="build"; base_opt=""; effort=""
+links=(); [[ -n "${FORGE_LINK:-}" ]] && read -r -a links <<< "$FORGE_LINK"
+
+# Options are accepted both before and after the name, so a flag written after
+# it is honoured instead of silently becoming part of the task text.
+parse_opts() {
+  while [[ "${1:-}" == --* ]]; do
+    case "$1" in
+      --model) [[ -n "${2:-}" ]] || die "--model needs a value"; model="$2"; shift 2 ;;
+      --model=*) model="${1#--model=}"; shift ;;
+      --kind) [[ -n "${2:-}" ]] || die "--kind needs a value"; kind="$2"; shift 2 ;;
+      --kind=*) kind="${1#--kind=}"; shift ;;
+      --base) [[ -n "${2:-}" ]] || die "--base needs a value"; base_opt="$2"; shift 2 ;;
+      --base=*) base_opt="${1#--base=}"; shift ;;
+      --effort) [[ -n "${2:-}" ]] || die "--effort needs a value"; effort="$2"; shift 2 ;;
+      --effort=*) effort="${1#--effort=}"; shift ;;
+      --link) [[ -n "${2:-}" ]] || die "--link needs a value"; links+=("$2"); shift 2 ;;
+      --link=*) links+=("${1#--link=}"); shift ;;
+      --) shift; break ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  OPTS_LEFT=$#
+}
+
+parse_opts "$@"; shift $(( $# - OPTS_LEFT ))
+
+[[ $# -ge 1 ]] || die 'usage: forge-spawn [--model <m>] [--kind build|analysis] [--base <ref>] [--link <path>] <name> "<task>"   (task may also come on stdin)'
+name="$1"; shift
+
+parse_opts "$@"; shift $(( $# - OPTS_LEFT ))
+
+case "$kind" in
+  build|analysis) ;;
+  *) die "unknown --kind '$kind' (use: build, analysis)" ;;
+esac
+
+case "$effort" in
+  ""|low|medium|high|xhigh|max|ultra) ;;
+  *) die "unknown --effort '$effort' (use: low, medium, high, xhigh, max, ultra)" ;;
+esac
+
+if [[ -n "$model" ]]; then
+  [[ -n "$(models_list)" ]] || die "--model is disabled: no models configured in $MODELS_FILE"
+  model_allowed "$model" || die "model '$model' not allowed. Allowed: $(models_list | cut -f1 | paste -sd, -) (see forge-models)"
+else
+  model="$(model_default)"
+fi
+
+valid_name "$name"
+if [[ $# -gt 0 ]]; then task="$*"; else task="$(cat)"; fi
+[[ -n "${task//[[:space:]]/}" ]] || die "empty task"
+
+[[ -f "$(agent_file "$name")" ]] && \
+  [[ "$(agent_get "$name" status)" != "merged" && "$(agent_get "$name" status)" != "dropped" ]] && \
+  die "agent '$name' already exists (status: $(agent_get "$name" status)). Use another name or forge-drop it."
+
+branch="agent/$name"
+base="${base_opt:-${FORGE_BASE:-$(git -C "$ROOT" rev-parse --abbrev-ref HEAD)}}"
+base_sha="$(git -C "$ROOT" rev-parse "$base" 2>/dev/null)" || die "no such base ref: $base"
+wt="$WT_ROOT/$name"
+
+git -C "$ROOT" show-ref --quiet "refs/heads/$branch" && die "branch $branch already exists"
+mkdir -p "$WT_ROOT"
+git -C "$ROOT" worktree add -q -b "$branch" "$wt" "$base_sha"
+
+# A worktree holds only tracked files, so gitignored paths a task needs
+# (virtualenv, large data) are linked in from the main repo. Each is excluded
+# locally as well: a pattern like ".venv/" with a trailing slash does not match
+# a symlink, so without this they would show up untracked and could be committed.
+wt_exclude="$(git -C "$wt" rev-parse --path-format=absolute --git-path info/exclude)"
+mkdir -p "$(dirname "$wt_exclude")"
+for l in ${links[@]+"${links[@]}"}; do
+  [[ -n "$l" ]] || continue
+  case "$l" in /*|*..*) die "--link must be a relative path inside the repo: $l" ;; esac
+  [[ -e "$ROOT/$l" ]] || die "--link target does not exist in the repo: $l"
+  if [[ -e "$wt/$l" ]]; then info "skipping --link $l (already present in the worktree)"; continue; fi
+  mkdir -p "$(dirname "$wt/$l")"
+  ln -s "$ROOT/$l" "$wt/$l"
+  grep -qxF "$l" "$wt_exclude" 2>/dev/null || printf '%s\n' "$l" >> "$wt_exclude"
+  info "linked $l -> $ROOT/$l"
+done
+
+printf '%s\n' "$task" > "$STATE/tasks/$name.md"
+rm -f "$(agent_file "$name")"
+agent_set "$name" name="$name" status=queued branch="$branch" base="$base" \
+  base_sha="$base_sha" worktree="$wt" model="$model" kind="$kind" effort="$effort" \
+  title="$(head -n1 <<<"$task" | cut -c1-120)" \
+  created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+ensure_session
+# tmux new-window inherits the tmux *server's* environment, not this shell's, so
+# `FORGE_CODEX_ARGS=... forge-spawn ...` would silently not reach the worker.
+# Pass the worker-facing variables explicitly with -e.
+tmux_env=()
+for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_REPORT_DIR FORGE_KEEP_WINDOW \
+         FORGE_MODELS_FILE FORGE_WT_ROOT FORGE_SESSION; do
+  [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
+done
+tmux new-window -d "${tmux_env[@]}" -t "$FORGE_SESSION:" -n "$name" -c "$wt" "$FORGE_HOME/bin/forge-run '$name'"
+
+echo "spawned $name ($kind) on $branch from $base, model: ${model:-codex default}${effort:+, effort: $effort} (worktree: $wt, tmux: $FORGE_SESSION:$name)"
+if [[ ${#links[@]} -gt 0 ]]; then echo "  linked: ${links[*]}"; fi

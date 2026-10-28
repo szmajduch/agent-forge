@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# forge-drop <name> — stop a worker and DISCARD its work (window, worktree, branch).
+# Irreversible for uncommitted/unmerged work. The orchestrator must ask the
+# operator before calling this.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+[[ $# -ge 1 ]] || die "usage: forge-drop <name>"
+name="$1"; valid_name "$name"
+branch="$(agent_get "$name" branch)"
+wt="$(agent_get "$name" worktree)"
+
+tmux kill-window -t "$FORGE_SESSION:$name" 2>/dev/null || true
+[[ -d "$wt" ]] && git -C "$ROOT" worktree remove --force "$wt"
+git -C "$ROOT" show-ref --quiet "refs/heads/$branch" && git -C "$ROOT" branch -q -D "$branch"
+agent_set "$name" status=dropped
+echo "dropped $name"
