@@ -796,7 +796,20 @@ t_doctor_flags_missing_role_files() {
 t_doctor_passes_after_init() {
   forge init >/dev/null 2>&1
   git -C "$REPO" add -A && git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm "forge setup"
-  forge doctor
+  # A models.conf of its own, so the result cannot depend on which providers
+  # happen to be installed and signed in on the machine running the tests.
+  # Gemini in particular is BROKEN on a personal Google login, which is a true
+  # report about the host, not about the repo under test.
+  cat > "$TMPROOT/$CURRENT_TEST/models.conf" <<'EOF'
+gpt-6.1-sol  codex  both  everyday work
+default gpt-6.1-sol
+EOF
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" \
+         FORGE_MODELS_FILE="$TMPROOT/$CURRENT_TEST/models.conf" \
+         "$BIN/forge-doctor" 2>&1)"
+  RC=$?
+  set -e
   # The launcher check compares ~/.local/bin against THIS checkout, so a clone
   # or a second copy legitimately reports BROKEN there. That is the check doing
   # its job, not a failure of the repo under test, so it is excluded here;
@@ -868,7 +881,127 @@ t_up_rejects_bad_mouse_value() {
 t_models_lists_default() {
   forge models
   assert_rc 0 "$RC" "forge-models"
-  assert_contains "$OUT" "(default)" "default model marked"
+  assert_contains "$OUT" "= default" "default model marked in the legend"
+  # The marker is a '*' on the name; the legend alone would also match a file
+  # with no default at all.
+  printf '%s' "$OUT" | grep -qE '^[a-z0-9.-]+\*' \
+    && ok || no "no model row carries the default marker"
+}
+
+
+# --- providers: routing, roles and usage accounting -------------------------
+# A fake CLI per provider, so argv can be asserted without a network call.
+# The mode is baked into the script rather than exported: forge-spawn forwards
+# only a whitelist of variables into the tmux window, so an exported setting
+# would silently never arrive (this bit us before).
+write_fake_provider() { # write_fake_provider <path> <kind>
+  local path="$1" kind="$2"
+  cat > "$path" <<EOF
+#!/usr/bin/env bash
+KIND="$kind"
+EOF
+  cat >> "$path" <<'EOF'
+printf '%s\n' "$@" > ./ARGV.txt
+mkdir -p reports; echo "# report" > "reports/$(basename "$PWD").md"
+echo "changed" > "changed-by-$KIND.txt"
+if [[ "$KIND" == "gemini" ]]; then
+  echo "Ripgrep is not available. Falling back to GrepTool."
+  echo '{"session_id":"s1","response":"ok","stats":{"models":{"gemini-3-pro":{"tokens":{"input":100,"prompt":100,"candidates":20,"total":120,"cached":80,"thoughts":5,"tool":0}}}}}'
+fi
+exit 0
+EOF
+  chmod +x "$path"
+}
+
+t_spawn_routes_to_claude_provider() {
+  write_fake_provider "$FAKEBIN/claude" claude
+  forge spawn --model sonnet w1 "task"
+  assert_rc 0 "$RC" "spawn a claude-provider model"
+  assert_contains "$OUT" "claude model: sonnet" "provider named in spawn output"
+  local st; st="$(await w1)"
+  assert_eq "done" "$st" "claude worker finished"
+  local argv="$FORGE_WT_ROOT/w1/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -qx -- '-p' "$argv" && ok || no "claude argv missing -p"
+    grep -qx -- '--model' "$argv" && ok || no "claude argv missing --model"
+    grep -qx -- 'acceptEdits' "$argv" && ok || no "claude argv missing acceptEdits"
+  else
+    no "claude worker never recorded argv"; no "(skipped)"; no "(skipped)"
+  fi
+}
+
+t_spawn_routes_to_gemini_provider() {
+  write_fake_provider "$FAKEBIN/gemini" gemini
+  forge spawn --model gemini-3-pro w2 "task"
+  assert_rc 0 "$RC" "spawn a gemini-provider model"
+  local st; st="$(await w2)"
+  assert_eq "done" "$st" "gemini worker finished"
+  local argv="$FORGE_WT_ROOT/w2/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -qx -- '-y' "$argv" && ok || no "gemini argv missing -y (auto-approve)"
+    grep -qx -- 'json' "$argv" && ok || no "gemini argv missing -o json"
+  else
+    no "gemini worker never recorded argv"; no "(skipped)"
+  fi
+}
+
+t_spawn_records_provider_in_state() {
+  forge spawn --model gpt-6-luna w3 "task"
+  assert_rc 0 "$RC" "spawn codex model"
+  await w3 >/dev/null || true
+  local prov
+  prov="$(cd "$REPO" && jq -r '.provider // empty' .forge/agents/w3.json)"
+  assert_eq "codex" "$prov" "provider recorded in agent state"
+}
+
+t_spawn_refuses_missing_provider_cli() {
+  # The provider's CLI must be genuinely absent, which a bare PATH cannot
+  # guarantee: a real gemini may be installed on the machine running the
+  # tests. So PATH is replaced with the fake bin plus the few tools forge
+  # itself needs, and FORGE_GEMINI_CMD names a command that cannot exist.
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:/usr/bin:/bin" \
+         FORGE_GEMINI_CMD="gemini-not-installed-$RUN_ID" \
+         "$BIN/forge-spawn" --model gemini-3-pro w4 "task" 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 1 "$RC" "spawn with the provider CLI absent"
+  assert_contains "$OUT" "on PATH" "names the missing executable"
+  [[ -f "$REPO/.forge/agents/w4.json" ]] \
+    && no "a refused spawn left agent state behind" || ok
+  (cd "$REPO" && git show-ref --quiet refs/heads/agent/w4) \
+    && no "a refused spawn left a branch behind" || ok
+}
+
+t_models_lists_providers_and_roles() {
+  forge models
+  assert_rc 0 "$RC" "forge-models"
+  assert_contains "$OUT" "PROVIDER" "provider column present"
+  assert_contains "$OUT" "gemini" "gemini models listed"
+}
+
+t_usage_reports_gemini_from_worker() {
+  write_fake_provider "$FAKEBIN/gemini" gemini
+  forge spawn --model gemini-3-pro w5 "task"
+  await w5 >/dev/null || true
+  [[ -f "$REPO/.forge/usage/w5.json" ]] && ok \
+    || no "gemini usage was not captured from the headless JSON"
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"; RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-usage --json"
+  local tot
+  tot="$(printf '%s' "$OUT" | jq -r '[.[] | select(.provider=="gemini") | .total] | add // 0')"
+  assert_eq "120" "$tot" "gemini total tokens read back"
+}
+
+t_usage_json_is_valid_when_empty() {
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"; RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-usage --json with no sessions"
+  printf '%s' "$OUT" | jq -e 'type == "array"' >/dev/null \
+    && ok || no "forge-usage --json did not produce a JSON array"
 }
 
 # =============================================================================
@@ -974,6 +1107,15 @@ run_test wait-returns-on-finish         t_wait_returns_when_worker_finishes
 run_test review-shows-diff              t_review_shows_diff_and_report
 run_test report-preview-truncated       t_report_preview_is_truncated_in_json
 run_test models-lists-default           t_models_lists_default
+
+# providers
+run_test spawn-routes-to-claude         t_spawn_routes_to_claude_provider
+run_test spawn-routes-to-gemini         t_spawn_routes_to_gemini_provider
+run_test spawn-records-provider         t_spawn_records_provider_in_state
+run_test spawn-refuses-missing-cli      t_spawn_refuses_missing_provider_cli
+run_test models-lists-providers         t_models_lists_providers_and_roles
+run_test usage-reports-gemini           t_usage_reports_gemini_from_worker
+run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty
 
 echo
 if [[ $fail -eq 0 ]]; then

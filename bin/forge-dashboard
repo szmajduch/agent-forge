@@ -10,14 +10,39 @@ Set FORGE_DASH_LOGS=0 to hide raw worker logs from viewers (recommended for clie
 """
 import argparse
 import glob
+import importlib.machinery
 import hmac
 import json
 import os
 import re
 import subprocess
+import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
+
+# forge-usage holds the per-provider token parsers. It is imported rather than
+# reimplemented, so the dashboard and the CLI can never disagree about what a
+# number means. It has no .py extension, hence the explicit loader.
+def _load_usage_module():
+    import importlib.util
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "forge-usage")
+    try:
+        loader = importlib.machinery.SourceFileLoader("forge_usage", path)
+        spec = importlib.util.spec_from_loader("forge_usage", loader)
+        mod = importlib.util.module_from_spec(spec)
+        # Do not leave a __pycache__ next to the scripts: bin/ holds commands,
+        # and a stray cache directory shows up as untracked noise in the repo.
+        old = sys.dont_write_bytecode
+        sys.dont_write_bytecode = True
+        try:
+            loader.exec_module(mod)
+        finally:
+            sys.dont_write_bytecode = old
+        return mod
+    except Exception:
+        return None
+
 
 ap = argparse.ArgumentParser()
 ap.add_argument("--root", required=True)
@@ -64,6 +89,58 @@ def state_cache_key():
     except OSError:
         fb = 0.0
     return (newest, fb, git("rev-parse", "HEAD"))
+
+
+_USAGE_MOD = None
+_USAGE_CACHE = {"value": None, "at": 0.0}
+_USAGE_TTL = 30.0
+
+
+def usage_summary():
+    """Token usage per provider+model, plus the live sessions' context/quota.
+
+    Scanning every local session log is far too expensive for the 3s poll, so
+    this is cached for _USAGE_TTL and the page reuses whatever is current.
+    """
+    global _USAGE_MOD
+    now = time.monotonic()
+    if _USAGE_CACHE["value"] is not None and now - _USAGE_CACHE["at"] < _USAGE_TTL:
+        return _USAGE_CACHE["value"]
+    if _USAGE_MOD is None:
+        _USAGE_MOD = _load_usage_module()
+    value = {"models": [], "sessions": [], "error": ""}
+    if _USAGE_MOD is None:
+        value["error"] = "forge-usage not found next to forge-dashboard"
+    else:
+        try:
+            recs = _USAGE_MOD.collect(root=ROOT, all_scope=False, since_days=0)
+            per = {}
+            for r in recs:
+                key = (r["provider"], _USAGE_MOD._short_model(r["model"]) or "unknown")
+                agg = per.setdefault(key, {"provider": key[0], "model": key[1],
+                                           "total": 0, "input": 0, "output": 0,
+                                           "cached": 0, "sessions": 0})
+                for f in ("total", "input", "output", "cached"):
+                    agg[f] += r[f]
+                agg["sessions"] += 1
+            value["models"] = sorted(per.values(), key=lambda a: -a["total"])
+            for r in recs[:8]:
+                win = r["context_window"]
+                held = r["last_total"]
+                pct = round(100.0 * held / win, 1) if win and held <= win else None
+                quota = r.get("quota") or {}
+                value["sessions"].append({
+                    "provider": r["provider"],
+                    "model": _USAGE_MOD._short_model(r["model"]),
+                    "session": r["session"][:20],
+                    "context_pct": pct,
+                    "context_window": win,
+                    "quota_pct": quota.get("used_percent"),
+                })
+        except Exception as e:
+            value["error"] = f"{type(e).__name__}: {e}"
+    _USAGE_CACHE.update(value=value, at=now)
+    return value
 
 
 def tail(path, n=40):
@@ -117,6 +194,7 @@ def build_state():
         "branch": git("rev-parse", "--abbrev-ref", "HEAD"),
         "head": git("log", "--oneline", "-6"),
         "agents": agents,
+        "usage": usage_summary(),
         "feedback": feedback,
         "logs": SHOW_LOGS,
         "now": time.strftime("%Y-%m-%d %H:%M:%S"),
@@ -239,6 +317,12 @@ button{font:600 13px var(--sans);background:var(--ink);color:var(--bg);border:0;
 padding:8px 14px;cursor:pointer}button:disabled{opacity:.5}
 .fb{border-top:1px solid var(--line);padding:8px 0;font-size:13px}.fb .sub{font-size:11px}
 .empty{color:var(--mute);padding:30px;text-align:center;border:1px dashed var(--line);border-radius:10px}
+.u{display:flex;justify-content:space-between;gap:8px;font:11.5px var(--mono);padding:3px 0}
+.u b{font-weight:600}.u .m{color:var(--mute)}
+.bar{height:4px;border-radius:2px;background:var(--line);margin:3px 0 7px;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--ink)}
+.bar.hi i{background:var(--bad)}.bar.mid i{background:var(--warn)}
+.uh{font:11px var(--mono);color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:10px 0 4px}
 </style></head><body>
 <header><div><h1>forge <span id="repo"></span></h1><div class="meta" id="meta"></div></div>
 <div class="counts" id="counts"></div></header>
@@ -250,6 +334,7 @@ padding:8px 14px;cursor:pointer}button:disabled{opacity:.5}
 <textarea id="text" placeholder="What should change? The orchestrator reads this before the next round."></textarea>
 <button id="send">Send</button> <span class="sub" id="sent"></span>
 <div id="fbl" style="margin-top:12px"></div></div>
+<div class="card" style="margin-top:12px"><h2>Tokens</h2><div id="usage"></div></div>
 <div class="card" style="margin-top:12px"><h2>Main branch</h2><pre id="head"></pre></div>
 </aside></main>
 <script>
@@ -258,6 +343,39 @@ const q=p=>p+(T?(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T):'');
 const C={running:'--run',queued:'--idle',done:'--ok',merged:'--ok',failed:'--bad',conflict:'--warn',cancelled:'--warn',nochanges:'--idle',dropped:'--idle'};
 const el=(t,cls,txt)=>{const e=document.createElement(t);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
 const open=new Set();
+const fmtTok=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n);
+function renderUsage(u){
+  const box=document.getElementById('usage');box.textContent='';
+  if(!u){box.appendChild(el('div','sub','—'));return}
+  if(u.error){box.appendChild(el('div','sub',u.error));return}
+  if(!u.models.length){box.appendChild(el('div','sub','no usage recorded yet'));return}
+  box.appendChild(el('div','uh','per model'));
+  for(const m of u.models){
+    const r=el('div','u');
+    r.appendChild(el('span','',m.provider+' '+m.model));
+    r.appendChild(el('b','',fmtTok(m.total)));
+    box.appendChild(r);
+  }
+  if(u.sessions.length){
+    box.appendChild(el('div','uh','context / plan'));
+    for(const sx of u.sessions){
+      const r=el('div','u');
+      r.appendChild(el('span','',sx.provider+' '+(sx.model||'?')));
+      // A null percentage means the window or quota was not stated: say so
+      // rather than drawing a bar that implies a measurement.
+      const bits=[];
+      if(sx.context_pct!=null)bits.push('ctx '+sx.context_pct+'%');
+      if(sx.quota_pct!=null)bits.push('plan '+sx.quota_pct+'%');
+      r.appendChild(el('span','m',bits.length?bits.join(' · '):'n/a'));
+      box.appendChild(r);
+      const worst=Math.max(sx.context_pct!=null?sx.context_pct:0,sx.quota_pct!=null?sx.quota_pct:0);
+      if(worst>0){
+        const b=el('div','bar'+(worst>=85?' hi':worst>=60?' mid':''));
+        const i=el('i');i.style.width=Math.min(100,worst)+'%';b.appendChild(i);box.appendChild(b);
+      }
+    }
+  }
+}
 try{document.getElementById('author').value=localStorage.getItem('forge-author')||''}catch(e){}
 function card(a){
   const c=el('div','card '+a.status);c.style.setProperty('--c','var('+(C[a.status]||'--idle')+')');
@@ -273,6 +391,7 @@ function card(a){
   return c}
 async function load(){
   try{const r=await fetch(q('/api/state'),{cache:'no-store'});if(!r.ok)throw r.status;const s=await r.json();
+  renderUsage(s.usage);
   document.getElementById('repo').textContent='/ '+s.repo;
   document.getElementById('meta').textContent=s.branch+' · updated '+s.now;
   document.getElementById('head').textContent=s.head;

@@ -136,27 +136,74 @@ zwraca `Operation not permitted`. Dlatego artefakty pisz do worktree, a po
 review przenieś je do docelowego katalogu. Nie używaj `--add-dir` na katalog
 tylko do czytania: dałoby prawo zapisu tam, gdzie nie wolno modyfikować.
 
-## Wybór modeli
+## Wybór modeli i dostawców
 
-**Orkiestrator (Claude Code)** — model wybierasz Ty: `/model` w Claude Code albo
-`FORGE_ORCH_CMD="claude --model opus" forge-up`.
-
-**Workerzy (Codex)** — model dla każdego zadania wybiera Claude, ale tylko z listy, którą
-ustalasz w `~/tools/forge/models.conf`:
+Worker może działać na trzech CLI: **codex** (OpenAI), **claude** (Anthropic)
+i **gemini** (Google). Jedna lista w `~/tools/forge/models.conf` mówi, który
+model należy do którego dostawcy i do jakiej roli się nadaje:
 
 ```
-szybki-model      małe, dobrze opisane zmiany, testy, dokumentacja, boilerplate
-mocny-model       zmiany architektury, trudne bugi, refaktory między modułami
-default szybki-model
-```
-(to przykładowe nazwy — wpisz dokładnie te, które przyjmuje Twój `codex exec -m`).
+<nazwa>        <dostawca>  <rola>        <kiedy użyć>
 
-- Opis po nazwie to wskazówka dla Claude'a, kiedy użyć danego modelu — pisz go konkretnie.
-- `default` — model dla zadań bez `--model`. Bez tej linii Codex użyje swojego domyślnego.
-- Pusta lista = `--model` wyłączony, wszyscy workerzy na domyślnym modelu Codexa.
+gpt-6.1-sol    codex       both          codzienne kodowanie i analiza
+opus           claude      both          review, sprzeczne dowody, architektura
+haiku          claude      worker        mechaniczne edycje, ekstrakcja
+gemini-3-pro   gemini      worker        wielki kontekst, długie dokumenty
+default gpt-6.1-sol
+```
+
+- **dostawca**: `codex` \| `claude` \| `gemini` — decyduje, które CLI zostanie
+  uruchomione i jak zostaną zbudowane argumenty.
+- **rola**: `worker` \| `orchestrator` \| `both`. `forge-spawn` odmówi modelu
+  oznaczonego jako `orchestrator`, zamiast startować workera, który nie umie
+  pracować.
+- Opis po roli to wskazówka dla Claude'a, kiedy użyć danego modelu — pisz go konkretnie.
+- `default` — model dla zadań bez `--model`.
 - Nazwa spoza listy jest odrzucana, więc Claude nie wymyśli nieistniejącego modelu.
-- Model widać w `forge-status`, w logu workera i na dashboardzie.
-- Inny plik dla konkretnego projektu: `FORGE_MODELS_FILE=/ścieżka/models.conf forge-up`.
+- Model i dostawcę widać w `forge-status`, w logu workera i na dashboardzie.
+- Inny plik dla projektu: `FORGE_MODELS_FILE=/ścieżka/models.conf forge-up`.
+- `forge-models` pokazuje też, których CLI **nie masz zainstalowanych** — ich
+  modeli nie da się uruchomić.
+
+Stary dwukolumnowy `models.conf` (`<nazwa> <opis>`) nadal działa: taki wpis
+jest czytany jako `codex` + `worker`.
+
+### Kto jest orkiestratorem
+
+Orkiestratorem jest Claude Code — to on czyta `FORGE.md` i zleca zadania.
+Model wybierasz Ty:
+
+```bash
+FORGE_ORCH_MODEL=opus forge-up      # tylko model z models.conf o roli both/orchestrator
+FORGE_ORCH_CMD="claude --model opus" forge-up   # pełna kontrola nad komendą
+```
+
+`FORGE_ORCH_MODEL` jest walidowany: model spoza listy, model o roli `worker`
+albo model nie-Claude'owy zostanie odrzucony przy starcie, a nie w trakcie pracy.
+
+### Gemini wymaga klucza API
+
+Osobiste konto Google **nie jest już obsługiwane** przez Gemini CLI — logowanie
+przechodzi, a potem każde wywołanie kończy się błędem:
+
+```
+IneligibleTierError: This client is no longer supported for Gemini Code Assist
+for individuals.  →  https://antigravity.google
+```
+
+Sprawdzone 2026-10-29 na gemini 0.66.0. Ścieżka przez klucz API to **inny tryb
+autoryzacji** i działa. Żeby włączyć Gemini:
+
+```bash
+export GEMINI_API_KEY=...        # klucz z aistudio.google.com/apikey
+# oraz w ~/.gemini/settings.json:
+# {"security":{"auth":{"selectedType":"gemini-api-key"}}}
+```
+
+Sam `GEMINI_API_KEY` nie wystarczy — dopóki `selectedType` to `oauth-personal`,
+klucz jest ignorowany. `forge-doctor` sprawdza oba warunki i mówi dokładnie,
+czego brakuje. Uwaga: klucz API jest płatny per token, niezależnie od Twojego
+planu Google.
 
 **Lista modeli się zmienia.** Jest odświeżana z serwera, więc `models.conf`
 może się zdezaktualizować. Jak sprawdzić, co przyjmuje twoje CLI:
@@ -174,7 +221,9 @@ codex exec -s read-only -m <nazwa> "Reply with exactly: OK" < /dev/null
 ```
 
 Tylko trzeci sposób jest dowodem — lista z cache i historia sesji mogą być
-niepełne albo przestarzałe.
+niepełne albo przestarzałe. Dla claude i gemini odpowiednikiem jest
+`forge-doctor --spawn`, które woła każde CLI raz, z tymi flagami, których
+forge faktycznie używa.
 
 ## Reasoning effort
 
@@ -207,7 +256,8 @@ przyjęte są wszystkie sześć poziomów, a nazwa spoza listy jest odrzucana.
 | Komenda | Co robi |
 |---|---|
 | `forge-spawn [--model <m>] [--effort <poziom>] [--kind build\|analysis] [--base <ref>] [--link <path>] <name> "<zadanie>"` | branch `agent/<name>` + worktree + Codex w nowym oknie tmux. Zadanie może iść też przez stdin. `--model` tylko z listy w `models.conf`. `--effort` = nakład rozumowania. `--kind analysis` = worker pisze raport, nie zmienia kodu. `--base` = inny punkt startu. `--link` = dowiąż gitignorowaną ścieżkę. |
-| `forge-models` | lista modeli Codex, które orkiestrator może wybierać, z opisem kiedy który |
+| `forge-models [--workers]` | lista modeli z dostawcą i rolą; `--workers` ukrywa modele tylko-orkiestratorskie |
+| `forge-usage [--json] [--all] [--since <dni>]` | zużycie tokenów per dostawca i model + kontekst/limit planu per sesja |
 | `forge-wait [names…] [--timeout s]` | czeka aż workerzy skończą, potem pokazuje status |
 | `forge-status [--json] [name]` | tabela workerów; z nazwą — raport i ostatnie linie logu |
 | `forge-review <name> [--stat]` | raport workera, commity, diff względem punktu startu |
@@ -355,6 +405,43 @@ akceptacyjny, więc niekontrolowany fan-out potrafi położyć maszynę. Podnie�
 przez `FORGE_MAX_WORKERS=6`, albo obejdź jednorazowo przez `--force`.
 `FORGE_MAX_WORKERS=0` wyłącza limit.
 
+## Zużycie tokenów
+
+```bash
+forge-usage                  # ten projekt: per model + kontekst/limit per sesja
+forge-usage --all            # wszystkie lokalne sesje, nie tylko tego repo
+forge-usage --since 7        # tylko ostatnie 7 dni
+forge-usage --json           # do skryptów
+```
+
+Nic nie dzwoni do API i żaden klucz nie jest potrzebny — czytane są wyłącznie
+lokalne logi sesji, które każde CLI i tak zapisuje. To samo widać na
+dashboardzie w kafelku **Tokens**.
+
+**Jakość danych różni się per dostawca** i to nie jest decyzja forge, tylko
+to, co dostawcy w ogóle zapisują:
+
+| Dostawca | Skąd | Tokeny | Limit planu |
+|---|---|---|---|
+| codex | `~/.codex/sessions/**/rollout-*.jsonl` | pełne, kumulatywnie per sesja | **tak** — `rate_limits.used_percent` |
+| claude | `~/.claude/projects/<repo>/<sesja>.jsonl` | pełne, sumowane per wiadomość | nie — tylko kontekst |
+| gemini | `.forge/usage/<worker>.json` (zapisane przez forge) | pełne, z `stats.models[].tokens` | nie |
+
+Dlatego **tylko codex** pokazuje realny procent wypalonego planu. Dla pozostałych
+kolumna `PLAN QUOTA` to `n/a` — forge nie zgaduje i nie przelicza tego na złotówki,
+bo nie zna cen Twojego planu.
+
+Kolumna `CONTEXT USED` to `kontekst_szczytowy / okno_modelu` — czyli jak blisko
+sesja była wymuszonej kompaktacji. Liczony jest **szczyt**, nie ostatnia
+wiadomość: po kompaktacji ostatnia wiadomość znów jest mała, co ukrywałoby fakt,
+że sesja się zapchała.
+
+Gemini nie trzyma trwałego logu tokenów jak codex — podaje je tylko w wyjściu
+JSON z `-p`. Dlatego `forge-run` zapisuje ten blok do `.forge/usage/<worker>.json`
+w momencie zakończenia workera. Bez tego nie ma czego czytać, a nieudane
+sparsowanie JSON-a **nie** jest traktowane jako błąd workera — praca może być
+całkowicie dobra.
+
 ## Testy
 
 ```bash
@@ -466,7 +553,13 @@ tmux set-option -t forge mouse off           # wyłącz, gdy przewijanie wariuje
 | `FORGE_LINK` | — | gitignorowane ścieżki dowiązywane do worktree (per worker: `--link`) |
 | `FORGE_CODEX_ARGS` | `-s workspace-write` | argumenty `codex exec`. Codex CLI 0.163.0 **nie ma już `--full-auto`** — używa `-s read-only\|workspace-write\|danger-full-access` |
 | `FORGE_CODEX_CMD` | `codex` | inny CLI z interfejsem `exec <prompt>` |
-| `FORGE_ORCH_CMD` | `claude` | komenda w oknie orkiestratora |
+| `FORGE_ORCH_CMD` | `claude` | komenda w oknie orkiestratora (pełna kontrola) |
+| `FORGE_ORCH_MODEL` | — | model orkiestratora z `models.conf` (rola `both`/`orchestrator`) |
+| `FORGE_CLAUDE_CMD` | `claude` | CLI dla dostawcy `claude` |
+| `FORGE_CLAUDE_ARGS` | `--permission-mode acceptEdits` | argumenty `claude -p` dla workera |
+| `FORGE_GEMINI_CMD` | `gemini` | CLI dla dostawcy `gemini` |
+| `FORGE_GEMINI_ARGS` | `-y -o json` | argumenty `gemini`; `-o json` jest potrzebne, bo z niego czytane są tokeny |
+| `GEMINI_API_KEY` | — | klucz API Gemini; przekazywany do okna workera |
 | `FORGE_KEEP_WINDOW` | `1` | okno workera zostaje otwarte po zakończeniu |
 | `FORGE_REPORT_DIR` | `reports` | katalog na raporty workerów (commitowane) |
 | `FORGE_MAX_WORKERS` | `4` | limit równolegle biegnących workerów (`0` = bez limitu, `--force` = obejście) |
