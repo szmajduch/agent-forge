@@ -12,7 +12,9 @@
       "Bash(forge-doctor:*)",
       "Bash(git status:*)",
       "Bash(git diff:*)",
-      "Bash(git log:*)"
+      "Bash(git log:*)",
+      "Bash(forge-usage)",
+      "Bash(forge-usage:*)"
     ],
     "ask": [
       "Bash(forge-clean:*)",

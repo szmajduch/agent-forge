@@ -1,19 +1,38 @@
 #!/usr/bin/env bash
-# forge-models — lists the Codex models the orchestrator may pass to
-# `forge-spawn --model`, with when to use each. Edit models.conf to change.
+# forge-models [--workers] — lists the models the orchestrator may pass to
+# `forge-spawn --model`, with the provider that runs each and when to use it.
+# --workers hides orchestrator-only models. Edit models.conf to change.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 
-list="$(models_list)"
+only_workers=0
+case "${1:-}" in
+  --workers) only_workers=1 ;;
+  "") ;;
+  *) die "unknown option $1 (usage: forge-models [--workers])" ;;
+esac
+
+if [[ $only_workers -eq 1 ]]; then list="$(models_workers)"; else list="$(models_list)"; fi
 if [[ -z "$list" ]]; then
   echo "No models configured ($MODELS_FILE)."
-  echo "Do not pass --model; workers use Codex's default model."
+  echo "Do not pass --model; workers use each provider's default model."
   exit 0
 fi
 def="$(model_default)"
-printf '%-24s %s\n' MODEL "WHEN TO USE"
-while IFS=$'\t' read -r n d; do
-  [[ "$n" == "$def" ]] && n="$n (default)"
-  printf '%-24s %s\n' "$n" "$d"
+printf '%-18s %-9s %-13s %s\n' MODEL PROVIDER ROLE "WHEN TO USE"
+while IFS=$'\t' read -r n p r d; do
+  # The marker goes on the name, not the role: appending it to the role pushed
+  # the description column out of line for exactly one row.
+  [[ "$n" == "$def" ]] && n="$n*"
+  printf '%-18s %-9s %-13s %s\n' "$n" "$p" "$r" "$d"
 done <<< "$list"
-[[ -z "$def" ]] && echo "(no default: without --model, Codex uses its own default)"
+if [[ -n "$def" ]]; then echo "* = default (used when --model is omitted)"
+else echo "(no default: without --model, each provider uses its own default)"; fi
+
+# A missing CLI is the most common reason a spawn fails, so it is surfaced here
+# rather than only in forge-doctor.
+missing=""
+for p in $(printf '%s\n' "$list" | cut -f2 | sort -u); do
+  command -v "$(provider_cmd "$p")" >/dev/null || missing="$missing $p"
+done
+[[ -n "$missing" ]] && echo "(not installed:$missing — those models cannot be spawned; see forge-doctor)"
 exit 0

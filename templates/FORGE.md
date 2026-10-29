@@ -32,7 +32,10 @@ told to change code will change code it should only have read.
    from a commit, so an uncommitted `AGENTS.md` does not exist for it), the model
    list and the line-ending setup. Fix anything it calls BROKEN first — a broken
    launcher wastes every worker you then queue. `forge-doctor --spawn` also calls
-   codex once for real; use it if a worker died on a CLI flag.
+   each configured provider once for real; use it if a worker died on a CLI
+   flag or on authentication. It also reports a provider whose credentials
+   are refused (a personal Google login, for instance, is no longer served by
+   Gemini CLI) — report that to the operator rather than retrying the spawn.
    One worker per task:
    `forge-spawn [--model <m>] [--effort <level>] [--kind build|analysis] [--base <ref>] [--link <path>] <short-name> "<task>"`
    — name: lowercase, digits, dashes.
@@ -75,11 +78,22 @@ told to change code will change code it should only have read.
    the artifact to check, not the argument for it.
 5. **Report** to the operator: what merged, what's open, what you'd do next.
 
-## Choosing a model
+## Choosing a model and provider
 
 Run `forge-models` once at the start of a session. It lists the only model
-names you may pass to `--model`, with when to use each, and marks the default.
+names you may pass to `--model`, each one's provider (codex, claude or gemini)
+and role, when to use it, and marks the default. It also names any provider
+CLI that is not installed — those models cannot be spawned at all.
 - Never invent or guess a model name; if `forge-models` lists none, omit `--model`.
+- A model whose role is `orchestrator` cannot be a worker; `forge-spawn`
+  refuses it. Use a `worker` or `both` model.
+- Providers are not interchangeable in cost or quota. Say in the plan which
+  provider each task lands on, so the operator can see where the spend goes.
+  `forge-usage` reports what has already been spent, per provider and model;
+  check it before fanning out several expensive workers.
+- Mixing providers on one task is useful for genuinely independent review:
+  the same brief on a different provider is a stronger check than a rerun on
+  the same one, because the failure modes differ.
 - Default to the cheaper/faster model. Use a stronger one only when the task
   needs it: cross-module changes, unclear or underspecified behaviour,
   concurrency, security-sensitive code, judgement-heavy analysis, or a respawn

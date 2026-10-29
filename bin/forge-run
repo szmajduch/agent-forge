@@ -14,18 +14,6 @@ wt="$(agent_get "$name" worktree)"
 log="$STATE/logs/$name.log"
 cd "$wt"
 
-CODEX_CMD="${FORGE_CODEX_CMD:-codex}"
-# Default: sandboxed, can write inside the worktree, no approval prompts.
-# `codex exec` is non-interactive, so workspace-write never prompts.
-# (Codex CLI dropped --full-auto in 0.163.0 in favour of -s/--sandbox.)
-read -r -a CODEX_ARGS <<< "${FORGE_CODEX_ARGS:--s workspace-write}"
-model="$(agent_get "$name" model)"
-[[ -n "$model" ]] && CODEX_ARGS+=(-m "$model")
-# Reasoning effort has no dedicated flag; it is a config override.
-# The key is model_reasoning_effort — plain `reasoning_effort` is ignored.
-effort="$(agent_get "$name" effort)"
-[[ -n "$effort" ]] && CODEX_ARGS+=(-c "model_reasoning_effort=\"$effort\"")
-
 kind="$(agent_get "$name" kind)"; kind="${kind:-build}"
 report_dir="${FORGE_REPORT_DIR:-reports}"
 
@@ -53,13 +41,77 @@ $deliverable
 TASK:
 $(cat "$STATE/tasks/$name.md")"
 
-agent_set "$name" status=running started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-echo "=== forge worker '$name' ($kind) — model: ${model:-codex default}${effort:+ — effort: $effort} — $(date) ===" > "$log"
+model="$(agent_get "$name" model)"
+effort="$(agent_get "$name" effort)"
+provider="$(agent_get "$name" provider)"
+provider="${provider:-$(provider_of "$model")}"
+CMD="$(provider_cmd "$provider")"
+
+# Each CLI spells "run once, non-interactively, allowed to edit this directory"
+# differently, so the argv is built per provider rather than shared. Verified
+# 2026-10-29 against codex-cli 0.163.0, claude 2.1.312, gemini 0.66.0.
+case "$provider" in
+  codex)
+    # `codex exec` is non-interactive, so workspace-write never prompts.
+    # (Codex CLI dropped --full-auto in 0.163.0 in favour of -s/--sandbox.)
+    read -r -a ARGS <<< "${FORGE_CODEX_ARGS:--s workspace-write}"
+    ARGS=(exec "${ARGS[@]}")
+    [[ -n "$model" ]] && ARGS+=(-m "$model")
+    # Reasoning effort has no dedicated flag; it is a config override.
+    # The key is model_reasoning_effort — plain `reasoning_effort` is ignored.
+    [[ -n "$effort" ]] && ARGS+=(-c "model_reasoning_effort=\"$effort\"")
+    ARGS+=("$prompt")
+    ;;
+  claude)
+    # -p is one-shot. Permissions must be granted explicitly or the worker
+    # stalls on the first edit with nobody there to approve it; the sandbox is
+    # the worktree, which is why this is acceptable here and not in general.
+    read -r -a ARGS <<< "${FORGE_CLAUDE_ARGS:---permission-mode acceptEdits}"
+    ARGS=(-p "${ARGS[@]}")
+    [[ -n "$model" ]] && ARGS+=(--model "$model")
+    ARGS+=("$prompt")
+    ;;
+  gemini)
+    # -y auto-approves tool calls (the -p equivalent of acceptEdits), and
+    # -o json is what carries the token stats forge-usage reads back.
+    read -r -a ARGS <<< "${FORGE_GEMINI_ARGS:--y -o json}"
+    [[ -n "$model" ]] && ARGS+=(-m "$model")
+    ARGS+=(-p "$prompt")
+    ;;
+esac
+
+agent_set "$name" status=running provider="$provider" started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+echo "=== forge worker '$name' ($kind) — $provider — model: ${model:-provider default}${effort:+ — effort: $effort} — $(date) ===" > "$log"
 
 set +e
-"$CODEX_CMD" exec "${CODEX_ARGS[@]}" "$prompt" 2>&1 | tee -a "$log"
+"$CMD" "${ARGS[@]}" 2>&1 | tee -a "$log"
 rc=${PIPESTATUS[0]}
 set -e
+
+# Gemini reports token usage only in its headless JSON output, with no durable
+# per-turn log of its own, so it is captured here or not at all. A parse
+# failure is not a worker failure: the work may be perfectly good.
+if [[ "$provider" == "gemini" ]]; then
+  mkdir -p "$STATE/usage"
+  python3 - "$log" "$STATE/usage/$name.json" "$wt" <<'PYEOF' || true
+import json, re, sys
+log, out, cwd = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(log, encoding="utf-8", errors="replace").read()
+# The JSON object is the last one printed; warnings may precede it.
+stats = None
+for m in re.finditer(r"\{", text):
+    try:
+        obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
+    except ValueError:
+        continue
+    if isinstance(obj, dict) and "stats" in obj:
+        stats = obj["stats"]
+if stats is None:
+    sys.exit(1)
+json.dump({"provider": "gemini", "cwd": cwd, "stats": stats},
+          open(out, "w"), indent=1)
+PYEOF
+fi
 
 # The report is a deliverable, not scratch: it stays in the tree so it lands in
 # the commit. FORGE_REPORT.md in the root is still accepted (older AGENTS.md

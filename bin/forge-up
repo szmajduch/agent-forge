@@ -25,7 +25,27 @@ esac
 if tmux has-session -t "$FORGE_SESSION" 2>/dev/null; then
   info "session '$FORGE_SESSION' already exists"
 else
-  tmux new-session -d -s "$FORGE_SESSION" -n orchestrator -c "$ROOT" "${FORGE_ORCH_CMD:-claude}; exec ${SHELL:-bash}"
+  # The orchestrator model is configurable, but only among models.conf entries
+  # whose role allows it — a worker-only model as orchestrator would start a
+  # session that cannot drive the others.
+  orch_cmd="${FORGE_ORCH_CMD:-}"
+  if [[ -z "$orch_cmd" ]]; then
+    orch_model="${FORGE_ORCH_MODEL:-}"
+    if [[ -n "$orch_model" ]]; then
+      role="$(model_role "$orch_model")"
+      [[ -n "$role" ]] || die "FORGE_ORCH_MODEL='$orch_model' is not in $MODELS_FILE"
+      case "$role" in
+        orchestrator|both) ;;
+        *) die "FORGE_ORCH_MODEL='$orch_model' has role '$role' — it cannot be the orchestrator" ;;
+      esac
+      prov="$(provider_of "$orch_model")"
+      [[ "$prov" == "claude" ]] || die "the orchestrator must be a claude model (got '$orch_model' on '$prov')"
+      orch_cmd="$(provider_cmd claude) --model $orch_model"
+    else
+      orch_cmd="$(provider_cmd claude)"
+    fi
+  fi
+  tmux new-session -d -s "$FORGE_SESSION" -n orchestrator -c "$ROOT" "$orch_cmd; exec ${SHELL:-bash}"
   # Mouse mode is OFF by default, because with it on the wheel does not scroll
   # the orchestrator window — it throws it into tmux copy-mode instead.
   #

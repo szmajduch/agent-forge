@@ -67,12 +67,26 @@ agent_set() {
 # --- models (see models.conf) -------------------------------------------------
 MODELS_FILE="${FORGE_MODELS_FILE:-$FORGE_HOME/models.conf}"
 
-# Prints "<name>\t<description>" for each configured model.
+# Prints "<name>\t<provider>\t<role>\t<description>" for each configured model.
+# A line missing the provider/role columns is read as an old two-column file
+# (name + description) and treated as a codex worker, so an existing
+# models.conf keeps working after an upgrade.
 models_list() {
   [[ -f "$MODELS_FILE" ]] || return 0
   awk '/^[[:space:]]*(#|$)/ {next} $1=="default" {next}
-       { n=$1; $1=""; sub(/^[[:space:]]+/, ""); print n "\t" $0 }' "$MODELS_FILE"
+       {
+         n=$1; p=$2; r=$3
+         if (p ~ /^(codex|claude|gemini)$/ && r ~ /^(worker|orchestrator|both)$/) {
+           $1=$2=$3=""
+         } else { p="codex"; r="worker"; $1="" }
+         sub(/^[[:space:]]+/, "")
+         print n "\t" p "\t" r "\t" $0
+       }' "$MODELS_FILE"
 }
+
+# Models that may be spawned as workers (role worker or both).
+models_workers() { models_list | awk -F'\t' '$3=="worker" || $3=="both"'; }
+model_role() { models_list | awk -F'\t' -v m="$1" '$1==m {print $3; exit}'; }
 model_default() {
   [[ -f "$MODELS_FILE" ]] || return 0
   awk '$1=="default" && NF>=2 {print $2; exit}' "$MODELS_FILE"
@@ -83,3 +97,32 @@ ensure_session() {
   tmux has-session -t "$FORGE_SESSION" 2>/dev/null \
     || tmux new-session -d -s "$FORGE_SESSION" -n orchestrator -c "$ROOT"
 }
+
+# --- providers -----------------------------------------------------------------
+# A provider is a CLI that can run a worker non-interactively. Each one differs
+# in three ways that forge has to know about, so they are kept together here
+# rather than spread across forge-run/forge-spawn/forge-usage:
+#
+#   argv      how to ask for a one-shot run, a model and a reasoning effort
+#   usage     where the token counts land afterwards, and in what shape
+#   limits    whether the plan's remaining quota is knowable at all
+#
+# Verified 2026-10-29 against codex-cli 0.163.0, claude 2.1.312, gemini 0.66.0.
+
+provider_of() { # provider_of <model-name> -> codex|claude|gemini
+  local p
+  p="$(awk -v m="$1" '/^[[:space:]]*(#|$)/ {next} $1=="default" {next}
+                      $1==m {print $2; exit}' "$MODELS_FILE" 2>/dev/null)"
+  echo "${p:-codex}"
+}
+
+provider_cmd() { # provider_cmd <provider> -> the executable to run
+  case "$1" in
+    codex)  echo "${FORGE_CODEX_CMD:-codex}" ;;
+    claude) echo "${FORGE_CLAUDE_CMD:-claude}" ;;
+    gemini) echo "${FORGE_GEMINI_CMD:-gemini}" ;;
+    *) die "unknown provider '$1' (use: codex, claude, gemini)" ;;
+  esac
+}
+
+provider_known() { case "$1" in codex|claude|gemini) return 0 ;; *) return 1 ;; esac; }

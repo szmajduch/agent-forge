@@ -34,20 +34,31 @@ for c in git tmux jq python3; do
   if command -v "$c" >/dev/null; then ok "$c — $(command -v "$c")"
   else nope "$c is missing"; note "brew install tmux jq git python"; fi
 done
-if command -v codex >/dev/null; then
-  ok "codex — $(codex --version 2>/dev/null | head -1)"
-else
-  nope "codex is missing (workers cannot run)"
-  note "npm i -g @openai/codex && codex login"
-fi
-if command -v claude >/dev/null; then ok "claude — $(command -v claude)"
+# Only the providers this models.conf actually references have to be present:
+# a missing gemini is irrelevant if no gemini model is configured.
+used_providers="$(models_workers | cut -f2 | sort -u)"
+[[ -n "$used_providers" ]] || used_providers="codex"
+for prov in $used_providers; do
+  cmd="$(provider_cmd "$prov")"
+  if command -v "$cmd" >/dev/null; then
+    ok "$prov — $cmd ($("$cmd" --version 2>/dev/null | head -1))"
+  else
+    nope "$prov CLI '$cmd' is missing — its models cannot be spawned"
+    case "$prov" in
+      codex)  note "npm i -g @openai/codex && codex login" ;;
+      claude) note "see claude.com/claude-code for install instructions" ;;
+      gemini) note "npm i -g @google/gemini-cli   (then set GEMINI_API_KEY)" ;;
+    esac
+  fi
+done
+if command -v claude >/dev/null; then ok "claude — $(command -v claude) (orchestrator)"
 else caution "claude is missing (the orchestrator window will not start)"; fi
 
 head2 "installed launchers"
 # A launcher left over from a previous location silently runs the old forge, or
 # nothing at all. It is the one failure whose error message points nowhere.
 missing_cmds=(); stale_cmds=()
-for cmd in spawn status wait review merge drop models init up doctor clean cancel; do
+for cmd in spawn status wait review merge drop models usage init up doctor clean cancel; do
   src="$FORGE_HOME/bin/forge-$cmd"
   [[ -f "$src" ]] || continue
   found="$(command -v "forge-$cmd" 2>/dev/null || true)"
@@ -141,7 +152,18 @@ else
   if [[ "$count" -eq 0 ]]; then
     caution "models.conf lists no models — --model is disabled, codex uses its default"
   else
-    ok "$count model(s) configured"
+    ok "$count model(s) configured ($(models_workers | grep -c . || true) usable as workers)"
+    # A typo in the provider column makes every spawn of that model fail, and
+    # the message would otherwise come from deep inside forge-run.
+    while IFS=$'\t' read -r mname mprov mrole mdesc; do
+      [[ -n "$mname" ]] || continue
+      provider_known "$mprov" \
+        || nope "model '$mname' names unknown provider '$mprov' (use codex, claude or gemini)"
+      case "$mrole" in
+        worker|orchestrator|both) ;;
+        *) nope "model '$mname' has invalid role '$mrole' (use worker, orchestrator or both)" ;;
+      esac
+    done <<< "$(models_list)"
     if [[ -z "$def" ]]; then
       caution "no 'default' line — a spawn without --model uses codex's default"
     elif model_allowed "$def"; then
@@ -160,28 +182,97 @@ else
   note "session '$FORGE_SESSION' not started yet (forge-up)"
 fi
 
-head2 "codex launcher"
-if ! command -v "${FORGE_CODEX_CMD:-codex}" >/dev/null; then
-  nope "FORGE_CODEX_CMD='${FORGE_CODEX_CMD:-codex}' not found"
-elif [[ $run_spawn -eq 1 ]]; then
-  # The decisive check: the flags forge actually passes, against the real CLI.
-  args="${FORGE_CODEX_ARGS:--s workspace-write}"
-  note "running: ${FORGE_CODEX_CMD:-codex} exec $args 'Reply with exactly: FORGE_OK'"
-  out="$("${FORGE_CODEX_CMD:-codex}" exec $args "Reply with exactly: FORGE_OK" 2>&1 </dev/null || true)"
-  if printf '%s' "$out" | grep -q FORGE_OK; then
-    ok "codex accepted the flags and answered"
-  elif printf '%s' "$out" | grep -qi "unexpected argument\|unrecognized\|invalid value"; then
-    nope "codex rejected forge's flags"
-    note "$(printf '%s' "$out" | grep -i "unexpected argument\|unrecognized\|invalid value" | head -1)"
-    note "Codex CLI >= 0.163.0 dropped --full-auto; use -s workspace-write"
-  elif printf '%s' "$out" | grep -qi "not logged in\|unauthorized\|authentication"; then
-    nope "codex is not logged in"; note "run: codex login"
-  else
-    caution "codex ran but did not answer as asked — check the output below"
-    printf '%s\n' "$out" | tail -5 | sed 's/^/           /'
-  fi
+head2 "provider auth"
+# Auth is the failure that looks like a working setup: the CLI is installed and
+# answers --version, then every worker dies on its first real call. Without
+# --spawn this only reports what can be seen without spending tokens.
+for prov in $used_providers; do
+  cmd="$(provider_cmd "$prov")"
+  command -v "$cmd" >/dev/null || continue
+  case "$prov" in
+    gemini)
+      # A personal Google login is no longer served: Gemini CLI fails with
+      # IneligibleTierError / UNSUPPORTED_CLIENT and points at Antigravity.
+      # Measured 2026-10-29 with gemini 0.66.0 — an API key uses a different
+      # auth path and does work, so the key is what is checked here.
+      sel="$(python3 - <<'PYEOF' 2>/dev/null || true
+import json, os
+try:
+    with open(os.path.expanduser("~/.gemini/settings.json")) as fh:
+        print(((json.load(fh).get("security") or {}).get("auth") or {}).get("selectedType", ""))
+except Exception:
+    print("")
+PYEOF
+)"
+      if [[ -n "${GEMINI_API_KEY:-}" ]]; then
+        if [[ "$sel" == "oauth-personal" ]]; then
+          nope "GEMINI_API_KEY is set but ~/.gemini/settings.json selects oauth-personal"
+          note "the key is ignored while that is selected, and personal logins are refused"
+          note 'set {"security":{"auth":{"selectedType":"gemini-api-key"}}} in ~/.gemini/settings.json'
+        else
+          ok "gemini: GEMINI_API_KEY set (auth type: ${sel:-unset})"
+        fi
+      elif [[ "$sel" == "oauth-personal" ]]; then
+        nope "gemini uses a personal Google login, which Google no longer serves"
+        note "it fails with: IneligibleTierError / UNSUPPORTED_CLIENT"
+        note "get a key at aistudio.google.com/apikey, export GEMINI_API_KEY,"
+        note 'and set {"security":{"auth":{"selectedType":"gemini-api-key"}}} in ~/.gemini/settings.json'
+      else
+        caution "gemini has no GEMINI_API_KEY set — workers will fail to authenticate"
+        note "get a key at aistudio.google.com/apikey and export GEMINI_API_KEY"
+      fi
+      ;;
+    claude)
+      # Claude Code stores credentials outside the repo; the cheap signal is
+      # whether a config exists at all.
+      if [[ -f "$HOME/.claude/settings.json" || -d "$HOME/.claude/projects" ]]; then
+        ok "claude: configured (~/.claude present)"
+      else
+        caution "claude has no ~/.claude yet — run 'claude' once to sign in"
+      fi
+      ;;
+    codex)
+      if [[ -f "$HOME/.codex/auth.json" ]]; then
+        ok "codex: signed in (~/.codex/auth.json)"
+      else
+        nope "codex is not signed in"; note "run: codex login"
+      fi
+      ;;
+  esac
+done
+
+head2 "provider flags"
+if [[ $run_spawn -eq 0 ]]; then
+  note "not verified — rerun with --spawn to call each provider once for real"
 else
-  note "flags not verified — rerun with --spawn to call codex once for real"
+  # The decisive check: the flags forge actually passes, against the real CLI.
+  for prov in $used_providers; do
+    cmd="$(provider_cmd "$prov")"
+    command -v "$cmd" >/dev/null || continue
+    case "$prov" in
+      codex)  pargs=(exec ${FORGE_CODEX_ARGS:--s workspace-write} "Reply with exactly: FORGE_OK") ;;
+      claude) pargs=(-p ${FORGE_CLAUDE_ARGS:---permission-mode acceptEdits} "Reply with exactly: FORGE_OK") ;;
+      gemini) pargs=(${FORGE_GEMINI_ARGS:--y -o json} -p "Reply with exactly: FORGE_OK") ;;
+    esac
+    note "running: $cmd ${pargs[*]:0:4} ..."
+    out="$("$cmd" "${pargs[@]}" 2>&1 </dev/null || true)"
+    if printf '%s' "$out" | grep -q FORGE_OK; then
+      ok "$prov accepted forge's flags and answered"
+    elif printf '%s' "$out" | grep -qi "unexpected argument\|unrecognized\|invalid value\|unknown argument"; then
+      nope "$prov rejected forge's flags"
+      note "$(printf '%s' "$out" | grep -i "unexpected argument\|unrecognized\|invalid value\|unknown argument" | head -1)"
+      [[ "$prov" == codex ]] && note "Codex CLI >= 0.163.0 dropped --full-auto; use -s workspace-write"
+    elif printf '%s' "$out" | grep -qi "IneligibleTier\|UNSUPPORTED_CLIENT"; then
+      nope "$prov refused this account tier (personal Google logins are no longer served)"
+      note "set GEMINI_API_KEY and selectedType=gemini-api-key — see 'provider auth' above"
+    elif printf '%s' "$out" | grep -qi "not logged in\|unauthorized\|authentication\|API key not valid"; then
+      nope "$prov is not authenticated"
+      note "$(printf '%s' "$out" | grep -i "not logged in\|unauthorized\|authentication\|API key not valid" | head -1 | cut -c1-120)"
+    else
+      caution "$prov ran but did not answer as asked — check the output below"
+      printf '%s\n' "$out" | tail -5 | sed 's/^/           /'
+    fi
+  done
 fi
 
 head2 "summary"

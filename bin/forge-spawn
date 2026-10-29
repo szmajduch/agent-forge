@@ -62,10 +62,21 @@ esac
 
 if [[ -n "$model" ]]; then
   [[ -n "$(models_list)" ]] || die "--model is disabled: no models configured in $MODELS_FILE"
-  model_allowed "$model" || die "model '$model' not allowed. Allowed: $(models_list | cut -f1 | paste -sd, -) (see forge-models)"
+  model_allowed "$model" || die "model '$model' not allowed. Allowed: $(models_workers | cut -f1 | paste -sd, -) (see forge-models)"
+  # An orchestrator-only model would start a worker that cannot do worker work,
+  # so it is refused here rather than failing inside the tmux window.
+  role="$(model_role "$model")"
+  [[ "$role" == "orchestrator" ]] && die "model '$model' is orchestrator-only. Worker models: $(models_workers | cut -f1 | paste -sd, -)"
 else
   model="$(model_default)"
 fi
+
+provider="$(provider_of "$model")"
+provider_known "$provider" || die "model '$model' names unknown provider '$provider' in $MODELS_FILE"
+# Fail now, with a clear reason, instead of leaving a worker to die in its own
+# window where the operator has to go looking for the log.
+command -v "$(provider_cmd "$provider")" >/dev/null \
+  || die "provider '$provider' needs '$(provider_cmd "$provider")' on PATH (see forge-doctor)"
 
 valid_name "$name"
 
@@ -127,7 +138,8 @@ done
 printf '%s\n' "$task" > "$STATE/tasks/$name.md"
 rm -f "$(agent_file "$name")"
 agent_set "$name" name="$name" status=queued branch="$branch" base="$base" \
-  base_sha="$base_sha" worktree="$wt" model="$model" kind="$kind" effort="$effort" \
+  base_sha="$base_sha" worktree="$wt" model="$model" provider="$provider" \
+  kind="$kind" effort="$effort" \
   title="$(head -n1 <<<"$task" | cut -c1-120)" \
   created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -136,11 +148,13 @@ ensure_session
 # `FORGE_CODEX_ARGS=... forge-spawn ...` would silently not reach the worker.
 # Pass the worker-facing variables explicitly with -e.
 tmux_env=()
-for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_REPORT_DIR FORGE_KEEP_WINDOW \
+for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
+         FORGE_GEMINI_CMD FORGE_GEMINI_ARGS GEMINI_API_KEY \
+         FORGE_REPORT_DIR FORGE_KEEP_WINDOW \
          FORGE_MODELS_FILE FORGE_WT_ROOT FORGE_SESSION; do
   [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
 done
 tmux new-window -d "${tmux_env[@]}" -t "$FORGE_SESSION:" -n "$name" -c "$wt" "$FORGE_HOME/bin/forge-run '$name'"
 
-echo "spawned $name ($kind) on $branch from $base, model: ${model:-codex default}${effort:+, effort: $effort} (worktree: $wt, tmux: $FORGE_SESSION:$name)"
+echo "spawned $name ($kind) on $branch from $base, $provider model: ${model:-provider default}${effort:+, effort: $effort} (worktree: $wt, tmux: $FORGE_SESSION:$name)"
 if [[ ${#links[@]} -gt 0 ]]; then echo "  linked: ${links[*]}"; fi
