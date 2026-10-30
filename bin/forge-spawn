@@ -149,7 +149,7 @@ ensure_session
 # Pass the worker-facing variables explicitly with -e.
 tmux_env=()
 for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
-         FORGE_GEMINI_CMD FORGE_GEMINI_ARGS GEMINI_API_KEY \
+         FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS \
          FORGE_REPORT_DIR FORGE_KEEP_WINDOW \
          FORGE_MODELS_FILE FORGE_WT_ROOT FORGE_SESSION; do
   [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")

@@ -15,11 +15,11 @@ echo "installed forge-* launchers into $DEST"
 case ":$PATH:" in *":$DEST:"*) ;; *) echo "add to your shell rc:  export PATH=\"$DEST:\$PATH\"";; esac
 
 echo; echo "dependencies:"
-for c in git tmux jq python3 claude codex gemini; do
+for c in git tmux jq python3 claude codex agy; do
   if command -v "$c" >/dev/null; then echo "  ok       $c"
   # Worker providers are optional — only the ones models.conf references must
   # be installed, and forge-doctor checks that per project.
-  elif [[ "$c" == gemini || "$c" == codex ]]; then echo "  absent   $c (optional provider)"
+  elif [[ "$c" == agy || "$c" == codex ]]; then echo "  absent   $c (optional provider)"
   else echo "  MISSING  $c"; fi
 done
 for c in cloudflared lemux; do

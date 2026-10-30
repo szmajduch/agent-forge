@@ -34,8 +34,7 @@ told to change code will change code it should only have read.
    launcher wastes every worker you then queue. `forge-doctor --spawn` also calls
    each configured provider once for real; use it if a worker died on a CLI
    flag or on authentication. It also reports a provider whose credentials
-   are refused (a personal Google login, for instance, is no longer served by
-   Gemini CLI) — report that to the operator rather than retrying the spawn.
+   are refused — report that to the operator rather than retrying the spawn.
    One worker per task:
    `forge-spawn [--model <m>] [--effort <level>] [--kind build|analysis] [--base <ref>] [--link <path>] <short-name> "<task>"`
    — name: lowercase, digits, dashes.
@@ -81,10 +80,17 @@ told to change code will change code it should only have read.
 ## Choosing a model and provider
 
 Run `forge-models` once at the start of a session. It lists the only model
-names you may pass to `--model`, each one's provider (codex, claude or gemini)
+names you may pass to `--model`, each one's provider (codex, claude or antigravity)
 and role, when to use it, and marks the default. It also names any provider
 CLI that is not installed — those models cannot be spawned at all.
 - Never invent or guess a model name; if `forge-models` lists none, omit `--model`.
+- An `antigravity` model runs on Google credits, not on the Claude or ChatGPT
+  plan. `agy-sonnet`/`agy-opus` are the same models as `sonnet`/`opus` — reach
+  for them to spare the Claude quota, not to get a different answer. Their
+  reasoning effort is fixed in the model name, so `--effort` does nothing there.
+- An `antigravity` worker may only run the commands the operator allowed in
+  `FORGE_AGY_COMMANDS`. If one fails with "auto-denied", the fix is the
+  operator's to make — report it, do not retry the spawn unchanged.
 - A model whose role is `orchestrator` cannot be a worker; `forge-spawn`
   refuses it. Use a `worker` or `both` model.
 - Providers are not interchangeable in cost or quota. Say in the plan which

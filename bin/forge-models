@@ -18,12 +18,12 @@ if [[ -z "$list" ]]; then
   exit 0
 fi
 def="$(model_default)"
-printf '%-18s %-9s %-13s %s\n' MODEL PROVIDER ROLE "WHEN TO USE"
+printf '%-20s %-12s %-13s %s\n' MODEL PROVIDER ROLE "WHEN TO USE"
 while IFS=$'\t' read -r n p r d; do
   # The marker goes on the name, not the role: appending it to the role pushed
   # the description column out of line for exactly one row.
   [[ "$n" == "$def" ]] && n="$n*"
-  printf '%-18s %-9s %-13s %s\n' "$n" "$p" "$r" "$d"
+  printf '%-20s %-12s %-13s %s\n' "$n" "$p" "$r" "$d"
 done <<< "$list"
 if [[ -n "$def" ]]; then echo "* = default (used when --model is omitted)"
 else echo "(no default: without --model, each provider uses its own default)"; fi

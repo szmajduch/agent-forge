@@ -16,11 +16,16 @@ cd "$wt"
 
 kind="$(agent_get "$name" kind)"; kind="${kind:-build}"
 report_dir="${FORGE_REPORT_DIR:-reports}"
+# Created here rather than by the worker. An antigravity worker has no blanket
+# shell permission (see agy_permissions), so "create the directory if needed"
+# cost it a denied command and, with it, the whole run — measured with agy
+# 1.4.11. Every provider can write into a directory that already exists.
+mkdir -p "$report_dir"
 
 if [[ "$kind" == "analysis" ]]; then
   deliverable="This is an ANALYSIS task. You are not required to change code.
 Your deliverable is the report itself: write it to $report_dir/$name.md in the
-repository root (create the directory if needed). Make it self-contained —
+repository root (the directory already exists). Make it self-contained —
 record sources, file paths, line/row references and hashes for every claim, so
 a reader can re-check it without rerunning you. State explicitly what you could
 NOT determine; \"unresolved, and here is the missing evidence\" is a correct and
@@ -29,8 +34,8 @@ is not proof of completeness."
 else
   deliverable="This is a BUILD task. Run the acceptance check stated below before
 finishing. When done, write a short summary of what you changed and anything
-left open to $report_dir/$name.md in the repository root (create the directory
-if needed)."
+left open to $report_dir/$name.md in the repository root (the directory
+already exists)."
 fi
 
 prompt="You are a forge worker on branch agent/$name. Follow AGENTS.md.
@@ -49,7 +54,7 @@ CMD="$(provider_cmd "$provider")"
 
 # Each CLI spells "run once, non-interactively, allowed to edit this directory"
 # differently, so the argv is built per provider rather than shared. Verified
-# 2026-10-29 against codex-cli 0.163.0, claude 2.1.312, gemini 0.66.0.
+# 2026-10-30 against codex-cli 0.163.0, claude 2.1.312, agy 1.4.11.
 case "$provider" in
   codex)
     # `codex exec` is non-interactive, so workspace-write never prompts.
@@ -71,12 +76,26 @@ case "$provider" in
     [[ -n "$model" ]] && ARGS+=(--model "$model")
     ARGS+=("$prompt")
     ;;
-  gemini)
-    # -y auto-approves tool calls (the -p equivalent of acceptEdits), and
-    # -o json is what carries the token stats forge-usage reads back.
-    read -r -a ARGS <<< "${FORGE_GEMINI_ARGS:--y -o json}"
-    [[ -n "$model" ]] && ARGS+=(-m "$model")
-    ARGS+=(-p "$prompt")
+  antigravity)
+    # The prompt is attached to the flag as -p=<prompt>, and goes LAST.
+    # Measured against agy 1.4.11: a bare `-p <prompt> --output-format json`
+    # makes -p swallow the next token as its value ("-p took --output-format
+    # as its prompt"), silently dropping the real task. Attaching it removes
+    # the ordering hazard entirely.
+    #
+    # Permissions are an explicit allowlist because agy auto-denies anything
+    # it would have to prompt for (see agy_permissions in forge-lib.sh) — and
+    # reports SUCCESS anyway, which is why the denial check runs below.
+    read -r -a ARGS <<< "${FORGE_AGY_ARGS:---output-format json}"
+    ARGS+=(--settings "$(agy_permissions)")
+    slug="$(provider_slug antigravity "$model")"
+    [[ -n "$slug" ]] || die "model '$model' has no 'slug' line in $MODELS_FILE (see forge-models)"
+    ARGS+=(--model "$slug")
+    # Effort is part of the slug for every agy model, and passing --effort as
+    # well is a hard error ("--model X conflicts with --effort=Y"), so it is
+    # dropped rather than allowed to fail the spawn.
+    [[ -n "$effort" ]] && echo "note: --effort is ignored for antigravity models (effort is part of the slug '$slug')" >&2
+    ARGS+=(-p="$prompt")
     ;;
 esac
 
@@ -88,29 +107,48 @@ set +e
 rc=${PIPESTATUS[0]}
 set -e
 
-# Gemini reports token usage only in its headless JSON output, with no durable
-# per-turn log of its own, so it is captured here or not at all. A parse
-# failure is not a worker failure: the work may be perfectly good.
-if [[ "$provider" == "gemini" ]]; then
+# Antigravity reports token usage only in its headless JSON envelope, with no
+# durable per-turn log of its own, so it is captured here or not at all.
+#
+# It also auto-denies any tool it cannot prompt for and STILL exits 0 with
+# status SUCCESS — measured against agy 1.4.11. A worker that was never allowed
+# to write is indistinguishable from one that chose not to, so denied_actions
+# is promoted to a hard failure here; otherwise forge would report "done" for a
+# worker that did nothing. FORGE_AGY_COMMANDS widens the command allowlist.
+if [[ "$provider" == "antigravity" ]]; then
   mkdir -p "$STATE/usage"
-  python3 - "$log" "$STATE/usage/$name.json" "$wt" <<'PYEOF' || true
+  denied="$(python3 - "$log" "$STATE/usage/$name.json" "$wt" "$model" <<'PYEOF' || true
 import json, re, sys
-log, out, cwd = sys.argv[1], sys.argv[2], sys.argv[3]
+log, out, cwd, model = sys.argv[1:5]
 text = open(log, encoding="utf-8", errors="replace").read()
-# The JSON object is the last one printed; warnings may precede it.
-stats = None
+# The envelope is the last complete JSON object printed; notices precede it.
+env = None
 for m in re.finditer(r"\{", text):
     try:
         obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
     except ValueError:
         continue
-    if isinstance(obj, dict) and "stats" in obj:
-        stats = obj["stats"]
-if stats is None:
-    sys.exit(1)
-json.dump({"provider": "gemini", "cwd": cwd, "stats": stats},
+    if isinstance(obj, dict) and "usage" in obj and "status" in obj:
+        env = obj
+if env is None:
+    sys.exit(0)
+json.dump({"provider": "antigravity", "cwd": cwd, "model": model,
+           "status": env.get("status", ""), "usage": env.get("usage") or {},
+           "denied_actions": env.get("denied_actions") or []},
           open(out, "w"), indent=1)
+names = sorted({(d or {}).get("action", "?") for d in (env.get("denied_actions") or [])})
+if names:
+    print(",".join(names))
 PYEOF
+)"
+  if [[ -n "$denied" ]]; then
+    rc=1
+    echo "=== agy auto-denied required tool(s): $denied ===" | tee -a "$log"
+    echo "    The run reported SUCCESS but was not permitted to act." | tee -a "$log"
+    echo "    For a command, add its FIRST WORD to FORGE_AGY_COMMANDS" | tee -a "$log"
+    echo "    (e.g. FORGE_AGY_COMMANDS=\"pytest python3 git\"; 'python3 -m pytest' needs 'python3'" | tee -a "$log"
+    echo "     to be matched as the first word, so prefer the plain 'pytest x.py' form)." | tee -a "$log"
+  fi
 fi
 
 # The report is a deliverable, not scratch: it stays in the tree so it lands in

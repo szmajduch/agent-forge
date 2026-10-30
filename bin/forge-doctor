@@ -35,7 +35,7 @@ for c in git tmux jq python3; do
   else nope "$c is missing"; note "brew install tmux jq git python"; fi
 done
 # Only the providers this models.conf actually references have to be present:
-# a missing gemini is irrelevant if no gemini model is configured.
+# a missing agy is irrelevant if no antigravity model is configured.
 used_providers="$(models_workers | cut -f2 | sort -u)"
 [[ -n "$used_providers" ]] || used_providers="codex"
 for prov in $used_providers; do
@@ -47,7 +47,7 @@ for prov in $used_providers; do
     case "$prov" in
       codex)  note "npm i -g @openai/codex && codex login" ;;
       claude) note "see claude.com/claude-code for install instructions" ;;
-      gemini) note "npm i -g @google/gemini-cli   (then set GEMINI_API_KEY)" ;;
+      antigravity) note "install Antigravity CLI from antigravity.google, then run 'agy' once to sign in" ;;
     esac
   fi
 done
@@ -158,7 +158,7 @@ else
     while IFS=$'\t' read -r mname mprov mrole mdesc; do
       [[ -n "$mname" ]] || continue
       provider_known "$mprov" \
-        || nope "model '$mname' names unknown provider '$mprov' (use codex, claude or gemini)"
+        || nope "model '$mname' names unknown provider '$mprov' (use codex, claude or antigravity)"
       case "$mrole" in
         worker|orchestrator|both) ;;
         *) nope "model '$mname' has invalid role '$mrole' (use worker, orchestrator or both)" ;;
@@ -190,36 +190,31 @@ for prov in $used_providers; do
   cmd="$(provider_cmd "$prov")"
   command -v "$cmd" >/dev/null || continue
   case "$prov" in
-    gemini)
-      # A personal Google login is no longer served: Gemini CLI fails with
-      # IneligibleTierError / UNSUPPORTED_CLIENT and points at Antigravity.
-      # Measured 2026-10-29 with gemini 0.66.0 — an API key uses a different
-      # auth path and does work, so the key is what is checked here.
-      sel="$(python3 - <<'PYEOF' 2>/dev/null || true
-import json, os
-try:
-    with open(os.path.expanduser("~/.gemini/settings.json")) as fh:
-        print(((json.load(fh).get("security") or {}).get("auth") or {}).get("selectedType", ""))
-except Exception:
-    print("")
-PYEOF
-)"
-      if [[ -n "${GEMINI_API_KEY:-}" ]]; then
-        if [[ "$sel" == "oauth-personal" ]]; then
-          nope "GEMINI_API_KEY is set but ~/.gemini/settings.json selects oauth-personal"
-          note "the key is ignored while that is selected, and personal logins are refused"
-          note 'set {"security":{"auth":{"selectedType":"gemini-api-key"}}} in ~/.gemini/settings.json'
-        else
-          ok "gemini: GEMINI_API_KEY set (auth type: ${sel:-unset})"
-        fi
-      elif [[ "$sel" == "oauth-personal" ]]; then
-        nope "gemini uses a personal Google login, which Google no longer serves"
-        note "it fails with: IneligibleTierError / UNSUPPORTED_CLIENT"
-        note "get a key at aistudio.google.com/apikey, export GEMINI_API_KEY,"
-        note 'and set {"security":{"auth":{"selectedType":"gemini-api-key"}}} in ~/.gemini/settings.json'
+    antigravity)
+      # agy keeps credentials under ~/.gemini/antigravity-cli. Unlike Gemini
+      # CLI, a personal Google account IS served here (measured 2026-10-30 with
+      # agy 1.4.11) — this is the path Google redirected personal accounts to.
+      if [[ -d "$HOME/.gemini/antigravity-cli" ]]; then
+        ok "antigravity: configured (~/.gemini/antigravity-cli present)"
       else
-        caution "gemini has no GEMINI_API_KEY set — workers will fail to authenticate"
-        note "get a key at aistudio.google.com/apikey and export GEMINI_API_KEY"
+        caution "antigravity has no ~/.gemini/antigravity-cli yet — run 'agy' once to sign in"
+      fi
+      # Each model needs a slug line, or the spawn dies in its own window.
+      while IFS=$'\t' read -r mname mprov _mrole _mdesc; do
+        [[ "$mprov" == "antigravity" ]] || continue
+        if [[ -z "$(provider_slug antigravity "$mname")" ]]; then
+          nope "model '$mname' has no 'slug' line in $MODELS_FILE"
+          note "add: slug $mname <slug from 'agy models'>"
+        fi
+      done <<< "$(models_workers)"
+      # A build worker whose acceptance check cannot run looks like a worker
+      # that chose not to run it: agy auto-denies and still reports SUCCESS.
+      if [[ -z "${FORGE_AGY_COMMANDS:-}" ]]; then
+        caution "FORGE_AGY_COMMANDS is unset — antigravity workers cannot run any command"
+        note "a build worker needs its acceptance check: FORGE_AGY_COMMANDS=\"pytest python3 git\""
+        note "matched on the first word only — command(python3) does NOT cover 'python3 -m pytest'"
+      else
+        ok "antigravity: commands allowed — ${FORGE_AGY_COMMANDS}"
       fi
       ;;
     claude)
@@ -252,7 +247,9 @@ else
     case "$prov" in
       codex)  pargs=(exec ${FORGE_CODEX_ARGS:--s workspace-write} "Reply with exactly: FORGE_OK") ;;
       claude) pargs=(-p ${FORGE_CLAUDE_ARGS:---permission-mode acceptEdits} "Reply with exactly: FORGE_OK") ;;
-      gemini) pargs=(${FORGE_GEMINI_ARGS:--y -o json} -p "Reply with exactly: FORGE_OK") ;;
+      antigravity)
+        aslug="$(provider_slug antigravity "$(models_workers | awk -F'\t' '$2=="antigravity"{print $1; exit}')")"
+        pargs=(${FORGE_AGY_ARGS:---output-format json} ${aslug:+--model "$aslug"} -p="Reply with exactly: FORGE_OK") ;;
     esac
     note "running: $cmd ${pargs[*]:0:4} ..."
     out="$("$cmd" "${pargs[@]}" 2>&1 </dev/null || true)"
@@ -264,7 +261,7 @@ else
       [[ "$prov" == codex ]] && note "Codex CLI >= 0.163.0 dropped --full-auto; use -s workspace-write"
     elif printf '%s' "$out" | grep -qi "IneligibleTier\|UNSUPPORTED_CLIENT"; then
       nope "$prov refused this account tier (personal Google logins are no longer served)"
-      note "set GEMINI_API_KEY and selectedType=gemini-api-key — see 'provider auth' above"
+      note "Gemini CLI is dead for personal accounts; the antigravity provider is the way in"
     elif printf '%s' "$out" | grep -qi "not logged in\|unauthorized\|authentication\|API key not valid"; then
       nope "$prov is not authenticated"
       note "$(printf '%s' "$out" | grep -i "not logged in\|unauthorized\|authentication\|API key not valid" | head -1 | cut -c1-120)"

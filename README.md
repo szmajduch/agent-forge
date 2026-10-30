@@ -139,8 +139,8 @@ tylko do czytania: dałoby prawo zapisu tam, gdzie nie wolno modyfikować.
 ## Wybór modeli i dostawców
 
 Worker może działać na trzech CLI: **codex** (OpenAI), **claude** (Anthropic)
-i **gemini** (Google). Jedna lista w `~/tools/forge/models.conf` mówi, który
-model należy do którego dostawcy i do jakiej roli się nadaje:
+i **antigravity** (`agy`, Google). Jedna lista w `~/tools/forge/models.conf`
+mówi, który model należy do którego dostawcy i do jakiej roli się nadaje:
 
 ```
 <nazwa>        <dostawca>  <rola>        <kiedy użyć>
@@ -148,12 +148,18 @@ model należy do którego dostawcy i do jakiej roli się nadaje:
 gpt-6.1-sol    codex       both          codzienne kodowanie i analiza
 opus           claude      both          review, sprzeczne dowody, architektura
 haiku          claude      worker        mechaniczne edycje, ekstrakcja
-gemini-3-pro   gemini      worker        wielki kontekst, długie dokumenty
+agy-sonnet     antigravity worker        Sonnet na kredytach Google
 default gpt-6.1-sol
+
+slug agy-sonnet  claude-sonnet-4-6
 ```
 
-- **dostawca**: `codex` \| `claude` \| `gemini` — decyduje, które CLI zostanie
-  uruchomione i jak zostaną zbudowane argumenty.
+- **dostawca**: `codex` \| `claude` \| `antigravity` — decyduje, które CLI
+  zostanie uruchomione i jak zostaną zbudowane argumenty.
+- **`slug`**: tylko dla `antigravity`. Mapuje nazwę z forge na nazwę, którą
+  przyjmuje `agy --model`. Jest potrzebny, bo ten sam model bywa dostępny
+  dwiema drogami (`agy-sonnet` vs `sonnet`), więc sama nazwa nie mówi, które
+  CLI uruchomić. Sprawdź `agy models` po aktualizacji CLI.
 - **rola**: `worker` \| `orchestrator` \| `both`. `forge-spawn` odmówi modelu
   oznaczonego jako `orchestrator`, zamiast startować workera, który nie umie
   pracować.
@@ -181,29 +187,81 @@ FORGE_ORCH_CMD="claude --model opus" forge-up   # pełna kontrola nad komendą
 `FORGE_ORCH_MODEL` jest walidowany: model spoza listy, model o roli `worker`
 albo model nie-Claude'owy zostanie odrzucony przy starcie, a nie w trakcie pracy.
 
-### Gemini wymaga klucza API
+### Antigravity (`agy`) — dostawca zamiast Gemini CLI
 
-Osobiste konto Google **nie jest już obsługiwane** przez Gemini CLI — logowanie
-przechodzi, a potem każde wywołanie kończy się błędem:
+Dostawca `gemini` został **usunięty 2026-10-30**. Google przestał obsługiwać
+Gemini CLI na kontach osobistych — logowanie przechodzi, a potem każde
+wywołanie kończy się błędem:
 
 ```
 IneligibleTierError: This client is no longer supported for Gemini Code Assist
 for individuals.  →  https://antigravity.google
 ```
 
-Sprawdzone 2026-10-29 na gemini 0.66.0. Ścieżka przez klucz API to **inny tryb
-autoryzacji** i działa. Żeby włączyć Gemini:
+Antigravity to ta ścieżka, na którą Google przekierował te konta, i **działa**
+na koncie osobistym (sprawdzone 2026-10-30 na `agy` 1.4.11: headless `agy -p`
+uruchamia się, edytuje pliki i raportuje tokeny). Jedno CLI daje dostęp do
+trzech rodzin modeli:
 
-```bash
-export GEMINI_API_KEY=...        # klucz z aistudio.google.com/apikey
-# oraz w ~/.gemini/settings.json:
-# {"security":{"auth":{"selectedType":"gemini-api-key"}}}
+```
+$ agy models
+gemini-3.8-flash-high/medium/low    Gemini 3.8 Flash
+claude-sonnet-4-6                   Claude Sonnet 4.6 (Thinking)
+claude-opus-4-6-thinking            Claude Opus 4.6 (Thinking)
+gpt-oss-120b-medium                 GPT-OSS 120B
 ```
 
-Sam `GEMINI_API_KEY` nie wystarczy — dopóki `selectedType` to `oauth-personal`,
-klucz jest ignorowany. `forge-doctor` sprawdza oba warunki i mówi dokładnie,
-czego brakuje. Uwaga: klucz API jest płatny per token, niezależnie od Twojego
-planu Google.
+**Uwaga na rachunek:** `agy-sonnet` i `agy-opus` to te same modele co `sonnet`
+i `opus` u dostawcy `claude`, ale idą z kredytów Google, nie z Twojej
+subskrypcji Claude. Używaj ich, żeby oszczędzić limit Claude'a — nie po to, by
+dostać inną odpowiedź.
+
+#### `FORGE_AGY_COMMANDS` — bez tego worker nic nie uruchomi
+
+W trybie headless `agy` **automatycznie odrzuca** każde narzędzie, o które
+musiałby zapytać — i **mimo to kończy z `status: SUCCESS` i kodem 0**. Worker,
+któremu nie wolno było nic zrobić, wygląda wtedy identycznie jak worker, który
+uznał, że nie ma nic do roboty.
+
+forge radzi sobie z tym dwojako:
+
+1. Przekazuje jawną listę uprawnień (`write_file(*)`, `replace(*)`, `read_file(*)`
+   i pozostałe odczyty) przez `--settings`, czyli **sesyjnie** — Twój
+   `~/.gemini/antigravity-cli/settings.json` nie jest modyfikowany.
+2. Traktuje niepuste `denied_actions` jako **błąd workera** (`failed`), nie
+   `done`. Inaczej forge raportowałby sukces workera, który nic nie zrobił.
+
+Polecenia shell to osobna sprawa i wymagają Twojej decyzji:
+
+```bash
+export FORGE_AGY_COMMANDS="pytest python3 git ls cat find grep"
+```
+
+Reguła dopasowuje się do **pierwszego słowa** polecenia i **nie** obsługuje
+glob (sprawdzone na `agy` 1.4.11):
+
+| Reguła | `pytest test.py` | `python3 -m pytest` | `curl ...` |
+|---|---|---|---|
+| `command(pytest)` | ✅ | ❌ | ❌ |
+| `command(python3)` | ❌ | ❌ | ❌ |
+| `command(python3*)` | ❌ | ❌ | ❌ |
+| `command(*)` | ✅ | ✅ | ✅ |
+
+Czyli `command(python3)` **nie** wystarczy na `python3 -m pytest`. W praktyce
+`agy` sięga też po `ls` na rozeznanie się w katalogu, zanim cokolwiek zrobi, więc
+lista musi obejmować narzędzia do czytania repo, nie tylko sam test. Bez
+`FORGE_AGY_COMMANDS` workerzy `--kind build` nie wykonają acceptance checku —
+`forge-doctor` o tym ostrzega.
+
+`command(*)` pozwala na dowolne polecenie w worktree. To Twoja decyzja, nie
+domyślna wartość forge.
+
+#### Reasoning effort jest w nazwie modelu
+
+Dla modeli `agy` poziom rozumowania jest częścią sluga (`-high`/`-medium`/`-low`),
+a podanie dodatkowo `--effort` to twardy błąd (`--model X conflicts with
+--effort=Y`). forge **pomija** `--effort` dla tych modeli i wypisuje o tym
+notkę, zamiast wywalić spawn.
 
 **Lista modeli się zmienia.** Jest odświeżana z serwera, więc `models.conf`
 może się zdezaktualizować. Jak sprawdzić, co przyjmuje twoje CLI:
@@ -221,7 +279,7 @@ codex exec -s read-only -m <nazwa> "Reply with exactly: OK" < /dev/null
 ```
 
 Tylko trzeci sposób jest dowodem — lista z cache i historia sesji mogą być
-niepełne albo przestarzałe. Dla claude i gemini odpowiednikiem jest
+niepełne albo przestarzałe. Dla claude i antigravity odpowiednikiem jest
 `forge-doctor --spawn`, które woła każde CLI raz, z tymi flagami, których
 forge faktycznie używa.
 
@@ -425,7 +483,7 @@ to, co dostawcy w ogóle zapisują:
 |---|---|---|---|
 | codex | `~/.codex/sessions/**/rollout-*.jsonl` | pełne, kumulatywnie per sesja | **tak** — `rate_limits.used_percent` |
 | claude | `~/.claude/projects/<repo>/<sesja>.jsonl` | pełne, sumowane per wiadomość | nie — tylko kontekst |
-| gemini | `.forge/usage/<worker>.json` (zapisane przez forge) | pełne, z `stats.models[].tokens` | nie |
+| antigravity | `.forge/usage/<worker>.json` (zapisane przez forge) | pełne, z koperty `usage` | nie |
 
 Dlatego **tylko codex** pokazuje realny procent wypalonego planu. Dla pozostałych
 kolumna `PLAN QUOTA` to `n/a` — forge nie zgaduje i nie przelicza tego na złotówki,
@@ -436,11 +494,19 @@ sesja była wymuszonej kompaktacji. Liczony jest **szczyt**, nie ostatnia
 wiadomość: po kompaktacji ostatnia wiadomość znów jest mała, co ukrywałoby fakt,
 że sesja się zapchała.
 
-Gemini nie trzyma trwałego logu tokenów jak codex — podaje je tylko w wyjściu
-JSON z `-p`. Dlatego `forge-run` zapisuje ten blok do `.forge/usage/<worker>.json`
-w momencie zakończenia workera. Bez tego nie ma czego czytać, a nieudane
-sparsowanie JSON-a **nie** jest traktowane jako błąd workera — praca może być
-całkowicie dobra.
+Antigravity nie trzyma trwałego logu tokenów jak codex — podaje je tylko w
+kopercie JSON na końcu biegu `-p`. Dlatego `forge-run` zapisuje ją do
+`.forge/usage/<worker>.json` w momencie zakończenia workera. Bez tego nie ma
+czego czytać, a nieudane sparsowanie JSON-a **nie** jest traktowane jako błąd
+workera — praca może być całkowicie dobra.
+
+Jedna pułapka w arytmetyce: `total_tokens` z `agy` to `input + output` i
+**nie zawiera** `cache_read_tokens` (zmierzone: 9169+355=9524 przy cache
+15628). forge dolicza cache, żeby `TOTAL` pokazywał realny przepływ.
+
+W tabeli `MODEL` widnieje nazwa z forge (`agy-sonnet`), nie slug — bo to ona
+mówi, z czyich kredytów poszedł bieg. `agy-sonnet` i `sonnet` to ten sam model
+na dwóch różnych rachunkach i zlanie ich w jedno ukryłoby właśnie tę różnicę.
 
 ## Testy
 
@@ -557,9 +623,9 @@ tmux set-option -t forge mouse off           # wyłącz, gdy przewijanie wariuje
 | `FORGE_ORCH_MODEL` | — | model orkiestratora z `models.conf` (rola `both`/`orchestrator`) |
 | `FORGE_CLAUDE_CMD` | `claude` | CLI dla dostawcy `claude` |
 | `FORGE_CLAUDE_ARGS` | `--permission-mode acceptEdits` | argumenty `claude -p` dla workera |
-| `FORGE_GEMINI_CMD` | `gemini` | CLI dla dostawcy `gemini` |
-| `FORGE_GEMINI_ARGS` | `-y -o json` | argumenty `gemini`; `-o json` jest potrzebne, bo z niego czytane są tokeny |
-| `GEMINI_API_KEY` | — | klucz API Gemini; przekazywany do okna workera |
+| `FORGE_AGY_CMD` | `agy` | CLI dla dostawcy `antigravity` |
+| `FORGE_AGY_ARGS` | `--output-format json` | argumenty `agy`; `json` jest potrzebne, bo z niego czytane są tokeny |
+| `FORGE_AGY_COMMANDS` | — | polecenia, które wolno uruchomić workerowi `agy` (pierwsze słowo, bez globów) |
 | `FORGE_KEEP_WINDOW` | `1` | okno workera zostaje otwarte po zakończeniu |
 | `FORGE_REPORT_DIR` | `reports` | katalog na raporty workerów (commitowane) |
 | `FORGE_MAX_WORKERS` | `4` | limit równolegle biegnących workerów (`0` = bez limitu, `--force` = obejście) |

@@ -20,10 +20,14 @@ Why each provider is read differently:
           Each assistant message carries `message.usage`. There is no plan
           quota in these files, so percentages are context-window based only.
 
-  gemini  ~/.gemini/tmp/<slug>/chats/*.jsonl and forge's own worker logs.
-          Gemini CLI reports usage in its headless JSON output rather than a
+  antigravity
+          forge's own .forge/usage/<worker>.json. `agy -p --output-format
+          json` ends with an envelope carrying {input_tokens, output_tokens,
+          thinking_tokens, cache_read_tokens, total_tokens}, but keeps no
           durable per-turn log, so forge-run stores what it printed; see
-          _gemini_usage. Without a run there is nothing to read.
+          _agy_usage. Without a run there is nothing to read.
+          (The `gemini` provider was removed on 2026-10-30 — Google no longer
+          serves Gemini CLI to personal accounts.)
 
 Percentages: a session's context use is `last_total / context_window`, which is
 what decides when a session must compact. Plan quota is shown only when the
@@ -50,8 +54,16 @@ CONTEXT_WINDOWS = {
     "sonnet": 1_000_000,
     "haiku": 1_000_000,
     "haiku-4-5": 200_000,
-    "gemini-3-pro": 1_000_000,
-    "gemini-3-flash": 1_000_000,
+    # Antigravity slugs, as `agy models` prints them. The Gemini Flash and
+    # Claude 4.6 context windows are 1M; GPT-OSS 120B is not documented as
+    # such, so it is left out rather than guessed.
+    "gemini-3.8-flash": 1_000_000,
+    "claude-sonnet-4-6": 1_000_000,
+    "claude-opus-4-6": 1_000_000,
+    # forge's own antigravity names, since that is what gets recorded.
+    "agy-gemini": 1_000_000,
+    "agy-sonnet": 1_000_000,
+    "agy-opus": 1_000_000,
 }
 
 
@@ -202,14 +214,18 @@ def _claude_sessions(since):
     return out
 
 
-def _gemini_usage(since, state):
-    """Read gemini usage that forge recorded from headless JSON output.
+def _agy_usage(since, state):
+    """Read antigravity usage that forge recorded from the headless envelope.
 
-    Gemini CLI prints `stats.models[<model>].tokens` ({input, prompt,
-    candidates, total, cached, thoughts, tool}) at the end of a `-p` run, but
-    does not keep a durable per-turn token log the way codex does. forge-run
-    therefore saves that block to .forge/usage/<name>.json, and this reads it
-    back. Verified against gemini 0.66.0.
+    `agy -p --output-format json` prints one envelope per run carrying
+    usage={input_tokens, output_tokens, thinking_tokens, cache_read_tokens,
+    total_tokens}; there is no durable per-turn log, so forge-run saves it to
+    .forge/usage/<name>.json and this reads it back. Verified against agy
+    1.4.11.
+
+    total_tokens is reported as input+output and EXCLUDES cache_read_tokens
+    (measured: 9169+355=9524 with cache_read 15628), so cache is added here to
+    get the real volume moved.
     """
     out = []
     if not state:
@@ -223,29 +239,30 @@ def _gemini_usage(since, state):
                 d = json.load(fh)
         except (OSError, ValueError):
             continue
-        if d.get("provider") != "gemini":
+        if d.get("provider") != "antigravity":
             continue
-        models = ((d.get("stats") or {}).get("models")) or {}
-        for model, m in models.items():
-            tk = (m or {}).get("tokens") or {}
-            rec = _blank("gemini", model, os.path.basename(path)[:-5])
-            rec["mtime"] = mtime
-            rec["cwd"] = d.get("cwd", "")
-            rec["input"] = tk.get("input", 0) or tk.get("prompt", 0)
-            rec["output"] = tk.get("candidates", 0)
-            rec["cached"] = tk.get("cached", 0)
-            rec["reasoning"] = tk.get("thoughts", 0)
-            rec["total"] = tk.get("total", 0)
-            rec["last_total"] = rec["total"]
-            if rec["total"]:
-                out.append(rec)
+        u = d.get("usage") or {}
+        rec = _blank("antigravity", d.get("model") or "?",
+                     os.path.basename(path)[:-5])
+        rec["mtime"] = mtime
+        rec["cwd"] = d.get("cwd", "")
+        rec["input"] = u.get("input_tokens", 0)
+        rec["output"] = u.get("output_tokens", 0)
+        rec["cached"] = u.get("cache_read_tokens", 0)
+        rec["reasoning"] = u.get("thinking_tokens", 0)
+        rec["total"] = (u.get("total_tokens", 0) or 0) + rec["cached"]
+        # One headless run is one turn, so the envelope's own figure IS the
+        # context held — there is no earlier peak to compare against.
+        rec["last_total"] = rec["input"] + rec["cached"] + rec["output"]
+        if rec["total"]:
+            out.append(rec)
     return out
 
 
 def collect(root=None, all_scope=False, since_days=0):
     since = time.time() - since_days * 86400 if since_days else 0
     state = os.path.join(root, ".forge") if root else ""
-    recs = _codex_sessions(since) + _claude_sessions(since) + _gemini_usage(since, state)
+    recs = _codex_sessions(since) + _claude_sessions(since) + _agy_usage(since, state)
     if not all_scope and root:
         recs = [r for r in recs if _in_scope(r, root)]
     for r in recs:
@@ -262,16 +279,29 @@ def _short_model(model):
     alias (opus). Matching on the alias keeps one table for both.
     """
     m = (model or "").lower()
-    for key in CONTEXT_WINDOWS:
+    # Longest key first: "agy-sonnet" must not be matched by "sonnet", which
+    # would report a Google-credits worker as if it ran on the Claude plan.
+    for key in sorted(CONTEXT_WINDOWS, key=len, reverse=True):
         if key in m:
             return key
     return m
 
 
+def _display_model(model):
+    """The name to show, which is not always the context-window key.
+
+    _short_model deliberately collapses ids onto a window key; for display
+    that would erase the distinction the operator needs most — agy-sonnet
+    (Google credits) vs sonnet (Claude subscription) are the same model on
+    two different bills.
+    """
+    return model or "unknown"
+
+
 def _in_scope(rec, root):
     """Does this session belong to the repo at <root>?
 
-    codex and gemini record a real cwd, which for a forge worker is the
+    codex records a real cwd, which for a forge worker is the
     worktree, not the repo — so the repo's basename is matched as well.
     Claude Code records a path-slug directory name instead.
     """
@@ -280,10 +310,10 @@ def _in_scope(rec, root):
     cwd = rec.get("cwd") or ""
     if rec["provider"] == "claude":
         return cwd == "-" + root.replace("/", "-").lstrip("-") or base in cwd
-    # A gemini record is written BY this repo's forge into this repo's
+    # An antigravity record is written BY this repo's forge into this repo's
     # .forge/usage, so it is in scope by construction — its cwd is the
     # worktree, which lives outside the repo.
-    if rec["provider"] == "gemini":
+    if rec["provider"] == "antigravity":
         return True
     if not cwd:
         return False
@@ -340,22 +370,22 @@ def main():
     # actually turns on — a provider total hides an expensive model.
     per = {}
     for r in recs:
-        key = (r["provider"], _short_model(r["model"]) or "unknown")
+        key = (r["provider"], _display_model(r["model"]))
         agg = per.setdefault(key, {"total": 0, "input": 0, "output": 0,
                                    "cached": 0, "reasoning": 0, "sessions": 0})
         for f in ("total", "input", "output", "cached", "reasoning"):
             agg[f] += r[f]
         agg["sessions"] += 1
 
-    print(f"{'PROVIDER':9} {'MODEL':16} {'SESS':>4} {'TOTAL':>8} {'IN':>8} "
+    print(f"{'PROVIDER':11} {'MODEL':20} {'SESS':>4} {'TOTAL':>8} {'IN':>8} "
           f"{'OUT':>8} {'CACHED':>8} {'REASON':>8}")
     for (prov, model), agg in sorted(per.items(), key=lambda kv: -kv[1]["total"]):
-        print(f"{prov:9} {model:16} {agg['sessions']:>4} {_fmt(agg['total']):>8} "
+        print(f"{prov:11} {model[:20]:20} {agg['sessions']:>4} {_fmt(agg['total']):>8} "
               f"{_fmt(agg['input']):>8} {_fmt(agg['output']):>8} "
               f"{_fmt(agg['cached']):>8} {_fmt(agg['reasoning']):>8}")
 
     print()
-    print(f"{'PROVIDER':9} {'MODEL':16} {'CONTEXT USED':>13} {'PLAN QUOTA':>12}  SESSION")
+    print(f"{'PROVIDER':11} {'MODEL':20} {'CONTEXT USED':>13} {'PLAN QUOTA':>12}  SESSION")
     for r in recs[:15]:
         ctx = _pct(r["last_total"], r["context_window"])
         if r["quota"] and r["quota"].get("used_percent") is not None:
@@ -364,16 +394,16 @@ def main():
             q = "  not stated"
         else:
             q = "         n/a"
-        print(f"{r['provider']:9} {_short_model(r['model'])[:16]:16} {ctx:>13} "
+        print(f"{r['provider']:11} {_display_model(r['model'])[:20]:20} {ctx:>13} "
               f"{q:>12}  {r['session'][:20]}")
 
     if any(r["provider"] == "codex" and not r["quota"] for r in recs):
         print()
         print("note: 'not stated' means codex returned no quota window for that "
               "session (common on plans that report credits only).")
-    if not any(r["provider"] == "gemini" for r in recs):
-        print("note: no gemini usage recorded yet (needs GEMINI_API_KEY; "
-              "a personal Google login is no longer served — see forge-doctor).")
+    if not any(r["provider"] == "antigravity" for r in recs):
+        print("note: no antigravity usage recorded yet — it is written only when "
+              "a worker runs on an agy model (see forge-models).")
     return 0
 
 

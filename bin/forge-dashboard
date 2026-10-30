@@ -116,7 +116,7 @@ def usage_summary():
             recs = _USAGE_MOD.collect(root=ROOT, all_scope=False, since_days=0)
             per = {}
             for r in recs:
-                key = (r["provider"], _USAGE_MOD._short_model(r["model"]) or "unknown")
+                key = (r["provider"], _USAGE_MOD._display_model(r["model"]))
                 agg = per.setdefault(key, {"provider": key[0], "model": key[1],
                                            "total": 0, "input": 0, "output": 0,
                                            "cached": 0, "sessions": 0})
@@ -131,7 +131,7 @@ def usage_summary():
                 quota = r.get("quota") or {}
                 value["sessions"].append({
                     "provider": r["provider"],
-                    "model": _USAGE_MOD._short_model(r["model"]),
+                    "model": _USAGE_MOD._display_model(r["model"]),
                     "session": r["session"][:20],
                     "context_pct": pct,
                     "context_window": win,

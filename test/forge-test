@@ -798,7 +798,7 @@ t_doctor_passes_after_init() {
   git -C "$REPO" add -A && git -C "$REPO" -c user.email=t@t -c user.name=t commit -qm "forge setup"
   # A models.conf of its own, so the result cannot depend on which providers
   # happen to be installed and signed in on the machine running the tests.
-  # Gemini in particular is BROKEN on a personal Google login, which is a true
+  # An unconfigured provider (no sign-in, no FORGE_AGY_COMMANDS) is a true
   # report about the host, not about the repo under test.
   cat > "$TMPROOT/$CURRENT_TEST/models.conf" <<'EOF'
 gpt-6.1-sol  codex  both  everyday work
@@ -904,9 +904,14 @@ EOF
 printf '%s\n' "$@" > ./ARGV.txt
 mkdir -p reports; echo "# report" > "reports/$(basename "$PWD").md"
 echo "changed" > "changed-by-$KIND.txt"
-if [[ "$KIND" == "gemini" ]]; then
-  echo "Ripgrep is not available. Falling back to GrepTool."
-  echo '{"session_id":"s1","response":"ok","stats":{"models":{"gemini-3-pro":{"tokens":{"input":100,"prompt":100,"candidates":20,"total":120,"cached":80,"thoughts":5,"tool":0}}}}}'
+if [[ "$KIND" == "antigravity" ]]; then
+  # A notice before the envelope, as the real agy prints, so the parser is
+  # exercised on "last complete JSON object" rather than "the only one".
+  echo "jetski: starting"
+  echo '{"conversation_id":"c1","status":"SUCCESS","response":"ok","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":100,"output_tokens":20,"thinking_tokens":5,"cache_read_tokens":80,"total_tokens":120}}'
+fi
+if [[ "$KIND" == "antigravity-denied" ]]; then
+  echo '{"conversation_id":"c2","status":"SUCCESS","response":"","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":2,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":12},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}'
 fi
 exit 0
 EOF
@@ -930,18 +935,52 @@ t_spawn_routes_to_claude_provider() {
   fi
 }
 
-t_spawn_routes_to_gemini_provider() {
-  write_fake_provider "$FAKEBIN/gemini" gemini
-  forge spawn --model gemini-3-pro w2 "task"
-  assert_rc 0 "$RC" "spawn a gemini-provider model"
+t_spawn_routes_to_antigravity_provider() {
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet w2 "task"
+  assert_rc 0 "$RC" "spawn an antigravity-provider model"
   local st; st="$(await w2)"
-  assert_eq "done" "$st" "gemini worker finished"
+  assert_eq "done" "$st" "antigravity worker finished"
   local argv="$FORGE_WT_ROOT/w2/ARGV.txt"
   if [[ -f "$argv" ]]; then
-    grep -qx -- '-y' "$argv" && ok || no "gemini argv missing -y (auto-approve)"
-    grep -qx -- 'json' "$argv" && ok || no "gemini argv missing -o json"
+    grep -qx -- '--output-format' "$argv" && ok || no "agy argv missing --output-format"
+    # The models.conf name must be translated to the slug agy accepts.
+    grep -qx -- 'claude-sonnet-4-6' "$argv" && ok \
+      || no "agy argv did not carry the slug for agy-sonnet"
+    # The prompt must be attached to -p, or agy eats the next flag as its value.
+    grep -q '^-p=' "$argv" && ok || no "agy argv must pass the prompt as -p=<prompt>"
+    grep -q 'write_file(\*)' "$argv" && ok || no "agy argv missing the permission allowlist"
   else
-    no "gemini worker never recorded argv"; no "(skipped)"
+    no "agy worker never recorded argv"; no "(skipped)"; no "(skipped)"; no "(skipped)"
+  fi
+}
+
+t_antigravity_denial_is_a_failure() {
+  # agy auto-denies a tool it cannot prompt for and still exits 0 with status
+  # SUCCESS. Reporting that as "done" would credit a worker that did nothing,
+  # so forge-run promotes denied_actions to a failure.
+  write_fake_provider "$FAKEBIN/agy" antigravity-denied
+  forge spawn --model agy-opus w6 "task"
+  assert_rc 0 "$RC" "spawn an antigravity model that will be denied"
+  local st; st="$(await w6)"
+  assert_eq "failed" "$st" "a denied antigravity run is a failure, not done"
+  assert_contains "$(cat "$REPO/.forge/logs/w6.log")" "auto-denied" \
+    "the log names the denial"
+}
+
+t_antigravity_effort_is_dropped() {
+  # Effort is part of the agy slug; passing --effort as well is a hard error,
+  # so forge must drop it rather than fail the spawn.
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet --effort high w7 "task"
+  assert_rc 0 "$RC" "spawn an antigravity model with --effort"
+  local st; st="$(await w7)"
+  assert_eq "done" "$st" "worker finished despite --effort"
+  local argv="$FORGE_WT_ROOT/w7/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -qx -- '--effort' "$argv" && no "agy argv must not carry --effort" || ok
+  else
+    no "agy worker never recorded argv"
   fi
 }
 
@@ -956,13 +995,13 @@ t_spawn_records_provider_in_state() {
 
 t_spawn_refuses_missing_provider_cli() {
   # The provider's CLI must be genuinely absent, which a bare PATH cannot
-  # guarantee: a real gemini may be installed on the machine running the
+  # guarantee: a real agy may be installed on the machine running the
   # tests. So PATH is replaced with the fake bin plus the few tools forge
-  # itself needs, and FORGE_GEMINI_CMD names a command that cannot exist.
+  # itself needs, and FORGE_AGY_CMD names a command that cannot exist.
   set +e
   OUT="$(cd "$REPO" && PATH="$FAKEBIN:/usr/bin:/bin" \
-         FORGE_GEMINI_CMD="gemini-not-installed-$RUN_ID" \
-         "$BIN/forge-spawn" --model gemini-3-pro w4 "task" 2>&1)"
+         FORGE_AGY_CMD="agy-not-installed-$RUN_ID" \
+         "$BIN/forge-spawn" --model agy-sonnet w4 "task" 2>&1)"
   RC=$?
   set -e
   assert_rc 1 "$RC" "spawn with the provider CLI absent"
@@ -977,22 +1016,23 @@ t_models_lists_providers_and_roles() {
   forge models
   assert_rc 0 "$RC" "forge-models"
   assert_contains "$OUT" "PROVIDER" "provider column present"
-  assert_contains "$OUT" "gemini" "gemini models listed"
+  assert_contains "$OUT" "antigravity" "antigravity models listed"
 }
 
-t_usage_reports_gemini_from_worker() {
-  write_fake_provider "$FAKEBIN/gemini" gemini
-  forge spawn --model gemini-3-pro w5 "task"
+t_usage_reports_antigravity_from_worker() {
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet w5 "task"
   await w5 >/dev/null || true
   [[ -f "$REPO/.forge/usage/w5.json" ]] && ok \
-    || no "gemini usage was not captured from the headless JSON"
+    || no "antigravity usage was not captured from the headless envelope"
   set +e
   OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"; RC=$?
   set -e
   assert_rc 0 "$RC" "forge-usage --json"
   local tot
-  tot="$(printf '%s' "$OUT" | jq -r '[.[] | select(.provider=="gemini") | .total] | add // 0')"
-  assert_eq "120" "$tot" "gemini total tokens read back"
+  tot="$(printf '%s' "$OUT" | jq -r '[.[] | select(.provider=="antigravity") | .total] | add // 0')"
+  # total_tokens (120) EXCLUDES cache_read_tokens (80), so forge adds them.
+  assert_eq "200" "$tot" "antigravity total tokens read back with cache"
 }
 
 t_usage_json_is_valid_when_empty() {
@@ -1110,11 +1150,13 @@ run_test models-lists-default           t_models_lists_default
 
 # providers
 run_test spawn-routes-to-claude         t_spawn_routes_to_claude_provider
-run_test spawn-routes-to-gemini         t_spawn_routes_to_gemini_provider
+run_test spawn-routes-to-antigravity    t_spawn_routes_to_antigravity_provider
+run_test antigravity-denial-fails      t_antigravity_denial_is_a_failure
+run_test antigravity-effort-dropped    t_antigravity_effort_is_dropped
 run_test spawn-records-provider         t_spawn_records_provider_in_state
 run_test spawn-refuses-missing-cli      t_spawn_refuses_missing_provider_cli
 run_test models-lists-providers         t_models_lists_providers_and_roles
-run_test usage-reports-gemini           t_usage_reports_gemini_from_worker
+run_test usage-reports-antigravity      t_usage_reports_antigravity_from_worker
 run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty
 
 echo
