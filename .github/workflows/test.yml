@@ -106,5 +106,7 @@ jobs:
             bin/forge-run bin/forge-spawn bin/forge-status bin/forge-up \
             bin/forge-wait bin/forge-lib.sh install.sh test/forge-test
 
-      - name: Check the dashboard compiles
-        run: python3 -m py_compile bin/forge-dashboard || true
+      # py_compile only proves these parse. The dashboard's behaviour is
+      # covered by test/forge-dashboard-test, which the test job runs.
+      - name: Check the Python scripts compile
+        run: python3 -m py_compile bin/forge-dashboard bin/forge-usage test/forge-dashboard-test || true

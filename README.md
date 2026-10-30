@@ -535,6 +535,7 @@ six levels are accepted and a name outside the list is rejected.
 | `forge-up [-d]` | starts the whole session |
 | `forge-init` | installs the role files into the repo |
 | `test/forge-test [filter]` | end-to-end tests of the whole kit (fake `codex`, nothing calls a model) |
+| `test/forge-dashboard-test [filter]` | the dashboard's HTTP endpoints; also run by `forge-test` |
 
 Worker statuses: `queued → running → done | nochanges | failed`, then
 `merged | conflict | cancelled | dropped`.
@@ -758,8 +759,10 @@ that difference.
 ## Tests
 
 ```bash
-test/forge-test             # everything
-test/forge-test merge       # only tests whose name contains "merge"
+test/forge-test                      # everything, including the dashboard
+test/forge-test merge                # only tests whose name contains "merge"
+test/forge-dashboard-test            # just the dashboard's HTTP endpoints
+test/forge-dashboard-test Token      # only its tests matching "Token"
 ```
 
 Every test gets its own repo in a temporary directory and a **fake `codex`**,
@@ -769,6 +772,28 @@ live `forge` session. Coverage: argument handling for every command, the worker
 lifecycle (build/analysis/nochanges/failed), merge with a conflict and abort,
 `--base`, `--link`, the parallelism limit, `forge-cancel`, `forge-clean`,
 `forge-doctor`.
+
+The dashboard is tested separately, in `test/forge-dashboard-test`, because it
+is an HTTP server rather than a command: each test starts the real process on
+an ephemeral port and speaks HTTP to it, so what is checked is the request path
+that is actually exposed — status codes, headers and payload — and not an
+importable copy of it. `test/forge-test` runs that file as one of its steps and
+counts its result, so a broken dashboard fails the whole suite.
+
+It covers what the dashboard is trusted with rather than how it looks: the
+token gate on every route (query parameter, header, a wrong token, and a
+**prefix** of the right one, since the comparison must be constant-time and
+whole-value), `FORGE_DASH_LOGS=0` actually withholding worker logs from the
+payload, the feedback rate limit and file trimming, field truncation and
+sanitising of the agent name, a corrupt agent JSON being skipped instead of
+taking down the page, ANSI escapes being stripped from logs, and the served
+page containing no `innerHTML`, no `eval` and no remote resources — the page
+renders model-written reports and operator-written feedback, so that last
+check is what keeps it free of an injection surface.
+
+Each of these was verified against a deliberately broken dashboard: with the
+defence removed, the corresponding test fails. A test that cannot fail proves
+nothing, so this is part of the exercise rather than a footnote.
 
 GitHub Actions runs the same suite on every push and pull request, on **both
 ubuntu-latest and macos-latest**. macOS is not redundant: it ships bash 3.2,

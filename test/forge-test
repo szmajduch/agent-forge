@@ -1379,6 +1379,28 @@ run_test usage-reports-antigravity      t_usage_reports_antigravity_from_worker
 run_test usage-total-derived            t_usage_total_is_derived_not_trusted
 run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty
 
+# The dashboard is an HTTP server, so its tests start the real process and
+# speak HTTP to it; that reads far better in Python than in bash assertions.
+# They live in their own file but run from here, so `test/forge-test` stays the
+# single entry point and one summary covers everything. A failure there must
+# fail this suite — a green "0 failures" beside a red dashboard would be a lie.
+echo
+echo "forge-dashboard (HTTP endpoints)"
+CURRENT_TEST="dashboard-endpoints"
+printf '  %-34s' "dashboard-endpoints"
+if DASH_OUT="$("$HERE/forge-dashboard-test" 2>&1)"; then
+  # Each unittest case is an assertion from this suite's point of view.
+  dash_n="$(printf '%s\n' "$DASH_OUT" | sed -n 's/^Ran \([0-9]*\) test.*/\1/p')"
+  pass=$((pass + ${dash_n:-1}))
+  green "ok"
+  dim "    ${dash_n:-?} dashboard endpoint tests passed"
+else
+  fail=$((fail+1)); failed_names+=("dashboard-endpoints")
+  red "FAIL"
+  printf '%s\n' "$DASH_OUT" | grep -E '^(FAIL|ERROR|AssertionError)' >&2 || true
+  dim "    full output: $HERE/forge-dashboard-test"
+fi
+
 echo
 if [[ $fail -eq 0 ]]; then
   green "$pass assertions passed, 0 failures"

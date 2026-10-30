@@ -1,0 +1,512 @@
+#!/usr/bin/env python3
+"""forge-dashboard-test — endpoint tests for the dashboard HTTP server.
+
+Run directly, or as one step of test/forge-test (which is the single entry
+point for the whole suite).
+
+    test/forge-dashboard-test            all tests
+    test/forge-dashboard-test Token      only tests whose name matches
+
+Why a real subprocess instead of importing the module: forge-dashboard parses
+argv and reads the environment at import time, so ROOT/TOKEN/SHOW_LOGS are
+fixed the moment it loads. Importing it would mean refactoring production code
+to be testable and then testing something other than what is exposed — the
+request path, its status codes and its headers. So each test starts the real
+server on an ephemeral port and talks HTTP to it.
+
+Nothing here reaches the network or a provider: the repo is a throwaway git
+init, the agent JSON is written by hand, and token usage is read from this
+repo's .forge only. Tests must not depend on the machine they run on (a
+developer's ~/.codex sessions, a signed-in CLI); see test_usage_degrades.
+"""
+import json
+import os
+import re
+import shutil
+import socket
+import subprocess
+import sys
+import tempfile
+import time
+import unittest
+import urllib.error
+import urllib.request
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+FORGE_HOME = os.path.dirname(HERE)
+DASHBOARD = os.path.join(FORGE_HOME, "bin", "forge-dashboard")
+
+
+def free_port():
+    """An ephemeral port the server can bind.
+
+    There is a race between closing this socket and the server binding it, but
+    the alternative — a fixed port — fails outright when a real dashboard or a
+    parallel test run already holds it. The window is microseconds and the
+    kernel does not hand out the same ephemeral port twice in a row.
+    """
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        return s.getsockname()[1]
+
+
+class DashboardCase(unittest.TestCase):
+    """A throwaway repo with a dashboard serving it.
+
+    Subclasses set `env_extra` to change the server's configuration; the
+    dashboard reads it only at startup, which is why configuration is a class
+    attribute rather than something a test mutates.
+    """
+
+    env_extra = {}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.mkdtemp(prefix="forge-dash-test.")
+        cls.repo = os.path.join(cls.tmp, "repo")
+        cls.state = os.path.join(cls.repo, ".forge")
+        os.makedirs(os.path.join(cls.state, "agents"))
+        os.makedirs(os.path.join(cls.state, "logs"))
+        cls._git_init()
+        cls._write_fixtures()
+        cls._start_server()
+
+    @classmethod
+    def tearDownClass(cls):
+        proc = getattr(cls, "proc", None)
+        if proc and proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    @classmethod
+    def _git_init(cls):
+        def git(*a):
+            subprocess.run(["git", "-C", cls.repo, *a], check=True,
+                           capture_output=True)
+        subprocess.run(["git", "init", "-q", "-b", "main", cls.repo],
+                       check=True, capture_output=True)
+        git("config", "user.email", "forge-test@example.invalid")
+        git("config", "user.name", "forge test")
+        with open(os.path.join(cls.repo, "README.md"), "w") as f:
+            f.write("seed\n")
+        git("add", "-A")
+        git("commit", "-qm", "init")
+
+    @classmethod
+    def _write_fixtures(cls):
+        """One agent per interesting status, plus a log with ANSI escapes.
+
+        The agent JSON is written directly rather than via forge-spawn: these
+        tests are about the HTTP layer, and a real spawn would need tmux and a
+        provider CLI to reach the same state.
+        """
+        agents = [
+            {"name": "alpha", "status": "running", "branch": "agent/alpha",
+             "title": "a running worker", "kind": "build", "model": "gpt-5.1",
+             "created": "2026-01-01T00:00:00Z"},
+            {"name": "beta", "status": "done", "branch": "agent/beta",
+             "title": "a finished worker", "kind": "analysis",
+             "report": "# findings\nall good", "commit": "abc1234",
+             "created": "2026-01-02T00:00:00Z"},
+            {"name": "gamma", "status": "dropped", "branch": "agent/gamma",
+             "title": "a dropped worker", "created": "2026-01-03T00:00:00Z"},
+        ]
+        for a in agents:
+            path = os.path.join(cls.state, "agents", a["name"] + ".json")
+            with open(path, "w") as f:
+                json.dump(a, f)
+        # A log carrying a real ANSI sequence, to prove the server strips it.
+        with open(os.path.join(cls.state, "logs", "alpha.log"), "w") as f:
+            f.write("\x1b[32mgreen line\x1b[0m\nplain line\n")
+        # Unparseable JSON next to the valid files: one corrupt agent must not
+        # take down the whole page.
+        with open(os.path.join(cls.state, "agents", "broken.json"), "w") as f:
+            f.write("{not json")
+
+    @classmethod
+    def _start_server(cls):
+        cls.port = free_port()
+        env = dict(os.environ)
+        # HOME is redirected so a developer's real ~/.codex or ~/.claude
+        # sessions cannot change what the usage panel reports. Without this a
+        # test would pass or fail depending on whose machine it runs on.
+        env["HOME"] = os.path.join(cls.tmp, "home")
+        os.makedirs(env["HOME"], exist_ok=True)
+        env.pop("FORGE_DASH_TOKEN", None)
+        env.pop("FORGE_DASH_LOGS", None)
+        env.update(cls.env_extra)
+        cls.proc = subprocess.Popen(
+            [sys.executable, DASHBOARD, "--root", cls.repo,
+             "--port", str(cls.port), "--host", "127.0.0.1"],
+            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True)
+        cls._await_server()
+
+    @classmethod
+    def _await_server(cls, timeout=15.0):
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if cls.proc.poll() is not None:
+                raise AssertionError(
+                    "dashboard exited with %s before serving:\n%s"
+                    % (cls.proc.returncode, cls.proc.stdout.read()))
+            try:
+                with socket.create_connection(("127.0.0.1", cls.port), 0.25):
+                    return
+            except OSError:
+                time.sleep(0.05)
+        raise AssertionError("dashboard did not start within %ss" % timeout)
+
+    # --- request helpers -----------------------------------------------------
+
+    def url(self, path):
+        return "http://127.0.0.1:%d%s" % (self.port, path)
+
+    def get(self, path, headers=None):
+        """GET returning (status, body, headers); an HTTP error is a result,
+        not an exception, because the error codes are what is under test."""
+        req = urllib.request.Request(self.url(path), headers=headers or {})
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode(), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode(), dict(e.headers)
+
+    def post(self, path, payload, headers=None, raw=None):
+        body = raw if raw is not None else json.dumps(payload).encode()
+        h = {"Content-Type": "application/json"}
+        h.update(headers or {})
+        req = urllib.request.Request(self.url(path), data=body, headers=h,
+                                     method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=10) as r:
+                return r.status, r.read().decode()
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode()
+
+    def feedback_lines(self):
+        path = os.path.join(self.state, "feedback.jsonl")
+        try:
+            with open(path) as f:
+                return [json.loads(l) for l in f if l.strip()]
+        except FileNotFoundError:
+            return []
+
+    def settle(self):
+        """Wait out the POST rate limit (FEEDBACK_MIN_INTERVAL = 2s).
+
+        Every test posting more than once has to respect it, so it is named
+        here rather than repeated as a bare sleep.
+        """
+        time.sleep(2.1)
+
+
+class TestPublicEndpoints(DashboardCase):
+    """No token configured: the dashboard serves anyone who can reach it."""
+
+    def test_root_serves_html(self):
+        code, body, headers = self.get("/")
+        self.assertEqual(200, code)
+        self.assertIn("text/html", headers.get("Content-Type", ""))
+        self.assertIn("<!doctype html>", body)
+
+    def test_security_headers_are_set(self):
+        # The page is exposed through a tunnel, so these are part of the
+        # contract, not decoration.
+        _, _, headers = self.get("/")
+        self.assertEqual("nosniff", headers.get("X-Content-Type-Options"))
+        self.assertEqual("no-referrer", headers.get("Referrer-Policy"))
+        self.assertEqual("no-store", headers.get("Cache-Control"))
+
+    def test_state_is_valid_json_with_expected_shape(self):
+        code, body, headers = self.get("/api/state")
+        self.assertEqual(200, code)
+        self.assertIn("application/json", headers.get("Content-Type", ""))
+        s = json.loads(body)
+        for key in ("repo", "branch", "head", "agents", "usage", "feedback",
+                    "logs", "now"):
+            self.assertIn(key, s, "missing key %r in /api/state" % key)
+        self.assertEqual("repo", s["repo"])
+        self.assertEqual("main", s["branch"])
+        self.assertTrue(s["logs"])
+
+    def test_corrupt_agent_file_is_skipped_not_fatal(self):
+        _, body, _ = self.get("/api/state")
+        names = [a["name"] for a in json.loads(body)["agents"]]
+        self.assertEqual(["alpha", "beta", "gamma"], sorted(names))
+
+    def test_agents_are_ordered_by_status(self):
+        # The operator's attention belongs on what is live, so running sorts
+        # first and dropped last regardless of creation time.
+        _, body, _ = self.get("/api/state")
+        names = [a["name"] for a in json.loads(body)["agents"]]
+        self.assertEqual(["alpha", "beta", "gamma"], names)
+
+    def test_log_is_served_with_ansi_stripped(self):
+        _, body, _ = self.get("/api/state")
+        alpha = next(a for a in json.loads(body)["agents"]
+                     if a["name"] == "alpha")
+        self.assertIn("green line", alpha["log"])
+        self.assertNotIn("\x1b", alpha["log"])
+
+    def test_unknown_path_is_404(self):
+        code, body, _ = self.get("/nope")
+        self.assertEqual(404, code)
+        self.assertIn("not found", body)
+
+    def test_unknown_post_path_is_404(self):
+        code, _ = self.post("/api/nope", {"text": "hi"})
+        self.assertEqual(404, code)
+
+    def test_usage_degrades_without_provider_logs(self):
+        """HOME is empty, so there are no sessions to read.
+
+        The panel must report that honestly — empty lists, no error — rather
+        than failing the whole /api/state request.
+        """
+        _, body, _ = self.get("/api/state")
+        usage = json.loads(body)["usage"]
+        self.assertEqual("", usage["error"])
+        self.assertEqual([], usage["models"])
+        self.assertEqual([], usage["sessions"])
+
+
+class TestFeedback(DashboardCase):
+    """POST /api/feedback is the one endpoint that writes to disk.
+
+    Every test here waits out the rate limit first. The limit is deliberately
+    not configurable — an env var that switched it off would be a way to
+    disable a real defence — so the suite pays the 2s rather than weakening
+    the thing it is testing.
+    """
+
+    def setUp(self):
+        self.settle()
+
+    def test_post_appends_entry(self):
+        before = len(self.feedback_lines())
+        code, body = self.post("/api/feedback",
+                               {"author": "ops", "agent": "alpha",
+                                "text": "narrow the task"})
+        self.assertEqual(200, code)
+        self.assertEqual({"ok": True}, json.loads(body))
+        lines = self.feedback_lines()
+        self.assertEqual(before + 1, len(lines))
+        self.assertEqual("ops", lines[-1]["author"])
+        self.assertEqual("alpha", lines[-1]["agent"])
+        self.assertEqual("narrow the task", lines[-1]["text"])
+        self.assertIn("time", lines[-1])
+
+    def test_entry_appears_in_state(self):
+        self.post("/api/feedback", {"author": "ops", "text": "visible?"})
+        _, body, _ = self.get("/api/state")
+        texts = [f["text"] for f in json.loads(body)["feedback"]]
+        self.assertIn("visible?", texts)
+
+    def test_empty_text_is_rejected(self):
+        before = len(self.feedback_lines())
+        code, _ = self.post("/api/feedback", {"author": "ops", "text": "   "})
+        self.assertEqual(400, code)
+        self.assertEqual(before, len(self.feedback_lines()))
+
+    def test_malformed_body_is_rejected(self):
+        before = len(self.feedback_lines())
+        code, _ = self.post("/api/feedback", None, raw=b"{not json")
+        self.assertEqual(400, code)
+        self.assertEqual(before, len(self.feedback_lines()))
+
+    def test_rate_limit_rejects_a_burst(self):
+        # A loop (or a bored client) must not be able to fill the disk.
+        first, _ = self.post("/api/feedback", {"text": "one"})
+        second, _ = self.post("/api/feedback", {"text": "two"})
+        self.assertEqual(200, first)
+        self.assertEqual(429, second)
+        texts = [f["text"] for f in self.feedback_lines()]
+        self.assertIn("one", texts)
+        self.assertNotIn("two", texts)
+
+    def test_agent_name_is_sanitised(self):
+        # The agent field reaches a filename-shaped context, so anything but
+        # [a-z0-9-] is dropped rather than escaped.
+        self.post("/api/feedback",
+                  {"text": "x", "agent": "../../etc/passwd; rm -rf /"})
+        agent = self.feedback_lines()[-1]["agent"]
+        self.assertRegex(agent, r"^[a-z0-9-]*$")
+        self.assertNotIn("/", agent)
+        self.assertNotIn(".", agent)
+
+    def test_long_fields_are_truncated(self):
+        self.post("/api/feedback",
+                  {"author": "a" * 500, "text": "t" * 9000})
+        entry = self.feedback_lines()[-1]
+        self.assertLessEqual(len(entry["author"]), 60)
+        self.assertLessEqual(len(entry["text"]), 4000)
+
+    def test_missing_author_defaults_to_anonymous(self):
+        self.post("/api/feedback", {"text": "no name given"})
+        self.assertEqual("anonymous", self.feedback_lines()[-1]["author"])
+
+    def test_oversized_body_does_not_crash_the_server(self):
+        # Content-Length is clamped to 20_000 before the read, so a large body
+        # is truncated into invalid JSON and rejected — the server stays up.
+        code, _ = self.post("/api/feedback",
+                            None, raw=b'{"text":"' + b"x" * 60_000 + b'"}')
+        self.assertIn(code, (400, 429))
+        code, _, _ = self.get("/api/state")
+        self.assertEqual(200, code)
+
+    def test_non_ascii_text_survives_the_round_trip(self):
+        self.post("/api/feedback", {"author": "ops", "text": "zażółć gęślą"})
+        self.assertEqual("zażółć gęślą", self.feedback_lines()[-1]["text"])
+
+
+class TestTokenAuth(DashboardCase):
+    """FORGE_DASH_TOKEN set: this is the only thing between a tunnel and the
+    operator's logs, so every way in is checked."""
+
+    env_extra = {"FORGE_DASH_TOKEN": "s3cret-token"}
+
+    def test_root_without_token_is_401(self):
+        code, body, _ = self.get("/")
+        self.assertEqual(401, code)
+        self.assertIn("unauthorized", body)
+
+    def test_state_without_token_is_401(self):
+        code, _, _ = self.get("/api/state")
+        self.assertEqual(401, code)
+
+    def test_post_without_token_is_401(self):
+        before = len(self.feedback_lines())
+        code, _ = self.post("/api/feedback", {"text": "should not land"})
+        self.assertEqual(401, code)
+        self.assertEqual(before, len(self.feedback_lines()))
+
+    def test_wrong_token_is_401(self):
+        code, _, _ = self.get("/api/state?t=wrong")
+        self.assertEqual(401, code)
+
+    def test_token_prefix_is_not_accepted(self):
+        # compare_digest, not startswith: a prefix must not open the door.
+        code, _, _ = self.get("/api/state?t=s3cret")
+        self.assertEqual(401, code)
+
+    def test_query_token_is_accepted(self):
+        code, _, _ = self.get("/api/state?t=s3cret-token")
+        self.assertEqual(200, code)
+
+    def test_header_token_is_accepted(self):
+        code, _, _ = self.get("/api/state",
+                              headers={"X-Forge-Token": "s3cret-token"})
+        self.assertEqual(200, code)
+
+    def test_authed_post_is_accepted(self):
+        self.settle()
+        code, _ = self.post("/api/feedback?t=s3cret-token",
+                            {"author": "ops", "text": "authed"})
+        self.assertEqual(200, code)
+        self.assertIn("authed", [f["text"] for f in self.feedback_lines()])
+
+
+class TestLogsHidden(DashboardCase):
+    """FORGE_DASH_LOGS=0 — what a client-facing dashboard must not leak.
+
+    Worker logs carry raw model output, file paths and sometimes repository
+    internals, so this is a privacy control and not a display preference.
+    """
+
+    env_extra = {"FORGE_DASH_LOGS": "0"}
+
+    def test_logs_are_withheld(self):
+        _, body, _ = self.get("/api/state")
+        s = json.loads(body)
+        self.assertFalse(s["logs"])
+        for a in s["agents"]:
+            self.assertEqual("", a["log"],
+                             "agent %s leaked a log" % a["name"])
+
+    def test_log_text_is_absent_from_the_whole_payload(self):
+        # Not just the log field: the line must not reach the client anywhere.
+        _, body, _ = self.get("/api/state")
+        self.assertNotIn("green line", body)
+
+    def test_other_fields_still_render(self):
+        # Hiding logs must not hide the status itself.
+        _, body, _ = self.get("/api/state")
+        names = [a["name"] for a in json.loads(body)["agents"]]
+        self.assertIn("alpha", names)
+
+
+class TestFeedbackTrim(DashboardCase):
+    """The file is append-only from an endpoint anyone with the URL can reach,
+    so it is trimmed to FEEDBACK_KEEP entries once past FEEDBACK_MAX_BYTES."""
+
+    def test_oversized_file_is_trimmed_on_next_post(self):
+        path = os.path.join(self.state, "feedback.jsonl")
+        # Pre-fill past the 1 MB threshold. The dashboard trims after the
+        # append, keeping the newest 500 entries, so the marker below must
+        # survive while the bulk of the padding does not.
+        with open(path, "w") as f:
+            for i in range(20_000):
+                f.write(json.dumps({"time": "2026-01-01T00:00:00",
+                                    "author": "pad", "agent": "",
+                                    "text": "padding %d %s" % (i, "y" * 60)})
+                        + "\n")
+        self.assertGreater(os.path.getsize(path), 1_000_000)
+        code, _ = self.post("/api/feedback", {"author": "ops", "text": "last"})
+        self.assertEqual(200, code)
+        lines = self.feedback_lines()
+        self.assertEqual(500, len(lines))
+        self.assertEqual("last", lines[-1]["text"])
+        self.assertLess(os.path.getsize(path), 1_000_000)
+
+
+class TestPageMarkup(unittest.TestCase):
+    """Static checks on the served page.
+
+    The page renders operator-supplied feedback and model-supplied reports, so
+    it is an injection surface. It builds every node with textContent, and
+    these tests exist to keep it that way: a later innerHTML would be invisible
+    in review but reintroduce XSS through a worker's own report.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(DASHBOARD, encoding="utf-8") as f:
+            cls.src = f.read()
+        start = cls.src.index('PAGE = r"""')
+        cls.page = cls.src[start:]
+
+    def test_page_never_assigns_innerhtml(self):
+        self.assertNotRegex(self.page, r"\binnerHTML\b")
+
+    def test_page_never_uses_document_write_or_eval(self):
+        self.assertNotRegex(self.page, r"\bdocument\.write\b")
+        self.assertNotRegex(self.page, r"\beval\(")
+
+    def test_page_has_no_remote_resources(self):
+        # Served over a tunnel to a client: everything must be inline, so the
+        # page works with no outbound access and loads no third-party code.
+        self.assertNotRegex(self.page, r"src\s*=\s*[\"']https?://")
+        self.assertNotRegex(self.page, r"href\s*=\s*[\"']https?://")
+
+    def test_token_is_url_encoded_when_appended(self):
+        self.assertIn("encodeURIComponent(T)", self.page)
+
+    def test_page_declares_dark_mode(self):
+        self.assertIn("prefers-color-scheme:dark", self.page)
+
+
+def main():
+    argv = [sys.argv[0]]
+    if len(sys.argv) > 1:
+        argv += ["-k", sys.argv[1]]
+    argv += ["-v"]
+    unittest.main(argv=argv, module=sys.modules[__name__], exit=True)
+
+
+if __name__ == "__main__":
+    main()
