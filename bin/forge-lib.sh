@@ -48,12 +48,61 @@ agent_get() { # agent_get <name> <jq-field>
   jq -r ".$2 // empty" "$f"
 }
 
+# agent_set is a read-modify-write: jq reads the file, mv replaces it a moment
+# later. mv is atomic, so the file is never torn — but two writers racing on the
+# same agent would both read the old JSON and the second mv would discard the
+# first one's field. The symptom is a status that appears to move backwards,
+# which is why this is locked rather than left to chance.
+#
+# mkdir is the primitive: atomic on every POSIX filesystem, and present
+# everywhere. flock is Linux-only (macOS has no such binary — checked), and
+# shlock is built around PID files for long-lived daemons, not for a critical
+# section measured in milliseconds.
+#
+# Held only around one jq+mv, so waiting is short. A holder killed mid-write
+# (Ctrl-C in a worker window, a tmux window closed) would otherwise leave the
+# directory behind and block every later write forever, so the lock records its
+# owner's pid and a waiter reclaims it once that process is gone. The timeout
+# is only how long to wait before checking that; a LIVE holder is waited on for
+# as long as it takes.
+FORGE_LOCK_TIMEOUT="${FORGE_LOCK_TIMEOUT:-10}"
+
+agent_lock() { # agent_lock <lockdir> — blocks until held, or reclaims a dead one
+  local lock="$1" waited=0 holder
+  while ! mkdir "$lock" 2>/dev/null; do
+    sleep 0.1
+    waited=$((waited + 1))
+    [[ $waited -lt $((FORGE_LOCK_TIMEOUT * 10)) ]] && continue
+    waited=0
+
+    # Liveness, not age. The first version of this compared the lock
+    # directory's mtime against the timeout and robbed a holder that was simply
+    # slow — measured: a writer holding the lock for 6s lost it after 3. A
+    # directory's mtime does not advance while it is held, so age says when the
+    # lock was TAKEN, never whether its owner is still working.
+    #
+    # kill -0 tests for a live process without signalling it. A PID can be
+    # reused, but only after the original exited, and then the lock is free to
+    # take anyway. A lock with no readable PID (killed between mkdir and the
+    # write below) is also reclaimed: nothing can be waiting on it.
+    holder="$(cat "$lock/pid" 2>/dev/null || true)"
+    if [[ -n "$holder" ]] && kill -0 "$holder" 2>/dev/null; then
+      info "waiting for $(basename "$lock") held by pid $holder"
+      continue
+    fi
+    info "reclaiming $(basename "$lock") from dead pid ${holder:-unknown}"
+    rm -rf "$lock"
+  done
+  # $$ inside a subshell is the PARENT's pid, which is correct here: that is
+  # the process whose death should release the lock.
+  echo $$ > "$lock/pid" 2>/dev/null || true
+}
+
 # agent_set <name> key=value ...  (merges into the agent's JSON, updates timestamp)
 agent_set() {
   local name="$1"; shift
-  local f tmp args=() filter='.'
-  f="$(agent_file "$name")"; tmp="$f.tmp.$$"
-  [[ -f "$f" ]] || echo '{}' > "$f"
+  local f tmp lock args=() filter='.'
+  f="$(agent_file "$name")"; lock="$f.lock"
   local i=0 kv
   for kv in "$@"; do
     args+=(--arg "k$i" "${kv%%=*}" --arg "v$i" "${kv#*=}")
@@ -61,7 +110,27 @@ agent_set() {
     i=$((i+1))
   done
   filter+=' | .updated = (now | todate)'
+
+  agent_lock "$lock"
+  # mktemp, not "$f.tmp.$$": a subshell inherits its parent's $$, so parallel
+  # `( agent_set ... ) &` writers all built the SAME temp name and clobbered
+  # each other's file mid-write — measured, it left unreadable JSON behind.
+  # The lock alone would prevent that now, but a temp name that is unique on
+  # its own does not depend on the lock being correct.
+  tmp="$(mktemp "$f.tmp.XXXXXX")"
+  # The trap covers a kill between here and the release below: without it the
+  # directory would outlive the process and every later write would pay the
+  # full timeout before stealing it.
+  trap 'rm -rf "$lock"; rm -f "$tmp"' EXIT INT TERM
+  # Inside the lock, so a concurrent writer cannot create it between the test
+  # and the write.
+  [[ -f "$f" ]] || echo '{}' > "$f"
   jq "${args[@]}" "$filter" "$f" > "$tmp" && mv "$tmp" "$f"
+  local rc=$?
+  rm -f "$tmp"
+  rm -rf "$lock"
+  trap - EXIT INT TERM
+  return $rc
 }
 
 # --- models (see models.conf) -------------------------------------------------

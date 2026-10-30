@@ -14,6 +14,137 @@ tmux session "forge"
 
 ![dashboard](docs/dashboard.png)
 
+## Architecture
+
+Three things make a run reproducible: each worker is isolated in its own
+worktree, the orchestrator never writes code itself, and all shared state lives
+in one directory of JSON files.
+
+### Isolation — one worker, one branch, one worktree
+
+The main checkout is never touched by a worker. `forge-spawn` creates a branch
+and a worktree for it, and the worker is started with that worktree as its
+working directory, in a tmux window of its own.
+
+```
+       your repo (main checkout)                    ../.forge-wt/<repo>/
+       ┌───────────────────────────┐                ┌──────────────────────┐
+       │ main          ← you work  │   worktree add │ fix-login/           │
+       │ .forge/       ← state     ├───────────────►│   (agent/fix-login)  │ ← worker 1
+       │ .git/                     │                ├──────────────────────┤
+       │                           ├───────────────►│ add-export/          │
+       └───────────────────────────┘                │   (agent/add-export) │ ← worker 2
+                   ▲                                └──────────────────────┘
+                   │  forge-merge --no-ff (only after you review the diff)
+                   └──────────────────────────────────────────┘
+```
+
+A worktree holds **tracked files only**, which is why gitignored paths need
+`--link` (see [Data outside the repo](#data-outside-the-repo---link)). forge
+never pushes: merging into your branch is the last step it takes, and the
+remote is yours.
+
+### The loop — who does what
+
+```
+   you                orchestrator              worker N              harness
+    │                 (Claude Code)           (codex/claude/agy)     (forge-run)
+    │   goal              │                         │                    │
+    ├────────────────────►│                         │                    │
+    │                     │  plan, split into tasks │                    │
+    │   "ok"              │                         │                    │
+    ├────────────────────►│                         │                    │
+    │                     │   forge-spawn ─────────────────────────────► │
+    │                     │                         │ ◄── brief + rules  │
+    │                     │                         │                    │
+    │                     │                         │ edits code,        │
+    │                     │                         │ runs the           │
+    │                     │                         │ acceptance check   │
+    │                     │                         │ writes the report  │
+    │                     │                         ├───────────────────►│
+    │                     │   forge-wait            │                    │ commits
+    │                     │ ◄───────────────────────────── status ───────┤ (never pushes)
+    │                     │   forge-review (reads the diff)              │
+    │   report            │   forge-merge --no-ff                        │
+    │ ◄───────────────────┤                                              │
+```
+
+The worker never commits — the harness does, after the run, so a worker that
+dies mid-task cannot leave half a commit. The orchestrator never merges without
+reading the diff first, and `forge-drop` (which destroys work) has to ask you.
+
+### Worker lifecycle
+
+```
+                        forge-spawn
+                             │
+                             ▼
+                        ┌─────────┐
+                        │ queued  │
+                        └────┬────┘
+                             │ forge-run starts the CLI
+                             ▼
+                        ┌─────────┐
+            ┌───────────┤ running ├───────────┐
+            │           └────┬────┘           │
+   worker exited ≠ 0         │          nothing produced
+   or agy auto-denied        │          (no diff / no report)
+            ▼                ▼                ▼
+       ┌────────┐       ┌────────┐      ┌───────────┐
+       │ failed │       │  done  │      │ nochanges │
+       └────────┘       └───┬────┘      └───────────┘
+      worktree kept         │
+      for inspection        │ forge-merge
+                     ┌──────┴──────┐
+                     ▼             ▼
+                ┌────────┐   ┌──────────┐
+                │ merged │   │ conflict │ ← merge aborted, tree left clean
+                └────────┘   └──────────┘
+
+   at any point:  forge-cancel → cancelled (branch kept, partial work committed)
+                  forge-drop   → dropped   (branch and worktree deleted)
+```
+
+`done` means the run finished, **not** that there is a deliverable — always
+read the report.
+
+### State — one file per worker
+
+Everything the commands show comes from `.forge/`, which is excluded from git
+automatically. `agent_set` is the only writer.
+
+```
+   forge-spawn ─┐
+   forge-run  ──┤                      .forge/
+   forge-merge ─┼──► agent_set ──►     ├── agents/<name>.json   status, branch,
+   forge-cancel ┤   (locked, atomic)   │                        base_sha, model,
+   forge-drop  ─┘                      │                        provider, commands,
+                                       │                        report, commit
+                                       ├── tasks/<name>.md      the brief
+                                       ├── logs/<name>.log      raw CLI output
+                                       ├── usage/<name>.json    agy token envelope
+                                       └── feedback.jsonl       dashboard comments
+                                              │
+   forge-status ──┐                           │
+   forge-wait   ──┤                           │
+   forge-review ──┼──◄── agent_get ───────────┘
+   forge-clean  ──┤
+   dashboard    ──┘
+```
+
+`forge-spawn` and `forge-run` live in different tmux windows and cannot pass
+anything through the environment, so the agent file is also the channel between
+them: the spawn records the model, kind, effort and allowed commands, and the
+run reads them back.
+
+Writes are serialised with a lock, because `agent_set` is a read-modify-write:
+`jq` reads the file and `mv` replaces it a moment later. The `mv` is atomic, so
+the file is never torn, but two writers racing on the same agent would both
+read the old JSON and the second would discard the first's field — a status
+that appears to move backwards. The lock is a `mkdir` (atomic everywhere;
+macOS has no `flock`) recording the holder's pid, and a waiter reclaims it only
+once that process is gone, so a slow holder is waited for rather than robbed.
+
 ## Install (macOS) — once, not per project
 
 The `forge` folder is a tool shared by all your projects. Keep it in one fixed
@@ -264,6 +395,25 @@ do not.
   **subset** for one worker, matched to the acceptance check in its brief. A
   spawn without `--commands` grants the whole bound.
 
+```
+   commands.conf                    the operator's bound — your decision
+   ┌───────────────────────────────────────────────────┐
+   │  cd echo ls cat find grep head tail wc git        │
+   │  python3 pytest                                   │
+   └───────────────────────────────────────────────────┘
+                │                            │
+                │ forge-spawn                │ forge-spawn
+                │  --commands "cd echo pytest"│  (no --commands)
+                ▼                            ▼
+        ┌───────────────┐            ┌──────────────────┐
+        │ worker A      │            │ worker B         │
+        │ cd echo pytest│            │ the whole bound  │
+        └───────────────┘            └──────────────────┘
+
+        forge-spawn --commands "curl ..."  ──►  spawn ABORTS
+        curl is outside the bound; widening it is the operator's call
+```
+
 The orchestrator can **never exceed** `commands.conf`: asking for a command
 outside the bound aborts the spawn with a message, before the worktree is even
 created. That is deliberate — the orchestrator reads task briefs, so a brief
@@ -396,12 +546,27 @@ for analysis, no report. An analysis worker that wrote a report finishes as
 `forge-init` installs a layout in which **no tool reads another's role**:
 
 ```
-PROJECT.md   project rules — the ONLY source of truth
-   ↑ @PROJECT.md              ↑ @PROJECT.md
-CLAUDE.md                  AGENTS.md
-(orchestrator)             (Codex worker)
-   ↑ @FORGE.md                + worker rules
-FORGE.md
+          ┌──────────────────────────────────────────┐
+          │ PROJECT.md   project rules — the ONLY    │
+          │              source of truth. YOU own it.│
+          └──────────────────────────────────────────┘
+                 ▲                          ▲
+                 │ @PROJECT.md              │ @PROJECT.md
+                 │                          │
+      ┌──────────┴─────────┐     ┌──────────┴──────────────┐
+      │ CLAUDE.md          │     │ AGENTS.md               │
+      │ read by Claude Code│     │ read by the worker CLI  │
+      │ (the orchestrator) │     │ + worker rules          │
+      └──────────┬─────────┘     └─────────────────────────┘
+                 │ @FORGE.md
+                 ▼
+      ┌────────────────────┐
+      │ FORGE.md           │  the orchestrator loop.
+      │ forge owns it      │  forge-init rewrites it every run —
+      └────────────────────┘  put your own rules in PROJECT.md
+
+  An arrow means "imports". Neither role file imports the other, so the
+  orchestrator never inherits worker rules and no worker reads the loop.
 ```
 
 - **`PROJECT.md`** — shared rules: environment, quality gate, conventions,

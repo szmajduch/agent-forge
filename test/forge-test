@@ -536,6 +536,76 @@ t_forge_state_is_git_excluded() {
   case "$(git -C "$REPO" status --porcelain)" in *.forge*) no ".forge shows as untracked" ;; *) ok ;; esac
 }
 
+# --- agent_set locking --------------------------------------------------------
+# agent_set is a read-modify-write (jq reads, mv replaces). Without a lock two
+# writers both read the old JSON and the second mv discards the first's field.
+
+t_agent_set_survives_concurrent_writers() {
+  forge status >/dev/null          # creates .forge
+  local n=20
+  # Each writer sets its OWN key, so a lost update is a missing key — not a
+  # last-writer-wins race that would be invisible.
+  ( cd "$REPO" && bash -c '
+      source "'"$FORGE_HOME"'/bin/forge-lib.sh"
+      agent_set conc init=1
+      for i in $(seq 1 '"$n"'); do ( agent_set conc "k$i=$i" ) & done
+      wait' ) >/dev/null 2>&1
+  local f="$REPO/.forge/agents/conc.json"
+  if [[ -f "$f" ]]; then
+    jq -e . "$f" >/dev/null 2>&1 && ok || no "concurrent writes left invalid JSON"
+    local got
+    got="$(jq -r '[keys[] | select(startswith("k"))] | length' "$f" 2>/dev/null)"
+    assert_eq "$n" "$got" "every concurrent writer's field survived"
+  else
+    no "no agent file was written"; no "(skipped)"
+  fi
+  # A completed write must leave nothing behind, or the next one waits for a
+  # lock nobody holds.
+  [[ -z "$(find "$REPO/.forge/agents" -name '*.lock' -o -name '*.tmp.*' 2>/dev/null)" ]] \
+    && ok || no "a lock or temp file was left behind"
+}
+
+t_agent_set_reclaims_a_dead_holders_lock() {
+  # A worker killed mid-write (Ctrl-C, tmux window closed) leaves the lock
+  # directory on disk. Without reclaim every later write would block forever.
+  forge status >/dev/null
+  ( cd "$REPO" && bash -c 'source "'"$FORGE_HOME"'/bin/forge-lib.sh"; agent_set orphan status=queued' ) >/dev/null 2>&1
+  local lock="$REPO/.forge/agents/orphan.json.lock"
+  mkdir -p "$lock" && echo 999999 > "$lock/pid"   # a pid that cannot exist
+  set +e
+  OUT="$(cd "$REPO" && FORGE_LOCK_TIMEOUT=1 bash -c '
+           source "'"$FORGE_HOME"'/bin/forge-lib.sh"
+           agent_set orphan status=running
+           agent_get orphan status' 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 0 "$RC" "a write recovers from an abandoned lock"
+  assert_contains "$OUT" "running" "the write went through after reclaiming"
+  [[ ! -d "$lock" ]] && ok || no "the reclaimed lock was not removed"
+}
+
+t_agent_set_waits_for_a_live_holder() {
+  # The inverse: a holder that is merely slow must NOT be robbed. An earlier
+  # draft compared the lock's mtime to the timeout and stole it after 3s from a
+  # holder working for 6 — mtime says when the lock was taken, not whether its
+  # owner is alive. Liveness is checked with kill -0 instead.
+  forge status >/dev/null
+  ( cd "$REPO" && bash -c 'source "'"$FORGE_HOME"'/bin/forge-lib.sh"; agent_set busy status=queued' ) >/dev/null 2>&1
+  local lock="$REPO/.forge/agents/busy.json.lock"
+  mkdir -p "$lock"
+  # A live holder, recording its pid the way agent_lock does.
+  bash -c 'echo $$ > "'"$lock"'/pid"; sleep 4; rm -rf "'"$lock"'"' &
+  local holder=$!
+  sleep 0.5
+  local start; start="$(date +%s)"
+  ( cd "$REPO" && FORGE_LOCK_TIMEOUT=1 bash -c '
+      source "'"$FORGE_HOME"'/bin/forge-lib.sh"; agent_set busy status=running' ) >/dev/null 2>&1
+  local waited=$(( $(date +%s) - start ))
+  wait "$holder" 2>/dev/null || true
+  # It had to outlast the holder rather than cut in at the timeout.
+  [[ $waited -ge 3 ]] && ok || no "a live holder was robbed after ${waited}s (timeout was 1s)"
+}
+
 t_refuses_to_run_in_the_tool_directory() {
   set +e
   OUT="$(cd "$FORGE_HOME" && "$BIN/forge-status" 2>&1)"; RC=$?
@@ -1277,6 +1347,9 @@ run_test up-rejects-bad-mouse-value     t_up_rejects_bad_mouse_value
 echo
 echo "state, isolation, reporting"
 run_test forge-state-git-excluded       t_forge_state_is_git_excluded
+run_test agent-set-concurrent           t_agent_set_survives_concurrent_writers
+run_test agent-set-reclaims-dead-lock   t_agent_set_reclaims_a_dead_holders_lock
+run_test agent-set-waits-live-holder    t_agent_set_waits_for_a_live_holder
 run_test refuses-tool-directory         t_refuses_to_run_in_the_tool_directory
 run_test works-from-worktree            t_works_from_inside_a_worktree
 run_test wait-returns-on-finish         t_wait_returns_when_worker_finishes
