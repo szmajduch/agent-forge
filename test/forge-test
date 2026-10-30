@@ -953,6 +953,161 @@ t_up_rejects_bad_mouse_value() {
     || ok
 }
 
+# --- forge-retry --------------------------------------------------------------
+# The default is to CONTINUE a failed attempt, so these tests check two separate
+# promises: that the partial work survives, and that the worker is actually told
+# it is continuing. A retry that silently restarts would look identical in the
+# status output while wasting the whole previous run.
+
+t_retry_continues_and_keeps_partial_work() {
+  # Fails after writing a file, exactly like a worker that got halfway.
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+echo "half done" > partial.txt
+echo "boom" >&2
+exit 7
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn rt1 "do the thing"
+  assert_rc 0 "$RC" "spawn worker that will fail"
+  assert_eq "failed" "$(await rt1)" "worker failed"
+  assert_file "$FORGE_WT_ROOT/rt1/partial.txt" "partial work left for retry"
+
+  # On retry the fake succeeds, and records the brief it was given so the test
+  # can prove the continuation note reached the model.
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+printf '%s' "$*" > /tmp/forge-retry-prompt.$$
+cp /tmp/forge-retry-prompt.$$ "$PWD/prompt-seen.txt"
+rm -f /tmp/forge-retry-prompt.$$
+mkdir -p reports; echo "# done on retry" > reports/rt1.md
+echo "finished" > finished.txt
+XEOF
+  chmod +x "$FAKEBIN/codex"
+
+  forge retry rt1
+  assert_rc 0 "$RC" "forge-retry"
+  assert_contains "$OUT" "continuing" "retry says it is continuing"
+  assert_eq "done" "$(await rt1)" "retried worker finished"
+
+  # The whole point: the earlier work was not thrown away.
+  assert_contains "$(git -C "$REPO" show --name-only --format= agent/rt1)" \
+    "partial.txt" "partial work from the failed attempt is committed"
+  # And the worker was told to continue rather than start over.
+  local seen; seen="$(cat "$FORGE_WT_ROOT/rt1/prompt-seen.txt" 2>/dev/null || true)"
+  assert_contains "$seen" "RETRY — attempt 2" "brief carries the retry header"
+  assert_contains "$seen" "CONTINUE from that state" "brief tells the worker to continue"
+  assert_contains "$seen" "partial.txt" "brief names the files already changed"
+  assert_contains "$seen" "exit code 7" "brief carries the previous exit code"
+}
+
+t_retry_fresh_resets_the_worktree() {
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+echo "junk" > junk.txt
+exit 7
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn rt2 "do the thing"
+  assert_eq "failed" "$(await rt2)" "worker failed"
+  assert_file "$FORGE_WT_ROOT/rt2/junk.txt" "junk present before --fresh"
+
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+cp "$STATE_TASK" "$PWD/prompt-seen.txt" 2>/dev/null || printf '%s' "$*" > "$PWD/prompt-seen.txt"
+mkdir -p reports; echo "# fresh" > reports/rt2.md
+echo "clean run" > clean.txt
+XEOF
+  chmod +x "$FAKEBIN/codex"
+
+  forge retry rt2 --fresh
+  assert_rc 0 "$RC" "forge-retry --fresh"
+  assert_contains "$OUT" "fresh" "retry says it is fresh"
+  assert_eq "done" "$(await rt2)" "fresh retry finished"
+  # --fresh discards the failed attempt's work, which is its whole purpose.
+  assert_no_file "$FORGE_WT_ROOT/rt2/junk.txt" "junk discarded by --fresh"
+  # The brief must NOT carry a continuation note on a fresh run.
+  local seen; seen="$(cat "$FORGE_WT_ROOT/rt2/prompt-seen.txt" 2>/dev/null || true)"
+  case "$seen" in *"RETRY — attempt"*) no "--fresh brief should not carry a retry note" ;; *) ok ;; esac
+}
+
+t_retry_does_not_stack_notes() {
+  # Two retries must not bury the task under two continuation notes.
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+printf '%s' "$*" > "$PWD/prompt-seen.txt"
+exit 7
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn rt3 "the original brief line"
+  assert_eq "failed" "$(await rt3)" "first attempt failed"
+  forge retry rt3
+  assert_eq "failed" "$(await rt3)" "second attempt failed"
+  forge retry rt3
+  assert_rc 0 "$RC" "third attempt starts"
+  assert_eq "failed" "$(await rt3)" "third attempt failed"
+
+  local seen; seen="$(cat "$FORGE_WT_ROOT/rt3/prompt-seen.txt" 2>/dev/null || true)"
+  assert_contains "$seen" "RETRY — attempt 3" "attempt counter advances"
+  # Exactly one note, not one per retry.
+  assert_eq "1" "$(printf '%s' "$seen" | grep -c 'RETRY — attempt')" "only one retry note in the brief"
+  assert_contains "$seen" "the original brief line" "original brief preserved"
+}
+
+t_retry_refuses_running_worker() {
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+sleep 30
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn rt4 "long task"
+  local i=0
+  while [[ $i -lt 40 ]]; do
+    [[ "$(status_of rt4)" == "running" ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+  forge retry rt4
+  assert_rc 1 "$RC" "retry refuses a running worker"
+  assert_contains "$OUT" "forge-cancel it first" "message points at cancel"
+  forge cancel rt4
+}
+
+t_retry_refuses_done_and_unknown() {
+  forge spawn rt5 "a task"
+  assert_eq "done" "$(await rt5)" "worker done"
+  forge retry rt5
+  assert_rc 1 "$RC" "retry refuses a successful worker"
+  assert_contains "$OUT" "finished successfully" "message explains why"
+
+  forge retry nosuchagent
+  assert_rc 1 "$RC" "retry refuses an unknown agent"
+  assert_contains "$OUT" "no such agent" "unknown agent message"
+}
+
+t_retry_rejects_bad_options() {
+  forge retry rt6 --nope
+  assert_rc 1 "$RC" "retry rejects an unknown option"
+  assert_contains "$OUT" "unknown option" "unknown option message"
+  forge retry a b
+  assert_rc 1 "$RC" "retry rejects two names"
+  assert_contains "$OUT" "too many arguments" "too many arguments message"
+}
+
+t_retry_refuses_when_worktree_is_gone() {
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+exit 7
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn rt7 "will fail"
+  assert_eq "failed" "$(await rt7)" "worker failed"
+  # Simulates a cleaned-up worktree: retry must say so rather than half-run.
+  rm -rf "$FORGE_WT_ROOT/rt7"
+  forge retry rt7
+  assert_rc 1 "$RC" "retry refuses a missing worktree"
+  assert_contains "$OUT" "worktree is gone" "missing worktree message"
+}
+
 t_models_lists_default() {
   forge models
   assert_rc 0 "$RC" "forge-models"
@@ -1325,6 +1480,16 @@ echo "forge-cancel"
 run_test cancel-keeps-partial-work      t_cancel_keeps_partial_work
 run_test cancel-refuses-finished        t_cancel_refuses_finished_worker
 run_test cancelled-is-mergeable         t_cancelled_worker_is_mergeable
+
+echo
+echo "forge-retry"
+run_test retry-continues-partial-work   t_retry_continues_and_keeps_partial_work
+run_test retry-fresh-resets-worktree    t_retry_fresh_resets_the_worktree
+run_test retry-does-not-stack-notes     t_retry_does_not_stack_notes
+run_test retry-refuses-running          t_retry_refuses_running_worker
+run_test retry-refuses-done-unknown     t_retry_refuses_done_and_unknown
+run_test retry-rejects-bad-options      t_retry_rejects_bad_options
+run_test retry-refuses-gone-worktree    t_retry_refuses_when_worktree_is_gone
 
 echo
 echo "forge-clean"

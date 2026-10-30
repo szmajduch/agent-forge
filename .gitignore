@@ -1,4 +1,9 @@
-# Lokalna lista modeli dla konkretnej instalacji.
+# Per-installation model list, not shared.
 models.local.conf
 
 .DS_Store
+
+# py_compile (run by CI and by hand) drops these next to the scripts; bin/ holds
+# commands, so a cache directory there is untracked noise. forge-dashboard
+# already suppresses its own via sys.dont_write_bytecode.
+__pycache__/

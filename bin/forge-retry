@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+# forge-retry <name> [--fresh] — run a finished worker again on its own branch.
+#
+# The default CONTINUES: the worktree is left exactly as the failed run left it
+# (forge-run deliberately does not clean up after a failure), and the brief is
+# extended with what happened last time — the exit code, the tail of the log,
+# and the worker's own uncommitted changes. A model that already wrote half the
+# work should finish it, not redo it.
+#
+# --fresh is the opposite: the worktree is reset to the agent's base_sha and the
+# original brief is used unchanged, for when the partial state is the problem
+# rather than the starting point.
+#
+# Why this is a command and not just a dashboard endpoint: the dashboard calls
+# it, but so does the operator and so does the orchestrator, and it has to be
+# testable like every other command.
+source "$(dirname "$0")/forge-lib.sh" || exit 1
+
+fresh=0; name=""
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --fresh) fresh=1; shift ;;
+    --) shift ;;
+    --*) die "unknown option $1 (usage: forge-retry <name> [--fresh])" ;;
+    *) [[ -z "$name" ]] || die "too many arguments: '$1' (usage: forge-retry <name> [--fresh])"
+       name="$1"; shift ;;
+  esac
+done
+[[ -n "$name" ]] || die "usage: forge-retry <name> [--fresh]"
+valid_name "$name"
+
+[[ -f "$(agent_file "$name")" ]] || die "no such agent: $name"
+
+status="$(agent_get "$name" status)"
+# A running worker must not be restarted underneath itself: two processes in one
+# worktree would interleave their writes. Cancel it first, deliberately.
+case "$status" in
+  failed|nochanges|cancelled) ;;
+  queued|running) die "agent '$name' is still $status — forge-cancel it first, then retry" ;;
+  done)   die "agent '$name' finished successfully — forge-review it, or forge-drop and respawn to redo the task" ;;
+  merged) die "agent '$name' is already merged — spawn a new agent for follow-up work" ;;
+  dropped) die "agent '$name' was dropped: its worktree and branch are gone, so there is nothing to continue" ;;
+  *) die "agent '$name' has status '${status:-unknown}' — only failed/nochanges/cancelled workers can be retried" ;;
+esac
+
+wt="$(agent_get "$name" worktree)"
+branch="$(agent_get "$name" branch)"
+base_sha="$(agent_get "$name" base_sha)"
+task_file="$STATE/tasks/$name.md"
+
+[[ -n "$wt" && -d "$wt" ]] || die "worktree is gone: ${wt:-<unrecorded>} — nothing to retry (spawn a new agent instead)"
+[[ -f "$task_file" ]] || die "the original brief is missing: $task_file (spawn a new agent instead)"
+
+# The window from the previous run may still exist (FORGE_KEEP_WINDOW=1 keeps a
+# shell open in it). Reusing the name would make tmux create "<name>-1", so the
+# old one goes first.
+tmux kill-window -t "$FORGE_SESSION:$name" 2>/dev/null || true
+
+attempt="$(agent_get "$name" attempt)"
+attempt=$((${attempt:-1} + 1))
+
+if [[ $fresh -eq 1 ]]; then
+  [[ -n "$base_sha" ]] || die "agent '$name' has no base_sha recorded, so --fresh cannot reset it safely"
+  # Discards the failed attempt's work. That is the point of --fresh, but it is
+  # irreversible for anything uncommitted, so it is never the default.
+  git -C "$wt" reset -q --hard "$base_sha"
+  git -C "$wt" clean -qfd
+  # Previous attempts live on the branch; keep them reachable for review rather
+  # than resetting the branch ref itself.
+  info "reset $wt to $base_sha (attempt $attempt, fresh start)"
+else
+  # Restore the original brief first, so repeated retries do not stack one
+  # continuation note on top of another until the task is buried.
+  if [[ -f "$task_file.orig" ]]; then
+    cp "$task_file.orig" "$task_file"
+  else
+    cp "$task_file" "$task_file.orig"
+  fi
+
+  # What the worker needs to know to continue rather than restart. Read from
+  # the worktree, not from the model's own account of it: the diff is what is
+  # actually on disk.
+  changed="$(git -C "$wt" status --porcelain 2>/dev/null | head -40)"
+  stat_line="$(git -C "$wt" diff --stat HEAD 2>/dev/null | tail -1)"
+  last_log="$(tail -c 2000 "$STATE/logs/$name.log" 2>/dev/null \
+              | sed 's/\x1b\[[0-9;?]*[A-Za-z]//g' | tail -25)"
+  prev_rc="$(agent_get "$name" exit_code)"
+
+  {
+    cat "$task_file.orig"
+    printf '\n\n---\n\n## RETRY — attempt %s\n\n' "$attempt"
+    printf 'A previous attempt at this task did not complete'
+    [[ -n "$prev_rc" && "$prev_rc" != "0" ]] && printf ' (exit code %s)' "$prev_rc"
+    printf '. Its work is still in this worktree.\n\n'
+    printf 'CONTINUE from that state. Do not start over, and do not redo work that is\n'
+    printf 'already present — read the files first, then carry on. If what is there is\n'
+    printf 'wrong, correct it.\n'
+    if [[ -n "$changed" ]]; then
+      printf '\nUncommitted changes left by the previous attempt:\n\n```\n%s\n```\n' "$changed"
+      [[ -n "$stat_line" ]] && printf '\n%s\n' "$stat_line"
+    else
+      printf '\nThe previous attempt left no file changes, so it failed before producing\n'
+      printf 'anything. Treat the log below as the clue to what blocked it.\n'
+    fi
+    if [[ -n "$last_log" ]]; then
+      printf '\nThe end of the previous attempt'"'"'s log:\n\n```\n%s\n```\n' "$last_log"
+    fi
+  } > "$task_file.new"
+  mv "$task_file.new" "$task_file"
+  info "continuing in $wt (attempt $attempt, previous work kept)"
+fi
+
+agent_set "$name" status=queued attempt="$attempt" \
+  retried="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+ensure_session
+# Same whitelist as forge-spawn: tmux new-window inherits the tmux server's
+# environment, not this shell's, so worker-facing variables are passed with -e
+# or they never arrive.
+tmux_env=()
+for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
+         FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS \
+         FORGE_REPORT_DIR FORGE_KEEP_WINDOW \
+         FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION; do
+  [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
+done
+# Guarded expansion, not "${tmux_env[@]}": under set -u bash 3.2 (macOS) treats
+# an empty array as unbound and aborts. It happens to be non-empty today only
+# because forge-lib.sh always defines FORGE_SESSION and that is on the list
+# above — remove it from the list and the bare form would break every spawn.
+tmux new-window -d ${tmux_env[@]+"${tmux_env[@]}"} -t "$FORGE_SESSION:" -n "$name" -c "$wt" \
+  "$FORGE_HOME/bin/forge-run '$name'"
+
+echo "retrying $name on $branch, attempt $attempt$([[ $fresh -eq 1 ]] && echo " (fresh)" || echo " (continuing)") (tmux: $FORGE_SESSION:$name)"

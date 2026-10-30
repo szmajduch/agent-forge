@@ -175,7 +175,11 @@ for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
          FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION; do
   [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
 done
-tmux new-window -d "${tmux_env[@]}" -t "$FORGE_SESSION:" -n "$name" -c "$wt" "$FORGE_HOME/bin/forge-run '$name'"
+# Guarded expansion: under set -u bash 3.2 (macOS) treats an empty array as
+# unbound and aborts. The array is non-empty today only because forge-lib.sh
+# always defines FORGE_SESSION and it is on the list above, so the bare form
+# would be a latent break the moment that list changes.
+tmux new-window -d ${tmux_env[@]+"${tmux_env[@]}"} -t "$FORGE_SESSION:" -n "$name" -c "$wt" "$FORGE_HOME/bin/forge-run '$name'"
 
 echo "spawned $name ($kind) on $branch from $base, $provider model: ${model:-provider default}${effort:+, effort: $effort} (worktree: $wt, tmux: $FORGE_SESSION:$name)"
 if [[ ${#links[@]} -gt 0 ]]; then echo "  linked: ${links[*]}"; fi

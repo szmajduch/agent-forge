@@ -167,6 +167,16 @@ higher effort before you re-scope the task.
 - To stop a worker that is going the wrong way, prefer `forge-cancel <name>`:
   it kills the model but keeps the branch and commits whatever it had produced,
   so you can still read it. `forge-drop` is for when the work is worthless.
+- A `failed` worker keeps its worktree, so prefer `forge-retry <name>` over
+  respawning: it continues from the partial work and tells the worker what the
+  last attempt left behind, instead of paying again for the part that already
+  worked. Use `forge-retry <name> --fresh` only when the partial state is
+  itself the problem.
+- Retry at most twice. A third failure on the same brief is evidence the brief
+  is wrong, not the worker — re-scope the task or ask the operator, rather than
+  spending another run on it. Read the log before each retry: retrying a worker
+  that failed because a command was denied, or because the acceptance check
+  does not exist, will fail identically.
 - `forge-clean` removes finished workers' leftovers. Plain `forge-clean` only
   touches merged ones and is safe; any wider scope can delete unmerged work, so
   ask the operator before using one.
