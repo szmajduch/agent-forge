@@ -29,6 +29,11 @@ Why each provider is read differently:
           (The `gemini` provider was removed on 2026-10-30 — Google no longer
           serves Gemini CLI to personal accounts.)
 
+Totals: every provider prints a total of its own and they disagree on what it
+includes, so none of them is trusted — TOTAL is derived from the parts (see
+_TOTAL_PARTS and _check_total) and the provider's figure is only used as a
+cross-check. A mismatch becomes a visible warning rather than a wrong number.
+
 Percentages: a session's context use is `last_total / context_window`, which is
 what decides when a session must compact. Plan quota is shown only when the
 provider states it (codex). Nothing here is extrapolated into a cost estimate:
@@ -88,8 +93,45 @@ def _blank(provider, model, session, cwd=""):
         "input": 0, "output": 0, "cached": 0, "cache_write": 0,
         "reasoning": 0, "total": 0,
         "context_window": 0, "last_total": 0, "mtime": 0.0,
-        "plan": "", "quota": None,
+        "plan": "", "quota": None, "note": "",
     }
+
+
+# What TOTAL means in this tool, for every provider: the billed volume, which
+# is the disjoint sum of the four input/output buckets.
+#
+# `reasoning` is deliberately NOT in the sum. Every provider reports it as a
+# subset of output_tokens, not alongside it (measured on agy 1.4.11: Gemini
+# Flash output=55 with thinking=54), so adding it would double-count.
+#
+# Each provider also prints a total of its own, and they do not agree on what
+# it includes — codex counts cache in, agy's is input+output only. Rather than
+# pick one and hope, forge derives the figure and _check_total compares it with
+# what the provider said, so a changed convention surfaces as a note instead of
+# a silently wrong number.
+_TOTAL_PARTS = ("input", "output", "cached", "cache_write")
+
+
+def derived_total(rec):
+    return sum(rec[k] for k in _TOTAL_PARTS)
+
+
+def _check_total(rec, claimed):
+    """Set rec['total'] from the parts, noting any disagreement.
+
+    Returns nothing; annotates rec. `claimed` is the provider's own
+    total_tokens, or 0/None when it does not report one.
+    """
+    rec["total"] = derived_total(rec)
+    if not claimed:
+        return
+    # Known and expected: a provider whose total omits the cache buckets.
+    cache = rec["cached"] + rec["cache_write"]
+    if claimed == rec["total"] or claimed == rec["total"] - cache:
+        return
+    # Anything else means the provider changed what it reports. Say so,
+    # with both numbers, instead of printing one of them as fact.
+    rec["note"] = f"provider total {claimed} != parts {rec['total']}"
 
 
 def _codex_sessions(since):
@@ -106,6 +148,9 @@ def _codex_sessions(since):
             continue
         rec = _blank("codex", "", os.path.basename(path))
         rec["mtime"] = mtime
+        # The provider's own figure, for _check_total to compare against. A
+        # session log may carry neither record, so it starts at 0 ("no claim").
+        claimed = 0
         for d in _f(path):
             t = d.get("type")
             p = d.get("payload") or {}
@@ -121,7 +166,7 @@ def _codex_sessions(since):
                     rec["output"] = u.get("output_tokens", 0)
                     rec["cached"] = u.get("cached_input_tokens", 0)
                     rec["reasoning"] = u.get("reasoning_output_tokens", 0)
-                    rec["total"] = u.get("total_tokens", 0)
+                    claimed = u.get("total_tokens", 0)
                 last = p.get("usage") or {}
                 if last:
                     rec["last_total"] = last.get("total_tokens", rec["last_total"])
@@ -131,11 +176,12 @@ def _codex_sessions(since):
                     rec["context_window"] = info["model_context_window"]
                 tot = info.get("total_token_usage") or {}
                 if tot.get("total_tokens"):
-                    rec["total"] = max(rec["total"], tot["total_tokens"])
+                    claimed = max(claimed, tot["total_tokens"])
                 rl = p.get("rate_limits") or {}
                 if rl:
                     rec["plan"] = rl.get("plan_type") or rec["plan"]
                     rec["quota"] = _codex_quota(rl)
+        _check_total(rec, claimed)
         if rec["total"]:
             out.append(rec)
     return out
@@ -205,10 +251,9 @@ def _claude_sessions(since):
                     + u.get("cache_creation_input_tokens", 0)
                     + u.get("output_tokens", 0))
             rec["last_total"] = max(rec["last_total"], held)
-        # input_tokens excludes cache, so the three are disjoint and summing
-        # them is the true billed volume.
-        rec["total"] = (rec["input"] + rec["output"]
-                        + rec["cached"] + rec["cache_write"])
+        # input_tokens excludes cache, so the buckets are disjoint. Claude
+        # states no per-session total of its own, hence no claim to check.
+        _check_total(rec, 0)
         if rec["total"]:
             out.append(rec)
     return out
@@ -223,9 +268,17 @@ def _agy_usage(since, state):
     .forge/usage/<name>.json and this reads it back. Verified against agy
     1.4.11.
 
-    total_tokens is reported as input+output and EXCLUDES cache_read_tokens
-    (measured: 9169+355=9524 with cache_read 15628), so cache is added here to
-    get the real volume moved.
+    agy's own total_tokens is input+output and excludes cache_read_tokens
+    (measured across all four model families on 1.4.11: claude-sonnet-4-6,
+    claude-opus-4-6-thinking, gemini-3.8-flash-high, gpt-oss-120b-medium —
+    total == input+output in every sample, with cache up to 39918). forge
+    therefore derives TOTAL from the parts via _check_total rather than
+    trusting or patching that figure, and reports a note if a future version
+    starts counting differently.
+
+    thinking_tokens is already part of output_tokens, not additional to it
+    (gemini-3.8-flash-high: output=55, thinking=54), so it is recorded for
+    display only and never added into the total.
     """
     out = []
     if not state:
@@ -250,7 +303,7 @@ def _agy_usage(since, state):
         rec["output"] = u.get("output_tokens", 0)
         rec["cached"] = u.get("cache_read_tokens", 0)
         rec["reasoning"] = u.get("thinking_tokens", 0)
-        rec["total"] = (u.get("total_tokens", 0) or 0) + rec["cached"]
+        _check_total(rec, u.get("total_tokens", 0) or 0)
         # One headless run is one turn, so the envelope's own figure IS the
         # context held — there is no earlier peak to compare against.
         rec["last_total"] = rec["input"] + rec["cached"] + rec["output"]
@@ -396,6 +449,19 @@ def main():
             q = "         n/a"
         print(f"{r['provider']:11} {_display_model(r['model'])[:20]:20} {ctx:>13} "
               f"{q:>12}  {r['session'][:20]}")
+
+    # A disagreement between the provider's total and the parts means the CLI
+    # changed what it reports. That invalidates the TOTAL column, so it is
+    # stated loudly rather than left in a JSON field nobody reads.
+    notes = sorted({r["note"] for r in recs if r.get("note")})
+    if notes:
+        print()
+        print("WARNING: a provider's reported total no longer matches its own "
+              "parts, so TOTAL may be wrong:")
+        for n in notes:
+            print(f"  {n}")
+        print("  TOTAL is the sum of in+out+cache; please re-check the "
+              "provider's usage format.")
 
     if any(r["provider"] == "codex" and not r["quota"] for r in recs):
         print()

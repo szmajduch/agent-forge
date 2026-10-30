@@ -500,9 +500,28 @@ kopercie JSON na końcu biegu `-p`. Dlatego `forge-run` zapisuje ją do
 czego czytać, a nieudane sparsowanie JSON-a **nie** jest traktowane jako błąd
 workera — praca może być całkowicie dobra.
 
-Jedna pułapka w arytmetyce: `total_tokens` z `agy` to `input + output` i
-**nie zawiera** `cache_read_tokens` (zmierzone: 9169+355=9524 przy cache
-15628). forge dolicza cache, żeby `TOTAL` pokazywał realny przepływ.
+### Skąd bierze się kolumna TOTAL
+
+Dostawcy **nie są zgodni**, co wchodzi w ich własne `total_tokens`: u `agy` to
+`input + output` bez cache (zmierzone na wszystkich czterech rodzinach modeli
+na 1.4.11), u codexa cache jest w środku, claude nie podaje sumy per sesja
+wcale. Dlatego forge **nie ufa** żadnemu z tych pól — liczy sam:
+
+```
+TOTAL = input + output + cached + cache_write
+```
+
+Te cztery kubełki są rozłączne, więc suma to realny przepływ tokenów. Kolumna
+`REASON` (reasoning/thinking) **nie wchodzi** do sumy, bo u każdego dostawcy
+jest już częścią `output`, nie dodatkiem do niego (zmierzone na
+`gemini-3.8-flash-high`: `output=55` przy `thinking=54`).
+
+Pole `total_tokens` od dostawcy jest jednak dalej sprawdzane: jeśli nie zgadza
+się ani z sumą części, ani z sumą minus cache, `forge-usage` wypisuje
+**WARNING** z obiema liczbami. Czyli gdy `agy` w przyszłej wersji zmieni
+konwencję, dowiesz się o tym z komunikatu, a nie z cicho zawyżonego rachunku.
+Sama kolumna `TOTAL` pozostaje poprawna w obu konwencjach — nie zależy od tego
+pola.
 
 W tabeli `MODEL` widnieje nazwa z forge (`agy-sonnet`), nie slug — bo to ona
 mówi, z czyich kredytów poszedł bieg. `agy-sonnet` i `sonnet` to ten sam model

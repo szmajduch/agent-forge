@@ -1031,8 +1031,49 @@ t_usage_reports_antigravity_from_worker() {
   assert_rc 0 "$RC" "forge-usage --json"
   local tot
   tot="$(printf '%s' "$OUT" | jq -r '[.[] | select(.provider=="antigravity") | .total] | add // 0')"
-  # total_tokens (120) EXCLUDES cache_read_tokens (80), so forge adds them.
+  # TOTAL is derived from the parts (100 in + 20 out + 80 cache), not taken
+  # from the envelope's own total_tokens (120). See usage-total-derived.
   assert_eq "200" "$tot" "antigravity total tokens read back with cache"
+}
+
+t_usage_total_is_derived_not_trusted() {
+  # TOTAL must be the disjoint sum of the parts, whatever the provider's own
+  # total_tokens says. agy reports input+output (cache excluded); if a future
+  # version switched to including it, trusting that field would double-count
+  # the cache or miss it entirely. Both conventions must give the same answer,
+  # and a figure that matches neither must raise a visible warning.
+  mkdir -p "$REPO/.forge/usage"
+  cat > "$REPO/.forge/usage/t_excl.json" <<'EOF'
+{"provider":"antigravity","cwd":"CWD","model":"t-excl","usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":50,"total_tokens":110}}
+EOF
+  cat > "$REPO/.forge/usage/t_incl.json" <<'EOF'
+{"provider":"antigravity","cwd":"CWD","model":"t-incl","usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":50,"total_tokens":160}}
+EOF
+  cat > "$REPO/.forge/usage/t_bogus.json" <<'EOF'
+{"provider":"antigravity","cwd":"CWD","model":"t-bogus","usage":{"input_tokens":100,"output_tokens":10,"cache_read_tokens":50,"total_tokens":9999}}
+EOF
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"; RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-usage --json with mixed total conventions"
+  local a b
+  a="$(printf '%s' "$OUT" | jq -r '[.[]|select(.model=="t-excl")|.total][0] // "none"')"
+  b="$(printf '%s' "$OUT" | jq -r '[.[]|select(.model=="t-incl")|.total][0] // "none"')"
+  assert_eq "160" "$a" "cache-exclusive total is corrected to the real volume"
+  assert_eq "160" "$b" "cache-inclusive total gives the same figure"
+  # Neither legitimate convention may be flagged.
+  local n
+  n="$(printf '%s' "$OUT" | jq -r '[.[]|select(.model=="t-excl" or .model=="t-incl")|.note]|join("")')"
+  assert_eq "" "$n" "a known convention raises no note"
+  # A figure matching neither must be flagged, in the text output too.
+  n="$(printf '%s' "$OUT" | jq -r '[.[]|select(.model=="t-bogus")|.note][0] // ""')"
+  assert_contains "$n" "!=" "an impossible provider total is noted"
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" 2>&1)"
+  set -e
+  assert_contains "$OUT" "WARNING" "the mismatch is warned about on stdout"
+  rm -f "$REPO/.forge/usage/t_excl.json" "$REPO/.forge/usage/t_incl.json" \
+        "$REPO/.forge/usage/t_bogus.json"
 }
 
 t_usage_json_is_valid_when_empty() {
@@ -1157,6 +1198,7 @@ run_test spawn-records-provider         t_spawn_records_provider_in_state
 run_test spawn-refuses-missing-cli      t_spawn_refuses_missing_provider_cli
 run_test models-lists-providers         t_models_lists_providers_and_roles
 run_test usage-reports-antigravity      t_usage_reports_antigravity_from_worker
+run_test usage-total-derived            t_usage_total_is_derived_not_trusted
 run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty
 
 echo
