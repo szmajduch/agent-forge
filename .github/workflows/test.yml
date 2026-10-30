@@ -1,0 +1,104 @@
+name: tests
+
+# forge creates branches, worktrees and commits, so the suite is the only proof
+# the tool still works. It needs no provider CLI: every test writes a fake
+# codex/claude/agy into its own PATH, so nothing calls a model and nothing
+# costs money.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    # Both platforms on purpose. macOS ships bash 3.2 (2007), which is what the
+    # scripts are written against — ubuntu's bash 5 silently accepts syntax that
+    # would break for every macOS user, so a green ubuntu alone proves little.
+    # ubuntu in turn catches GNU/BSD tool differences the other way round.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v7
+
+      # The suite drives real tmux sessions and parses JSON with jq. git and
+      # python3 are preinstalled on both runners.
+      - name: Install dependencies (ubuntu)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y tmux jq
+
+      - name: Install dependencies (macOS)
+        if: runner.os == 'macOS'
+        run: brew install tmux jq
+
+      # Printed so a failure can be read against the exact versions, and so a
+      # bash-3.2 regression on macOS is attributable at a glance.
+      - name: Versions
+        run: |
+          bash --version | head -1
+          tmux -V
+          jq --version
+          git --version
+          python3 --version
+
+      # forge-run commits a worker's output, so git refuses to act without an
+      # identity. Each test creates its own repo, which inherits this.
+      - name: Configure git identity
+        run: |
+          git config --global user.email "ci@example.invalid"
+          git config --global user.name "forge CI"
+          git config --global init.defaultBranch main
+
+      - name: Run the suite
+        run: test/forge-test
+
+      # A test that leaves a tmux session or a worktree behind would make the
+      # next run flaky rather than fail honestly, so it is surfaced here.
+      - name: Check for leftovers
+        if: always()
+        run: |
+          leftover_sessions="$(tmux ls 2>/dev/null || true)"
+          if [ -n "$leftover_sessions" ]; then
+            echo "::warning::tmux sessions left behind:"
+            echo "$leftover_sessions"
+          else
+            echo "no tmux sessions left behind"
+          fi
+
+  lint:
+    # Advisory, not a gate: shellcheck is opinionated and forge targets bash
+    # 3.2, so some of its suggestions do not apply. A finding is worth reading,
+    # not worth blocking a merge on.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install shellcheck
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y shellcheck
+
+      - name: Lint the scripts
+        run: |
+          # forge-lib.sh is sourced, never executed, so it is checked through
+          # the -x (follow source) pass on the commands rather than alone.
+          shellcheck --severity=warning --shell=bash \
+            bin/forge-cancel bin/forge-clean bin/forge-doctor bin/forge-drop \
+            bin/forge-init bin/forge-merge bin/forge-models bin/forge-review \
+            bin/forge-run bin/forge-spawn bin/forge-status bin/forge-up \
+            bin/forge-wait bin/forge-lib.sh install.sh test/forge-test
+
+      - name: Check the dashboard compiles
+        run: python3 -m py_compile bin/forge-dashboard || true

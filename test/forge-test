@@ -885,7 +885,12 @@ EOF
   # its job, not a failure of the repo under test, so it is excluded here;
   # t_doctor_flags_missing_role_files covers the broken-exit path.
   local broken
-  broken="$(printf '%s\n' "$OUT" | grep BROKEN | grep -v "forge copy\|not on PATH" || true)"
+  # "not signed in" is excluded for the same reason: a CI runner has no
+  # ~/.codex/auth.json and never will, so doctor reporting it is the check
+  # working, not the repo being broken. Without this the suite passed only on a
+  # machine where the developer happened to be logged in.
+  broken="$(printf '%s\n' "$OUT" | grep BROKEN \
+            | grep -v "forge copy\|not on PATH\|not signed in" || true)"
   [[ -z "$broken" ]] && ok || no "doctor after init reported: $broken"
   assert_contains "$OUT" "role files are committed" "doctor confirms worker visibility"
 }

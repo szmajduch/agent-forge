@@ -1,5 +1,7 @@
 # forge — Claude Code orchestrates, Codex builds
 
+[![tests](https://github.com/szmajduch/agent-forge/actions/workflows/test.yml/badge.svg)](https://github.com/szmajduch/agent-forge/actions/workflows/test.yml)
+
 A set of scripts for one workflow: **tmux + git worktrees + Claude Code (orchestrator) + Codex CLI (workers)**,
 with a status page you can expose through Cloudflare.
 
@@ -767,6 +769,14 @@ live `forge` session. Coverage: argument handling for every command, the worker
 lifecycle (build/analysis/nochanges/failed), merge with a conflict and abort,
 `--base`, `--link`, the parallelism limit, `forge-cancel`, `forge-clean`,
 `forge-doctor`.
+
+GitHub Actions runs the same suite on every push and pull request, on **both
+ubuntu-latest and macos-latest**. macOS is not redundant: it ships bash 3.2,
+which is what these scripts are written against, so syntax that only a newer
+bash accepts would pass on ubuntu and break for every macOS user. A shellcheck
+job runs alongside as advisory only — it is opinionated and some of its
+suggestions do not apply to bash 3.2, so a finding is worth reading rather than
+blocking a merge.
 
 ## Sensitive data
 
