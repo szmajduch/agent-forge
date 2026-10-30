@@ -1562,8 +1562,12 @@ if DASH_OUT="$("$HERE/forge-dashboard-test" 2>&1)"; then
 else
   fail=$((fail+1)); failed_names+=("dashboard-endpoints")
   red "FAIL"
-  printf '%s\n' "$DASH_OUT" | grep -E '^(FAIL|ERROR|AssertionError)' >&2 || true
-  dim "    full output: $HERE/forge-dashboard-test"
+  # The whole output, not grepped lines. A grep for '^(FAIL|ERROR)' dropped the
+  # indented detail under each assertion — which is where this harness reports
+  # the last socket error, whether the server was alive and what it printed.
+  # That is the diagnosis; without it a CI failure says only "did not answer",
+  # and it cost two blind runs to learn that.
+  printf '%s\n' "$DASH_OUT" >&2
 fi
 
 echo
