@@ -75,7 +75,7 @@ else
 fi
 
 head2 "project files"
-cd "$ROOT"
+cd "$ROOT" || die "cannot enter the repository root: $ROOT"
 for f in PROJECT.md CLAUDE.md AGENTS.md FORGE.md; do
   if [[ -f "$f" ]]; then ok "$f"
   else nope "$f is missing"; note "run: forge-init"; fi

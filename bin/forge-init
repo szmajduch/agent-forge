@@ -16,7 +16,7 @@
 # is invisible in the main checkout — see the checks at the end.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 T="$FORGE_HOME/templates"
-cd "$ROOT"
+cd "$ROOT" || die "cannot enter the repository root: $ROOT"
 
 # --- FORGE.md: owned by forge, so it is the one file we refresh ---------------
 cp "$T/FORGE.md" FORGE.md && echo "wrote FORGE.md (refreshed)"
