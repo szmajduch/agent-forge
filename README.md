@@ -815,7 +815,9 @@ It covers what the dashboard is trusted with rather than how it looks: the
 token gate on every route (query parameter, header, a wrong token, and a
 **prefix** of the right one, since the comparison must be constant-time and
 whole-value), `FORGE_DASH_LOGS=0` actually withholding worker logs from the
-payload, the feedback rate limit and file trimming, field truncation and
+payload, the feedback rate limit (including that two clients behind one proxy
+do not block each other, and that forging the forwarded-for header buys no
+access) and file trimming, field truncation and
 sanitising of the agent name, a corrupt agent JSON being skipped instead of
 taking down the page, ANSI escapes being stripped from logs, and the served
 page containing no `innerHTML`, no `eval` and no remote resources — the page
@@ -824,7 +826,24 @@ check is what keeps it free of an injection surface.
 
 Each of these was verified against a deliberately broken dashboard: with the
 defence removed, the corresponding test fails. A test that cannot fail proves
-nothing, so this is part of the exercise rather than a footnote.
+nothing, so this is part of the exercise rather than a footnote. It has already
+paid for itself twice — once on a check that passed while the defence it named
+was gone (the rate-limit table's cap, which the test was asserting against a
+copy of the logic instead of the real method), and once on an assertion that
+could not fail at all.
+
+A few cases guard the harness rather than the dashboard
+(`TestHarnessItself`). They exist because the harness's own bugs cost more than
+the code's: they look like the code is broken, and they surface on a machine
+you cannot inspect. Both were real. A test server started with
+`stdout=subprocess.PIPE` that nobody drains blocks on its own `print` once the
+pipe fills — `bind()` has run, so the port accepts connections, but
+`serve_forever()` is never reached and nothing answers; and a readiness check
+that waits for an open port reports exactly that server as healthy. Together
+they failed every dashboard test on the macOS runner (Python 3.15, which
+printed more than the local 3.12) while ubuntu stayed green. Output now goes to
+a file, readiness means an HTTP reply, and a timeout reports the last socket
+error, whether the process is alive, and what it printed.
 
 GitHub Actions runs the same suite on every push and pull request, on **both
 ubuntu-latest and macos-latest**. macOS is not redundant: it ships bash 3.2,
@@ -908,10 +927,18 @@ your workers. The dashboard says so at startup, every time, because
 long after the session it was meant for. If you want a client to watch without
 being able to act, leave actions off for the exposed session.
 
-One more consequence of the same fact, which is a plain bug rather than a
-design choice: the feedback rate limit buckets on the client address, so behind
-a tunnel every visitor shares one bucket and two people posting at once block
-each other with `429`.
+The same fact used to cause a plain bug, now fixed: the feedback rate limit
+bucketed on the socket address, so behind a tunnel every visitor shared one
+bucket and two people posting at once blocked each other with `429`. It now
+buckets on `Cf-Connecting-Ip` / `X-Real-Ip` / `X-Forwarded-For` when one is
+present, falling back to the socket address.
+
+Those headers are forgeable — which is precisely why they are used **here and
+nowhere else**. Forging one splits your own bucket: it lets you post more
+often, and gains you nothing you could not already do. Trusting one for access
+control would hand out the dashboard, so `authed()` ignores them entirely. The
+bucket table is capped (4096 entries) and locked, because the keys come from
+the caller and the server is threaded.
 
 ## Scrolling and the mouse
 

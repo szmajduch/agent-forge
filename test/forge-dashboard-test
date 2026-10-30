@@ -139,27 +139,69 @@ class DashboardCase(unittest.TestCase):
         env.pop("FORGE_DASH_TOKEN", None)
         env.pop("FORGE_DASH_LOGS", None)
         env.update(cls.env_extra)
+        # Output goes to a FILE, not a PIPE. A pipe nobody drains deadlocks the
+        # server the moment it fills — and an interpreter that emits a warning
+        # this code does not on the developer's version (3.15 deprecates
+        # BaseHTTPRequestHandler's version attributes, which `server_version`
+        # touches) writes to that same pipe. A file also survives the process,
+        # so a CI failure can be explained.
+        cls.logpath = os.path.join(cls.tmp, "dashboard.log")
+        cls.logfile = open(cls.logpath, "w+")
         cls.proc = subprocess.Popen(
             [sys.executable, DASHBOARD, "--root", cls.repo,
              "--port", str(cls.port), "--host", "127.0.0.1"],
-            env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            env=env, stdout=cls.logfile, stderr=subprocess.STDOUT,
             text=True)
         cls._await_server()
 
     @classmethod
-    def _await_server(cls, timeout=15.0):
+    def _await_server(cls, timeout=30.0):
+        """Wait until the server answers, or say precisely why it did not.
+
+        A bare "did not start" is useless on a CI runner, where the process
+        cannot be inspected afterwards: it was exactly that message which made
+        a macOS failure undiagnosable. So the timeout reports the last socket
+        error, whether the process is alive, and whatever it printed.
+
+        It waits for an HTTP answer rather than an open port: a listening
+        socket only proves bind() ran, and a server still importing forge-usage
+        accepts the connection without replying.
+        """
         deadline = time.monotonic() + timeout
+        last_err = "none"
         while time.monotonic() < deadline:
             if cls.proc.poll() is not None:
                 raise AssertionError(
                     "dashboard exited with %s before serving:\n%s"
-                    % (cls.proc.returncode, cls.proc.stdout.read()))
+                    % (cls.proc.returncode, cls._drain()))
             try:
-                with socket.create_connection(("127.0.0.1", cls.port), 0.25):
+                req = urllib.request.Request(
+                    "http://127.0.0.1:%d/api/state" % cls.port)
+                with urllib.request.urlopen(req, timeout=2):
                     return
-            except OSError:
-                time.sleep(0.05)
-        raise AssertionError("dashboard did not start within %ss" % timeout)
+            except urllib.error.HTTPError:
+                return  # 401 from the token gate is a serving server
+            except Exception as e:
+                last_err = "%s: %s" % (type(e).__name__, e)
+                time.sleep(0.1)
+        alive = cls.proc.poll() is None
+        raise AssertionError(
+            "dashboard on port %d did not answer within %ss\n"
+            "  process alive: %s (returncode %r)\n"
+            "  last error:    %s\n"
+            "  its output:    %s"
+            % (cls.port, timeout, alive, cls.proc.returncode, last_err,
+               cls._drain() or "(nothing)"))
+
+    @classmethod
+    def _drain(cls):
+        """Whatever the server printed. Reads the log file, so it neither
+        blocks on a live process nor needs the process to have exited."""
+        try:
+            with open(cls.logpath, errors="replace") as f:
+                return f.read().strip()
+        except Exception as e:
+            return "(could not read output: %s)" % e
 
     # --- request helpers -----------------------------------------------------
 
@@ -597,6 +639,278 @@ class TestActionsAuthed(DashboardCase):
         code, _ = self.post("/api/action?t=s3cret-token",
                             {"action": "merge", "agent": "alpha"})
         self.assertEqual(409, code)
+
+
+class TestHarnessItself(DashboardCase):
+    """Guards two mistakes this harness actually made.
+
+    Both were invisible locally and failed only on a CI runner whose
+    interpreter printed more than the developer's did, so they are asserted
+    rather than left to a comment.
+    """
+
+    def test_server_output_goes_to_a_file_not_a_pipe(self):
+        # A pipe nobody drains blocks the server on its own print: bind() has
+        # run, so the port accepts connections, but serve_forever() is never
+        # reached and nothing answers. Measured — that is exactly how the macOS
+        # job failed.
+        with open(__file__, encoding="utf-8") as f:
+            src = f.read()
+        start = src.index("cls.proc = subprocess.Popen(")
+        popen = src[start:start + 400]
+        self.assertIn("stdout=cls.logfile", popen)
+        self.assertNotIn("stdout=subprocess.PIPE", popen)
+
+    def test_readiness_is_an_http_answer_not_an_open_port(self):
+        # An open port only proves bind() ran. The readiness check must get a
+        # reply, or a blocked server reads as a healthy one.
+        with open(__file__, encoding="utf-8") as f:
+            src = f.read()
+        body = src[src.index("def _await_server"):src.index("def _drain")]
+        self.assertIn("urlopen", body)
+        self.assertNotIn("create_connection", body)
+
+    def test_the_server_under_test_is_actually_answering(self):
+        # The positive control for the two checks above.
+        code, _, _ = self.get("/api/state")
+        self.assertEqual(200, code)
+
+
+class TestRateLimitBuckets(DashboardCase):
+    """The rate limit must count per caller, not per socket address.
+
+    forge-up runs the tunnel as `cloudflared tunnel --url http://127.0.0.1:<port>`,
+    so every tunnel visitor shares one socket address. Bucketing on it made two
+    clients posting at once block each other with 429.
+    """
+
+    def test_distinct_forwarded_clients_do_not_block_each_other(self):
+        self.settle()
+        a, _ = self.post("/api/feedback", {"text": "from client a"},
+                         headers={"X-Forwarded-For": "203.0.113.10"})
+        b, _ = self.post("/api/feedback", {"text": "from client b"},
+                         headers={"X-Forwarded-For": "203.0.113.11"})
+        self.assertEqual(200, a)
+        self.assertEqual(200, b, "a second client was blocked by the first")
+        texts = [f["text"] for f in self.feedback_lines()]
+        self.assertIn("from client a", texts)
+        self.assertIn("from client b", texts)
+
+    def test_same_forwarded_client_is_still_limited(self):
+        # The limit must still exist: a loop from one client is what it is for.
+        self.settle()
+        first, _ = self.post("/api/feedback", {"text": "burst one"},
+                             headers={"X-Forwarded-For": "203.0.113.20"})
+        second, _ = self.post("/api/feedback", {"text": "burst two"},
+                              headers={"X-Forwarded-For": "203.0.113.20"})
+        self.assertEqual(200, first)
+        self.assertEqual(429, second)
+
+    def test_forwarded_chain_uses_the_original_client(self):
+        # "client, proxy1, proxy2" — the first entry is the client, so two
+        # requests through different proxy paths from one client still collide.
+        self.settle()
+        first, _ = self.post("/api/feedback", {"text": "chain one"},
+                             headers={"X-Forwarded-For":
+                                      "203.0.113.30, 70.0.0.1"})
+        second, _ = self.post("/api/feedback", {"text": "chain two"},
+                              headers={"X-Forwarded-For":
+                                       "203.0.113.30, 70.0.0.2"})
+        self.assertEqual(200, first)
+        self.assertEqual(429, second)
+
+    def test_cf_connecting_ip_is_preferred(self):
+        # Cloudflare's own header is the trustworthier of the two when present.
+        self.settle()
+        first, _ = self.post("/api/feedback", {"text": "cf one"},
+                             headers={"Cf-Connecting-Ip": "203.0.113.40"})
+        second, _ = self.post("/api/feedback", {"text": "cf two"},
+                              headers={"Cf-Connecting-Ip": "203.0.113.40",
+                                       "X-Forwarded-For": "203.0.113.99"})
+        self.assertEqual(200, first)
+        self.assertEqual(429, second, "a different XFF escaped the CF bucket")
+
+    def test_forging_the_header_does_not_bypass_the_limit_for_others(self):
+        """Forging only splits the forger's own bucket.
+
+        That is the whole reason this header is trusted for rate limiting and
+        nowhere else, so it is worth an explicit test: a forger can post more
+        often, but cannot stop anyone else from posting or reach anything they
+        could not reach before.
+        """
+        self.settle()
+        code, _ = self.post("/api/feedback", {"text": "forged"},
+                            headers={"X-Forwarded-For": "1.2.3.4"})
+        self.assertEqual(200, code)
+        # A different caller is unaffected by the forger's traffic.
+        other, _ = self.post("/api/feedback", {"text": "honest"},
+                             headers={"X-Forwarded-For": "5.6.7.8"})
+        self.assertEqual(200, other)
+
+    def test_many_distinct_callers_leave_the_server_healthy(self):
+        """The end-to-end half of the cap: lots of distinct keys, still fine.
+
+        This cannot see the table's size from outside the process — that is
+        what TestRateLimitTable asserts directly — so it checks the property
+        the cap protects: the server stays responsive and still rate-limits.
+        """
+        self.settle()
+        for i in range(400):
+            self.post("/api/feedback", {"text": "x"},
+                      headers={"X-Forwarded-For": "10.0.%d.%d"
+                               % ((i // 256) % 256, i % 256)})
+        code, _, _ = self.get("/api/state")
+        self.assertEqual(200, code, "server unhealthy after many buckets")
+        a, _ = self.post("/api/feedback", {"text": "after"},
+                         headers={"X-Forwarded-For": "198.51.100.1"})
+        b, _ = self.post("/api/feedback", {"text": "after again"},
+                         headers={"X-Forwarded-For": "198.51.100.1"})
+        self.assertEqual(200, a)
+        self.assertEqual(429, b)
+
+    def test_no_forwarded_header_falls_back_to_the_socket(self):
+        # Direct access, no proxy: the old behaviour must still hold.
+        self.settle()
+        first, _ = self.post("/api/feedback", {"text": "direct one"})
+        second, _ = self.post("/api/feedback", {"text": "direct two"})
+        self.assertEqual(200, first)
+        self.assertEqual(429, second)
+
+    def test_forwarded_header_cannot_authorize(self):
+        # No token is set here, so this only documents that the header plays no
+        # part in access control; TestTokenAuth covers the gate itself.
+        code, _, _ = self.get("/api/state",
+                              headers={"X-Forwarded-For": "127.0.0.1"})
+        self.assertEqual(200, code)
+
+
+class TestRateLimitTable(unittest.TestCase):
+    """The bucket cap, asserted against the real take_rate_token.
+
+    The table lives inside the server process, so no HTTP test can watch it
+    grow — a sabotage that removed the cap passed the end-to-end test. This is
+    the only place in this file that imports forge-dashboard, and it calls the
+    handler's own method on a bare instance rather than reimplementing it: a
+    copy of the logic would keep passing while the real code lost its cap,
+    which is exactly the mistake this class exists to catch.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("forge_dash", DASHBOARD)
+        spec = importlib.util.spec_from_loader("forge_dash", loader)
+        cls.mod = importlib.util.module_from_spec(spec)
+        argv, bytecode = sys.argv, sys.dont_write_bytecode
+        sys.argv = ["forge-dashboard", "--root", ".", "--port", "0"]
+        sys.dont_write_bytecode = True
+        try:
+            loader.exec_module(cls.mod)
+        finally:
+            sys.argv, sys.dont_write_bytecode = argv, bytecode
+
+    def setUp(self):
+        self.mod._last_post.clear()
+        # A handler instance without a connection: BaseHTTPRequestHandler does
+        # all its socket work in __init__, so it is bypassed and only the two
+        # attributes take_rate_token reads are supplied.
+        self.h = self.mod.H.__new__(self.mod.H)
+        self.h.client_address = ("127.0.0.1", 1)
+        self.h.headers = {}
+
+    def take(self, key, at=None):
+        """Call the real method, choosing the key through the real header path."""
+        self.h.headers = {"X-Forwarded-For": key}
+        if at is None:
+            return self.h.take_rate_token()
+        # Freeze the clock so the window is controlled rather than slept out.
+        real = self.mod.time.monotonic
+        self.mod.time.monotonic = lambda: at
+        try:
+            return self.h.take_rate_token()
+        finally:
+            self.mod.time.monotonic = real
+
+    # Filling the table is bounded work only if the cap is. This is the limit
+    # the tests below are willing to drive, and a cap above it is itself a
+    # failure — a table of millions of caller-supplied keys is the leak the cap
+    # is meant to prevent.
+    CAP_CEILING = 100_000
+
+    def test_a_cap_exists_and_is_sane(self):
+        self.assertTrue(hasattr(self.mod, "RATE_BUCKETS_MAX"),
+                        "the bucket table has no cap")
+        cap = self.mod.RATE_BUCKETS_MAX
+        self.assertGreater(cap, 0, "a cap of %r disables bucketing" % cap)
+        self.assertLessEqual(
+            cap, self.CAP_CEILING,
+            "RATE_BUCKETS_MAX is %d: too large to be a bound on a table of "
+            "caller-supplied keys" % cap)
+
+    def test_the_key_comes_from_the_forwarded_header(self):
+        # Positive control for the harness above: if this fails, the rest of
+        # the class is driving something other than the real key path.
+        self.h.headers = {"X-Forwarded-For": "203.0.113.5"}
+        self.assertEqual("203.0.113.5", self.h.rate_limit_key())
+        self.h.headers = {}
+        self.assertEqual("127.0.0.1", self.h.rate_limit_key())
+
+    def test_table_never_exceeds_the_cap(self):
+        # Keys are caller-supplied, so an unbounded table is a slow leak in a
+        # process meant to run for days. Every stamp is the same instant, so
+        # nothing is expired and eviction is what has to hold the line.
+        m = self.mod
+        cap = m.RATE_BUCKETS_MAX
+        # An absurd cap is test_a_cap_exists_and_is_sane's job to fail; this
+        # one must not try to fill it and hang instead of reporting.
+        self.assertLessEqual(cap, self.CAP_CEILING)
+        for i in range(cap + 300):
+            self.take("caller-%d" % i, at=10_000.0)
+            self.assertLessEqual(
+                len(m._last_post), cap,
+                "table grew to %d, past the cap of %d, at key %d"
+                % (len(m._last_post), cap, i))
+
+    def test_expired_buckets_are_reclaimed_before_live_ones(self):
+        # A caller past the window is free to evict; one inside it is not. So
+        # expiry is preferred, which keeps the limit meaningful for whoever is
+        # actually posting.
+        m = self.mod
+        cap = m.RATE_BUCKETS_MAX
+        self.assertLessEqual(cap, self.CAP_CEILING)
+        for i in range(cap):
+            m._last_post["old-%d" % i] = 0.0
+        self.assertTrue(self.take("fresh", at=10_000.0))
+        self.assertIn("fresh", m._last_post)
+        self.assertLessEqual(len(m._last_post), cap)
+        # And the newcomer is still limited straight afterwards.
+        self.assertFalse(self.take("fresh", at=10_000.01))
+
+    def test_the_window_is_enforced_and_then_released(self):
+        self.assertTrue(self.take("someone", at=1_000.0))
+        self.assertFalse(self.take("someone", at=1_000.5))
+        self.assertTrue(
+            self.take("someone", at=1_000.0 + self.mod.FEEDBACK_MIN_INTERVAL + 0.1))
+
+
+class TestRateLimitWithToken(DashboardCase):
+    """A forged forwarded-for must not help past the token gate."""
+
+    env_extra = {"FORGE_DASH_TOKEN": "s3cret-token"}
+
+    def test_spoofed_localhost_still_needs_the_token(self):
+        for h in ({"X-Forwarded-For": "127.0.0.1"},
+                  {"Cf-Connecting-Ip": "127.0.0.1"},
+                  {"X-Real-Ip": "127.0.0.1"}):
+            code, _, _ = self.get("/api/state", headers=h)
+            self.assertEqual(401, code, "header %r affected access" % h)
+
+    def test_spoofed_header_does_not_reach_actions(self):
+        code, _ = self.post("/api/action",
+                            {"action": "cancel", "agent": "alpha"},
+                            headers={"X-Forwarded-For": "127.0.0.1"})
+        self.assertEqual(401, code)
 
 
 class TestPageMarkup(unittest.TestCase):

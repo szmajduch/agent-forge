@@ -31,6 +31,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -90,7 +91,16 @@ FEEDBACK_MAX_BYTES = 1_000_000
 FEEDBACK_KEEP = 500          # entries retained when the file is trimmed
 FEEDBACK_MIN_INTERVAL = 2.0  # seconds between posts from one address
 
+# Keyed by caller (see rate_limit_key), not by socket address: behind a tunnel
+# every visitor shares one socket address, so bucketing on it would make two
+# people posting at once block each other.
+#
+# Bounded and locked: the server is threaded, so two POSTs can read-modify-write
+# this at the same time, and a dict that only ever grows is a slow leak in a
+# process meant to run for days.
 _last_post = {}
+_last_post_lock = threading.Lock()
+RATE_BUCKETS_MAX = 4096
 
 
 def git(*a):
@@ -240,6 +250,14 @@ class H(BaseHTTPRequestHandler):
         pass
 
     def authed(self):
+        """The only access check. It rests on the token and nothing else.
+
+        Deliberately ignores where the request appears to come from: behind a
+        tunnel every visitor arrives as 127.0.0.1, and the forwarded-for headers
+        that do carry the real address are caller-settable. Neither can gate
+        anything. rate_limit_key() uses those headers because a forged value
+        there harms only the forger.
+        """
         if not TOKEN:
             return True
         q = parse_qs(urlparse(self.path).query).get("t", [""])[0]
@@ -266,6 +284,53 @@ class H(BaseHTTPRequestHandler):
         if path == "/api/state":
             return self.send(200, json.dumps(state()))
         self.send(404, "not found", "text/plain")
+
+    def rate_limit_key(self):
+        """Who to count this POST against.
+
+        The socket address is the wrong answer behind a tunnel: forge-up runs
+        `cloudflared tunnel --url http://127.0.0.1:<port>`, so cloudflared is a
+        reverse proxy on this host and every visitor arrives as 127.0.0.1. One
+        shared bucket means two clients posting at once block each other, and
+        one client in a loop blocks everyone.
+
+        So a forwarded-for header is preferred when present. These headers are
+        attacker-settable — anyone who can reach the port can write any value —
+        which is exactly why they are used HERE and nowhere else: forging one
+        only splits your own bucket, costing you nothing and gaining you
+        nothing, whereas trusting one for access control would hand out the
+        dashboard. Never use this for authorization; see authed().
+        """
+        for h in ("Cf-Connecting-Ip", "X-Real-Ip", "X-Forwarded-For"):
+            v = self.headers.get(h, "")
+            if v:
+                # X-Forwarded-For is a chain, "client, proxy1, proxy2"; the
+                # original client is the first entry.
+                first = v.split(",")[0].strip()
+                # Cap it: the value is caller-controlled and becomes a dict key.
+                if first:
+                    return first[:64]
+        return self.client_address[0]
+
+    def take_rate_token(self):
+        """True if this caller may post now, recording the attempt if so."""
+        who = self.rate_limit_key()
+        now = time.monotonic()
+        with _last_post_lock:
+            if now - _last_post.get(who, 0.0) < FEEDBACK_MIN_INTERVAL:
+                return False
+            # Bounded: the keys are caller-supplied, so without this a stream of
+            # distinct X-Forwarded-For values would grow the dict forever. Drop
+            # entries that are already past the window, and if that frees
+            # nothing (every bucket is live), drop the oldest.
+            if len(_last_post) >= RATE_BUCKETS_MAX:
+                cutoff = now - FEEDBACK_MIN_INTERVAL
+                for k in [k for k, t in _last_post.items() if t < cutoff]:
+                    del _last_post[k]
+                while len(_last_post) >= RATE_BUCKETS_MAX:
+                    del _last_post[min(_last_post, key=_last_post.get)]
+            _last_post[who] = now
+            return True
 
     def run_action(self, body):
         """POST /api/action — run one forge command for one agent.
@@ -330,13 +395,10 @@ class H(BaseHTTPRequestHandler):
             return self.run_action(self.rfile.read(n))
         if path != "/api/feedback":
             return self.send(404, '{"error":"not found"}')
-        # One note every couple of seconds per address is plenty for a human and
+        # One note every couple of seconds per caller is plenty for a human and
         # stops a loop from filling the disk.
-        who = self.client_address[0]
-        now = time.monotonic()
-        if now - _last_post.get(who, 0.0) < FEEDBACK_MIN_INTERVAL:
+        if not self.take_rate_token():
             return self.send(429, '{"error":"too many requests"}')
-        _last_post[who] = now
         try:
             n = min(int(self.headers.get("Content-Length", 0)), 20_000)
             d = json.loads(self.rfile.read(n))
