@@ -12,7 +12,10 @@ name="$1"; valid_name "$name"
 
 wt="$(agent_get "$name" worktree)"
 log="$STATE/logs/$name.log"
-cd "$wt"
+# set -e would abort here anyway, but silently: the worker's window would close
+# with no reason given. A missing worktree means someone removed it under a
+# running agent, which is worth saying out loud.
+cd "$wt" || die "worktree is gone: $wt (was the agent cleaned up while running?)"
 
 kind="$(agent_get "$name" kind)"; kind="${kind:-build}"
 report_dir="${FORGE_REPORT_DIR:-reports}"

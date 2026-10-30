@@ -92,9 +92,15 @@ jobs:
 
       - name: Lint the scripts
         run: |
-          # forge-lib.sh is sourced, never executed, so it is checked through
-          # the -x (follow source) pass on the commands rather than alone.
+          # Two checks are disabled because they are false positives here, not
+          # because they are inconvenient:
+          #   SC2034 — forge-lib.sh is sourced, so the variables it defines
+          #            (WT_ROOT, mdesc, …) are used by the commands, not by it.
+          #   SC2206 — the ${arr[@]+"${arr[@]}"} form is deliberate: it is how
+          #            bash 3.2 (macOS) expands a possibly-empty array under
+          #            set -u. shellcheck's mapfile suggestion needs bash 4.
           shellcheck --severity=warning --shell=bash \
+            --exclude=SC2034,SC2206 \
             bin/forge-cancel bin/forge-clean bin/forge-doctor bin/forge-drop \
             bin/forge-init bin/forge-merge bin/forge-models bin/forge-review \
             bin/forge-run bin/forge-spawn bin/forge-status bin/forge-up \
