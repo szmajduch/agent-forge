@@ -7,6 +7,20 @@ Binds to localhost; expose it with Cloudflare Tunnel (see forge-up).
 If FORGE_DASH_TOKEN is set, every request needs ?t=<token> (the page keeps it
 in the URL) or header X-Forge-Token. ALWAYS set it before exposing via tunnel.
 Set FORGE_DASH_LOGS=0 to hide raw worker logs from viewers (recommended for clients).
+
+FORGE_DASH_ACTIONS=1 adds buttons that run forge-cancel / forge-merge /
+forge-retry. Off by default, because the page is built to be shared and those
+change the repository.
+
+The gate is the operator's opt-in, NOT the client's address. Measured
+2026-10-30: `cloudflared tunnel --url http://127.0.0.1:<port>` is a reverse
+proxy on the same host, so a tunnel visitor arrives with
+client_address == "127.0.0.1", indistinguishable from the operator at their own
+terminal. X-Forwarded-For does arrive but anyone who can reach the port can set
+it, so it is usable for rate-limit buckets and never for authorization. A
+"localhost only" check would therefore be a hole in exactly the case it exists
+for; with FORGE_DASH_ACTIONS=1 and a tunnel, anyone holding the URL (and the
+token, if set) can act — forge-up warns about that at startup.
 """
 import argparse
 import glob
@@ -54,6 +68,23 @@ ROOT = os.path.abspath(args.root)
 STATE = os.path.join(ROOT, ".forge")
 TOKEN = os.environ.get("FORGE_DASH_TOKEN", "")
 SHOW_LOGS = os.environ.get("FORGE_DASH_LOGS", "1") != "0"
+ACTIONS = os.environ.get("FORGE_DASH_ACTIONS", "0") == "1"
+BIN = os.path.dirname(os.path.abspath(__file__))
+
+# Each action maps to the command that already implements it, with the status
+# values that command accepts. The dashboard decides nothing about safety: it
+# shells out, and forge-cancel/-merge/-retry refuse what they always refuse, so
+# there is one rule per operation instead of two that can drift apart.
+#
+# forge-drop is deliberately absent. It discards a worktree and branch
+# irreversibly, which is not something to put behind a button on a page built
+# to be shared.
+ACTION_CMDS = {
+    "cancel": ("forge-cancel", ("queued", "running")),
+    "merge":  ("forge-merge", ("done", "cancelled", "nochanges")),
+    "retry":  ("forge-retry", ("failed", "nochanges", "cancelled")),
+}
+ACTION_TIMEOUT = 120  # forge-merge can take a while on a large tree
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 FEEDBACK_MAX_BYTES = 1_000_000
 FEEDBACK_KEEP = 500          # entries retained when the file is trimmed
@@ -197,6 +228,7 @@ def build_state():
         "usage": usage_summary(),
         "feedback": feedback,
         "logs": SHOW_LOGS,
+        "actions": ACTIONS,
         "now": time.strftime("%Y-%m-%d %H:%M:%S"),
     }
 
@@ -235,10 +267,68 @@ class H(BaseHTTPRequestHandler):
             return self.send(200, json.dumps(state()))
         self.send(404, "not found", "text/plain")
 
+    def run_action(self, body):
+        """POST /api/action — run one forge command for one agent.
+
+        Everything that decides whether an action is allowed lives in the
+        command being run; this validates only the shape of the request, so the
+        page cannot talk the dashboard into something the CLI would refuse.
+        """
+        if not ACTIONS:
+            return self.send(403, '{"error":"actions are disabled '
+                                  '(start the dashboard with FORGE_DASH_ACTIONS=1)"}')
+        try:
+            d = json.loads(body)
+        except Exception:
+            return self.send(400, '{"error":"bad request"}')
+        action = str(d.get("action", ""))
+        name = str(d.get("agent", ""))
+        if action not in ACTION_CMDS:
+            return self.send(400, json.dumps(
+                {"error": "unknown action", "allowed": sorted(ACTION_CMDS)}))
+        # The name becomes an argv entry, so it is matched against the same
+        # shape forge's own valid_name accepts rather than merely escaped.
+        if not re.fullmatch(r"[a-z0-9][a-z0-9-]{0,39}", name):
+            return self.send(400, '{"error":"invalid agent name"}')
+
+        cmd, allowed = ACTION_CMDS[action]
+        agents = {a.get("name"): a for a in state()["agents"]}
+        if name not in agents:
+            return self.send(404, '{"error":"no such agent"}')
+        status = agents[name].get("status", "")
+        if status not in allowed:
+            return self.send(409, json.dumps(
+                {"error": "%s is '%s'; %s applies to %s"
+                          % (name, status, action, "/".join(allowed))}))
+
+        argv = [os.path.join(BIN, cmd), name]
+        try:
+            # cwd=ROOT because every forge command locates the repo from the
+            # working directory. No shell: argv is passed through as a list.
+            p = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True,
+                               timeout=ACTION_TIMEOUT)
+            out = ((p.stdout or "") + (p.stderr or "")).strip()[-4000:]
+            rc = p.returncode
+        except subprocess.TimeoutExpired:
+            out, rc = "timed out after %ss" % ACTION_TIMEOUT, 124
+        except Exception as e:
+            out, rc = "%s: %s" % (type(e).__name__, e), 1
+        # The cached snapshot predates the action, so the next poll must rebuild
+        # it or the page would show the old status and look broken.
+        _CACHE["value"] = None
+        return self.send(200 if rc == 0 else 500,
+                         json.dumps({"ok": rc == 0, "action": action,
+                                     "agent": name, "exit_code": rc,
+                                     "output": out}))
+
     def do_POST(self):
         if not self.authed():
             return self.send(401, '{"error":"unauthorized"}')
-        if urlparse(self.path).path != "/api/feedback":
+        path = urlparse(self.path).path
+        if path == "/api/action":
+            n = min(int(self.headers.get("Content-Length", 0)), 20_000)
+            return self.run_action(self.rfile.read(n))
+        if path != "/api/feedback":
             return self.send(404, '{"error":"not found"}')
         # One note every couple of seconds per address is plenty for a human and
         # stops a loop from filling the disk.
@@ -323,6 +413,13 @@ padding:8px 14px;cursor:pointer}button:disabled{opacity:.5}
 .bar i{display:block;height:100%;background:var(--ink)}
 .bar.hi i{background:var(--bad)}.bar.mid i{background:var(--warn)}
 .uh{font:11px var(--mono);color:var(--mute);text-transform:uppercase;letter-spacing:.06em;margin:10px 0 4px}
+.acts{display:flex;flex-wrap:wrap;gap:6px;align-items:center;margin-top:10px;
+border-top:1px solid var(--line);padding-top:10px}
+.acts button{font:600 11.5px var(--mono);padding:5px 10px;background:transparent;
+color:var(--ink);border:1px solid var(--line);border-radius:5px}
+.acts button:hover:not(:disabled){background:var(--code)}
+.acts .msg{font:11px var(--mono);color:var(--mute);overflow-wrap:anywhere}
+.acts .msg.bad{color:var(--bad)}.acts .msg.good{color:var(--ok)}
 </style></head><body>
 <header><div><h1>forge <span id="repo"></span></h1><div class="meta" id="meta"></div></div>
 <div class="counts" id="counts"></div></header>
@@ -377,6 +474,42 @@ function renderUsage(u){
   }
 }
 try{document.getElementById('author').value=localStorage.getItem('forge-author')||''}catch(e){}
+// Which action applies to which status — the same table the server holds. The
+// server is still the authority: it re-checks and answers 409 if this is stale.
+const ACTS={cancel:['queued','running'],merge:['done','cancelled','nochanges'],
+            retry:['failed','nochanges','cancelled']};
+let ACTIONS_ON=false;
+function actions(a){
+  const avail=Object.keys(ACTS).filter(k=>ACTS[k].includes(a.status));
+  if(!avail.length)return null;
+  const box=el('div','acts'),msg=el('span','msg');
+  for(const act of avail){
+    const b=el('button',null,act);
+    b.onclick=async()=>{
+      // merge rewrites the main branch and retry spends tokens, so neither
+      // fires on a single stray click.
+      if(!confirm(act+' '+a.name+'?'))return;
+      const all=box.querySelectorAll('button');
+      all.forEach(x=>x.disabled=true);
+      msg.className='msg';msg.textContent=act+'…';
+      try{
+        const r=await fetch(q('/api/action'),{method:'POST',
+          headers:{'Content-Type':'application/json'},
+          body:JSON.stringify({action:act,agent:a.name})});
+        const j=await r.json().catch(()=>({}));
+        msg.className='msg '+(r.ok?'good':'bad');
+        // The command's own stdout/stderr, so a refusal explains itself here
+        // instead of sending the operator to the terminal.
+        msg.textContent=j.output||j.error||(r.ok?'done':'failed');
+      }catch(e){msg.className='msg bad';msg.textContent=String(e)}
+      all.forEach(x=>x.disabled=false);
+      load();
+    };
+    box.append(b);
+  }
+  box.append(msg);
+  return box;
+}
 function card(a){
   const c=el('div','card '+a.status);c.style.setProperty('--c','var('+(C[a.status]||'--idle')+')');
   const top=el('div','top');top.append(el('span','name',a.name));
@@ -388,9 +521,11 @@ function card(a){
   if(a.log){const d=el('details');d.open=open.has(a.name);d.ontoggle=()=>d.open?open.add(a.name):open.delete(a.name);
     const pre=el('pre',null,a.log);d.append(el('summary',null,'log'),pre);c.append(d);
     if(d.open)requestAnimationFrame(()=>pre.scrollTop=pre.scrollHeight)}
+  if(ACTIONS_ON){const ab=actions(a);if(ab)c.append(ab)}
   return c}
 async function load(){
   try{const r=await fetch(q('/api/state'),{cache:'no-store'});if(!r.ok)throw r.status;const s=await r.json();
+  ACTIONS_ON=!!s.actions;
   renderUsage(s.usage);
   document.getElementById('repo').textContent='/ '+s.repo;
   document.getElementById('meta').textContent=s.branch+' · updated '+s.now;
@@ -419,4 +554,17 @@ load();setInterval(load,3000);
 if __name__ == "__main__":
     srv = ThreadingHTTPServer((args.host, args.port), H)
     print(f"forge dashboard: http://{args.host}:{args.port}" + (" (token required)" if TOKEN else ""))
+    if ACTIONS:
+        print("actions ENABLED: cancel / merge / retry run from the page")
+        # The action gate is the opt-in, not the address, so a tunnel makes
+        # these reachable by whoever holds the URL. Said at startup, every
+        # time, because FORGE_DASH_ACTIONS is the kind of variable that stays
+        # exported in a shell long after the session it was meant for.
+        if os.environ.get("FORGE_TUNNEL") == "1":
+            print("  WARNING: a tunnel is configured. Anyone with the URL"
+                  + (" and token" if TOKEN else " (and there is NO token)")
+                  + " can cancel and merge your workers.")
+        elif not TOKEN:
+            print("  note: no FORGE_DASH_TOKEN — anyone who can reach this"
+                  " port can act")
     srv.serve_forever()

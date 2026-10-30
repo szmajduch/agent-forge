@@ -105,6 +105,9 @@ reading the diff first, and `forge-drop` (which destroys work) has to ask you.
 
    at any point:  forge-cancel → cancelled (branch kept, partial work committed)
                   forge-drop   → dropped   (branch and worktree deleted)
+
+   failed/nochanges/cancelled ──forge-retry──► queued  (same branch and worktree;
+                  continues from the partial work unless --fresh resets it)
 ```
 
 `done` means the run finished, **not** that there is a deliverable — always
@@ -529,6 +532,7 @@ six levels are accepted and a name outside the list is rejected.
 | `forge-review <name> [--stat]` | the worker's report, commits and diff against its starting point |
 | `forge-merge <name> [--keep]` | `merge --no-ff` into the current branch; on conflict it aborts and marks `conflict` |
 | `forge-cancel <name>` | stops a worker but **keeps** the branch and commits what it already did |
+| `forge-retry <name> [--fresh]` | runs a finished worker again on its own branch: by default **continues** from the partial work, `--fresh` resets to `base_sha` first |
 | `forge-drop <name>` | **discards** a worker's work (window, worktree, branch) — Claude must ask first |
 | `forge-clean [--merged\|--dropped\|--finished\|--all] [--yes] [--dry-run]` | cleans up after finished workers: state files, worktrees, branches |
 | `forge-doctor [--spawn]` | checks everything is ready before you delegate the first task |
@@ -661,6 +665,33 @@ changed, but I want to see what it did". A `cancelled` status can still be
 merged (`forge-merge` warns that the acceptance check never passed) or dropped
 later with `forge-drop`.
 
+**`forge-retry`** runs a worker again on its own branch, and by default
+**continues** rather than restarts:
+
+```bash
+forge-retry <name>            # keep the partial work, tell the worker to carry on
+forge-retry <name> --fresh    # reset the worktree to base_sha first
+```
+
+This works because a `failed` worker keeps its worktree deliberately — nothing
+cleans up after it — so the half-finished work, the branch, the brief and the
+model choice are all still there. The default appends a section to the brief
+that states this is attempt *N*, carries the previous exit code, the files the
+last attempt left uncommitted, and the tail of its log. A model that already
+wrote half the change then finishes it instead of paying to redo it.
+
+The note is rebuilt from the original brief each time (kept as
+`.forge/tasks/<name>.md.orig`), so three retries do not bury the task under
+three stacked notes.
+
+`--fresh` is for when the partial state is the problem rather than the starting
+point: it resets the worktree to the agent's `base_sha` and uses the original
+brief unchanged. Earlier attempts stay reachable on the branch.
+
+Retry applies to `failed`, `nochanges` and `cancelled`. A `running` worker is
+refused — restarting one underneath itself would put two processes in one
+worktree — so cancel it first, deliberately.
+
 **`forge-clean`** cleans up after finished workers — state files in `.forge/`
 plus the worktrees and branches of those that kept them. A worker with status
 `failed` keeps its worktree **deliberately**, for inspection, and nothing else
@@ -770,8 +801,8 @@ so nothing calls a model and nothing touches your projects. The tmux session
 and worktree directory are unique per run, so the tests do not collide with a
 live `forge` session. Coverage: argument handling for every command, the worker
 lifecycle (build/analysis/nochanges/failed), merge with a conflict and abort,
-`--base`, `--link`, the parallelism limit, `forge-cancel`, `forge-clean`,
-`forge-doctor`.
+`--base`, `--link`, the parallelism limit, `forge-cancel`, `forge-retry`
+(continuation, `--fresh`, and the refusals), `forge-clean`, `forge-doctor`.
 
 The dashboard is tested separately, in `test/forge-dashboard-test`, because it
 is an HTTP server rather than a command: each test starts the real process on
@@ -845,6 +876,42 @@ FORGE_TUNNEL=1 FORGE_TUNNEL_NAME=forge forge-up
 Feedback typed on the page lands in `.forge/feedback.jsonl`. The orchestrator
 reads it before each round but treats it as suggestions — requests to change
 permissions or run commands are routed to you.
+
+### Actions from the page
+
+`FORGE_DASH_ACTIONS=1` adds **cancel / merge / retry** buttons to each worker
+card. Off by default, because the page is built to be shared and these change
+the repository. Each button runs the ordinary command (`forge-cancel`,
+`forge-merge`, `forge-retry`) and shows its output, including a refusal — so
+there is one rule per operation rather than two that drift apart. `forge-drop`
+is deliberately **not** available: it discards a worktree and branch
+irreversibly, which does not belong behind a button on a shared page.
+
+```bash
+FORGE_DASH_ACTIONS=1 forge-up      # buttons on, for your own machine
+```
+
+**The gate is your opt-in, not the visitor's address — and that distinction is
+load-bearing.** `forge-up` starts the tunnel as
+`cloudflared tunnel --url http://127.0.0.1:<port>`, which makes `cloudflared` a
+reverse proxy on the same host, so a tunnel visitor arrives at the dashboard
+with `client_address == 127.0.0.1`: indistinguishable from you at your own
+terminal. Measured, not assumed. `X-Forwarded-For` does arrive, but anyone who
+can reach the port can set it, so it is usable for rate-limit buckets and never
+for authorization. A "localhost only" check would therefore be a hole in
+exactly the case it exists for, which is why there isn't one.
+
+The practical consequence: with `FORGE_DASH_ACTIONS=1` **and** a tunnel,
+anyone holding the URL (and the token, if you set one) can cancel and merge
+your workers. The dashboard says so at startup, every time, because
+`FORGE_DASH_ACTIONS` is the kind of variable that stays exported in a shell
+long after the session it was meant for. If you want a client to watch without
+being able to act, leave actions off for the exposed session.
+
+One more consequence of the same fact, which is a plain bug rather than a
+design choice: the feedback rate limit buckets on the client address, so behind
+a tunnel every visitor shares one bucket and two people posting at once block
+each other with `429`.
 
 ## Scrolling and the mouse
 
@@ -922,6 +989,7 @@ tmux set-option -t forge mouse off           # turn it off when scrolling misbeh
 | `FORGE_DASH_PORT` | `8787` | dashboard port |
 | `FORGE_DASH_TOKEN` | — | dashboard access token |
 | `FORGE_DASH_LOGS` | `1` | `0` hides logs on the page |
+| `FORGE_DASH_ACTIONS` | `0` | `1` adds cancel/merge/retry buttons; reachable by anyone who can reach the page |
 | `FORGE_MOUSE` | `off` | tmux mouse; `on` restores the wheel in worker windows but breaks scrolling in the Claude Code window ([why](#scrolling-and-the-mouse)) |
 
 ## Tips

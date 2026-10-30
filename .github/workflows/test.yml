@@ -103,7 +103,7 @@ jobs:
             --exclude=SC2034,SC2206 \
             bin/forge-cancel bin/forge-clean bin/forge-doctor bin/forge-drop \
             bin/forge-init bin/forge-merge bin/forge-models bin/forge-review \
-            bin/forge-run bin/forge-spawn bin/forge-status bin/forge-up \
+            bin/forge-retry bin/forge-run bin/forge-spawn bin/forge-status bin/forge-up \
             bin/forge-wait bin/forge-lib.sh install.sh test/forge-test
 
       # py_compile only proves these parse. The dashboard's behaviour is

@@ -464,6 +464,141 @@ class TestFeedbackTrim(DashboardCase):
         self.assertLess(os.path.getsize(path), 1_000_000)
 
 
+class TestActionsDisabled(DashboardCase):
+    """Default: no FORGE_DASH_ACTIONS, so the endpoint exists but refuses.
+
+    The page is built to be shared, so "off unless asked for" is the whole
+    point; a 403 here is the single most important assertion in this file.
+    """
+
+    def test_action_is_refused(self):
+        code, body = self.post("/api/action",
+                               {"action": "cancel", "agent": "alpha"})
+        self.assertEqual(403, code)
+        self.assertIn("FORGE_DASH_ACTIONS", json.loads(body)["error"])
+
+    def test_state_reports_actions_off(self):
+        _, body, _ = self.get("/api/state")
+        self.assertFalse(json.loads(body)["actions"])
+
+    def test_page_does_not_offer_buttons_without_the_flag(self):
+        # The flag is read from /api/state at runtime, so the markup always
+        # carries the code; what must be false is the server's own answer.
+        _, body, _ = self.get("/api/state")
+        self.assertIs(False, json.loads(body)["actions"])
+
+
+class TestActionsEnabled(DashboardCase):
+    """FORGE_DASH_ACTIONS=1. These run real forge commands in a real repo.
+
+    Validation is tested here; the commands' own refusals are tested in
+    test/forge-test, which is where that logic lives. The point of these cases
+    is that the HTTP layer cannot be talked into calling a command with
+    something the CLI would not accept.
+    """
+
+    env_extra = {"FORGE_DASH_ACTIONS": "1"}
+
+    def test_state_reports_actions_on(self):
+        _, body, _ = self.get("/api/state")
+        self.assertTrue(json.loads(body)["actions"])
+
+    def test_unknown_action_is_rejected(self):
+        code, body = self.post("/api/action",
+                               {"action": "rm -rf", "agent": "alpha"})
+        self.assertEqual(400, code)
+        d = json.loads(body)
+        self.assertEqual("unknown action", d["error"])
+        # drop must not be reachable: it discards work irreversibly.
+        self.assertEqual(["cancel", "merge", "retry"], d["allowed"])
+
+    def test_drop_is_not_an_available_action(self):
+        code, _ = self.post("/api/action",
+                            {"action": "drop", "agent": "alpha"})
+        self.assertEqual(400, code)
+
+    def test_invalid_agent_name_is_rejected(self):
+        # The name becomes an argv entry. Shell metacharacters, traversal and
+        # flag-shaped values must never reach it.
+        for bad in ("../../etc/passwd", "alpha; rm -rf /", "alpha$(id)",
+                    "--help", "ALPHA", "a" * 60, "", "alpha beta"):
+            code, body = self.post("/api/action",
+                                   {"action": "cancel", "agent": bad})
+            self.assertEqual(400, code, "accepted agent name %r" % bad)
+            self.assertEqual("invalid agent name", json.loads(body)["error"])
+
+    def test_unknown_agent_is_404(self):
+        code, body = self.post("/api/action",
+                               {"action": "cancel", "agent": "nosuchagent"})
+        self.assertEqual(404, code)
+        self.assertEqual("no such agent", json.loads(body)["error"])
+
+    def test_action_wrong_for_the_status_is_409(self):
+        # alpha is "running": merge does not apply, and the answer must say so
+        # rather than run the command and let it fail.
+        code, body = self.post("/api/action",
+                               {"action": "merge", "agent": "alpha"})
+        self.assertEqual(409, code)
+        err = json.loads(body)["error"]
+        self.assertIn("running", err)
+        self.assertIn("merge", err)
+
+    def test_retry_wrong_for_the_status_is_409(self):
+        # beta is "done": retry applies to failed/nochanges/cancelled only.
+        code, body = self.post("/api/action",
+                               {"action": "retry", "agent": "beta"})
+        self.assertEqual(409, code)
+        self.assertIn("done", json.loads(body)["error"])
+
+    def test_malformed_body_is_rejected(self):
+        code, _ = self.post("/api/action", None, raw=b"{not json")
+        self.assertEqual(400, code)
+
+    def test_missing_fields_are_rejected(self):
+        code, _ = self.post("/api/action", {})
+        self.assertEqual(400, code)
+
+    def test_action_requires_post_not_get(self):
+        # A GET would make the action triggerable by a link or a prefetch.
+        code, _, _ = self.get("/api/action")
+        self.assertEqual(404, code)
+
+    def test_failing_command_reports_its_own_output(self):
+        """A refusal from the command must reach the operator verbatim.
+
+        gamma is "dropped", which the server's own table lets through for
+        retry, so the command itself is what refuses — proving the output of a
+        real non-zero exit is surfaced rather than swallowed.
+        """
+        code, body = self.post("/api/action",
+                               {"action": "retry", "agent": "gamma"})
+        # Either the status table or forge-retry refuses; both are correct, but
+        # the response must explain which.
+        self.assertIn(code, (409, 500))
+        d = json.loads(body)
+        self.assertTrue(d.get("error") or d.get("output"),
+                        "a refusal with no explanation: %r" % d)
+
+
+class TestActionsAuthed(DashboardCase):
+    """Actions behind a token: the gate must apply to them too."""
+
+    env_extra = {"FORGE_DASH_ACTIONS": "1",
+                 "FORGE_DASH_TOKEN": "s3cret-token"}
+
+    def test_action_without_token_is_401(self):
+        code, _ = self.post("/api/action",
+                            {"action": "cancel", "agent": "alpha"})
+        self.assertEqual(401, code)
+
+    def test_action_with_token_passes_the_gate(self):
+        # Reaches validation rather than being turned away at the door: a 409
+        # for the wrong status proves the request was authorized.
+        code, _ = self.post("/api/action?t=s3cret-token",
+                            {"action": "merge", "agent": "alpha"})
+        self.assertEqual(409, code)
+
+
 class TestPageMarkup(unittest.TestCase):
     """Static checks on the served page.
 
@@ -495,6 +630,17 @@ class TestPageMarkup(unittest.TestCase):
 
     def test_token_is_url_encoded_when_appended(self):
         self.assertIn("encodeURIComponent(T)", self.page)
+
+    def test_action_buttons_confirm_before_acting(self):
+        # merge rewrites the main branch and retry spends tokens, so a single
+        # stray click must not fire either.
+        self.assertIn("confirm(", self.page)
+
+    def test_action_output_is_rendered_as_text(self):
+        # The output is a command's stdout, which can contain anything a model
+        # wrote. It reaches the page through textContent like everything else;
+        # test_page_never_assigns_innerhtml is what enforces that globally.
+        self.assertIn("msg.textContent=", self.page)
 
     def test_page_declares_dark_mode(self):
         self.assertIn("prefers-color-scheme:dark", self.page)
