@@ -88,9 +88,27 @@ CLI that is not installed — those models cannot be spawned at all.
   plan. `agy-sonnet`/`agy-opus` are the same models as `sonnet`/`opus` — reach
   for them to spare the Claude quota, not to get a different answer. Their
   reasoning effort is fixed in the model name, so `--effort` does nothing there.
-- An `antigravity` worker may only run the commands the operator allowed in
-  `FORGE_AGY_COMMANDS`. If one fails with "auto-denied", the fix is the
-  operator's to make — report it, do not retry the spawn unchanged.
+- An `antigravity` worker starts with **no shell commands at all**; it can only
+  read and write files. `codex` and `claude` get a sandboxed worktree instead
+  and need none of this. Pass `--commands "<binaries>"` naming the minimum the
+  task's acceptance check needs — `--commands "pytest"` for a Python test, plus
+  `git` only if the brief asks the worker to inspect history. Omitting it grants
+  everything the operator allowed, which is usually more than the task needs.
+  Every program in a compound command needs its own rule, because agy wraps a
+  check as `cd <worktree> && <cmd>; echo "EXIT_STATUS: $?"`.
+- Narrowing has a floor. An `agy` worker orients itself before acting, so a
+  subset must keep `cd echo ls cat` alongside the check's own programs —
+  measured: `--commands "cd echo pytest"` was denied in the worker's FIRST turn,
+  before it read anything, while the same task with the whole bound passed. If
+  you are not sure the floor is covered, omit `--commands` and take the bound.
+- `commands.conf` is the operator's upper bound and you cannot exceed it: asking
+  for a command outside it fails the spawn. If a task genuinely needs one that
+  is missing, say so and let the operator decide — do not work around it, and do
+  not retry the spawn with the command dropped if that makes the acceptance
+  check unverifiable. Say instead that it cannot be verified and why.
+- If an `antigravity` worker fails with "auto-denied", it was not permitted to
+  act. Respawn with the missing command added to `--commands` when the bound
+  already allows it; otherwise report it to the operator.
 - A model whose role is `orchestrator` cannot be a worker; `forge-spawn`
   refuses it. Use a `worker` or `both` model.
 - Providers are not interchangeable in cost or quota. Say in the plan which

@@ -209,12 +209,18 @@ for prov in $used_providers; do
       done <<< "$(models_workers)"
       # A build worker whose acceptance check cannot run looks like a worker
       # that chose not to run it: agy auto-denies and still reports SUCCESS.
-      if [[ -z "${FORGE_AGY_COMMANDS:-}" ]]; then
-        caution "FORGE_AGY_COMMANDS is unset — antigravity workers cannot run any command"
-        note "a build worker needs its acceptance check: FORGE_AGY_COMMANDS=\"pytest python3 git\""
-        note "matched on the first word only — command(python3) does NOT cover 'python3 -m pytest'"
+      agy_bound="$(commands_bound)"
+      if [[ -z "${agy_bound// }" ]]; then
+        if [[ -n "${FORGE_AGY_COMMANDS:-}" ]]; then
+          caution "FORGE_AGY_COMMANDS is set but empty — antigravity workers cannot run any command"
+        else
+          caution "no commands allowed in $COMMANDS_FILE — antigravity workers cannot run any command"
+          note "a build worker needs its acceptance check to run; add e.g. 'pytest python3 git'"
+        fi
       else
-        ok "antigravity: commands allowed — ${FORGE_AGY_COMMANDS}"
+        ok "antigravity: commands allowed —${agy_bound}"
+        note "every program in a compound command needs a rule: agy runs 'cd <dir> && <cmd>; echo ...'"
+        note "forge-spawn --commands narrows this per worker; it can never widen it"
       fi
       ;;
     claude)

@@ -66,6 +66,7 @@ agent_set() {
 
 # --- models (see models.conf) -------------------------------------------------
 MODELS_FILE="${FORGE_MODELS_FILE:-$FORGE_HOME/models.conf}"
+COMMANDS_FILE="${FORGE_COMMANDS_FILE:-$FORGE_HOME/commands.conf}"
 
 # Prints "<name>\t<provider>\t<role>\t<description>" for each configured model.
 # A line missing the provider/role columns is read as an old two-column file
@@ -155,19 +156,86 @@ provider_slug() { # provider_slug <provider> <model-name> -> slug for the CLI
 # Rule syntax is action(target). Measured against agy 1.4.11:
 #   - the target must be a glob: write_file(.) does not match, write_file(*) does
 #   - the shell action is named `command`, not `run_shell_command`
-#   - command(X) matches on the command's FIRST WORD and does not glob:
-#     command(pytest) allows `pytest test_x.py`, but command(python3) does NOT
-#     allow `python3 -m pytest`, and command(python3*) matches nothing.
-# So FORGE_AGY_COMMANDS must name every binary a worker may invoke, and the
-# task brief should ask for the plain form (`pytest x.py`, not `python3 -m
-# pytest x.py`). command(*) allows anything and is the operator's call.
+#   - command(X) names a program, not a pattern: command(pytest) allows
+#     `pytest test_x.py`, and command(pytest*) matches nothing.
+#   - EVERY program in a compound command needs its own rule. agy does not run
+#     a bare `pytest test_t.py`; it builds
+#         cd <worktree> && pytest test_t.py; echo "EXIT_STATUS: $?"
+#     which needs cd, pytest AND echo. With only command(pytest) the whole
+#     command is denied, and denied_actions says just "command" — never which
+#     part was missing. cd and echo are therefore in commands.conf by default;
+#     dropping them breaks almost every acceptance check.
+# So the allowlist must name every program a worker may invoke, not just the
+# one the task is about.
+#
+# The outer bound comes from commands.conf (or FORGE_AGY_COMMANDS, which
+# replaces it). A worker may be given a narrower subset — see commands_narrow.
+
+# The operator's upper bound, as a whitespace-separated list.
+commands_bound() {
+  if [[ -n "${FORGE_AGY_COMMANDS:-}" ]]; then
+    echo "${FORGE_AGY_COMMANDS}"
+    return
+  fi
+  # Strip comments (whole-line and trailing) and fold to one line.
+  awk '{ sub(/#.*/, ""); print }' "$COMMANDS_FILE" 2>/dev/null | tr -s '[:space:]' ' '
+}
+
+# commands_narrow <requested...> -> the requested commands, refusing any that
+# the bound does not permit. Called with no arguments it returns the whole
+# bound, so a worker spawned without --commands is unchanged by this feature.
+#
+# The orchestrator reads task briefs, so it can be talked into asking for more
+# than a task needs. It may therefore only ever pick a SUBSET: a request for
+# something outside the bound fails the spawn and names it, making the decision
+# to widen the operator's, taken once in commands.conf.
+commands_narrow() {
+  local bound; bound="$(commands_bound)"
+  if [[ $# -eq 0 ]]; then echo "$bound"; return; fi
+  # A bound of `*` is a literal rule for agy, not a shell glob, so pathname
+  # expansion is off while splitting it — otherwise `*` would become the names
+  # of the files in the current directory and grant those instead.
+  set -f
+  local unbounded=0 b
+  for b in $bound; do [[ "$b" == "*" ]] && unbounded=1; done
+  local out="" req ok
+  for req in "$@"; do
+    ok=$unbounded
+    for b in $bound; do [[ "$req" == "$b" ]] && ok=1; done
+    [[ $ok -eq 1 ]] || die "command '$req' is not allowed by $COMMANDS_FILE (allowed:$bound).
+Ask the operator to add it there — widening the bound is their decision, not a worker's."
+    out="$out $req"
+  done
+  set +f
+  echo "$out"
+}
+
+# Explains a denial in terms of whichever limit actually caused it: a worker
+# given a subset is usually fixed by widening that spawn's --commands, while a
+# worker holding the whole bound needs commands.conf changed.
+agy_denial_hint() {
+  if [[ $# -gt 0 ]]; then
+    echo " $* (a subset of $COMMANDS_FILE, chosen by --commands).
+    Respawn with the command added to --commands, or add it to $COMMANDS_FILE if it is not there either."
+  else
+    echo " $(commands_bound)(everything in $COMMANDS_FILE).
+    Add the command to $COMMANDS_FILE."
+  fi
+}
+
+# agy_permissions [command...] — the --settings JSON for one agy run.
+# With no arguments every command in the bound is granted.
 agy_permissions() {
-  local cmds="${FORGE_AGY_COMMANDS:-}" rules
+  local cmds rules
+  cmds="$(commands_narrow "$@")"
   rules='"write_file(*)","replace(*)","read_file(*)","list_directory(*)","glob(*)","search_file_content(*)"'
   # Narrow by design: a build worker needs its acceptance check to run, and
   # naming the binaries keeps that from becoming "any command at all".
   # command(python3) was measured to allow python3 and refuse curl.
+  # Same reason as in commands_narrow: `*` is a rule, not a glob.
+  set -f
   local c
   for c in $cmds; do rules="$rules,\"command($c)\""; done
+  set +f
   printf '{"permissions":{"allow":[%s]}}' "$rules"
 }

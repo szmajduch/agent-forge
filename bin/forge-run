@@ -87,7 +87,9 @@ case "$provider" in
     # it would have to prompt for (see agy_permissions in forge-lib.sh) — and
     # reports SUCCESS anyway, which is why the denial check runs below.
     read -r -a ARGS <<< "${FORGE_AGY_ARGS:---output-format json}"
-    ARGS+=(--settings "$(agy_permissions)")
+    # The subset forge-spawn --commands recorded, or empty for the whole bound.
+    read -r -a WCMDS <<< "$(agent_get "$name" commands)"
+    ARGS+=(--settings "$(agy_permissions ${WCMDS[@]+"${WCMDS[@]}"})")
     slug="$(provider_slug antigravity "$model")"
     [[ -n "$slug" ]] || die "model '$model' has no 'slug' line in $MODELS_FILE (see forge-models)"
     ARGS+=(--model "$slug")
@@ -145,9 +147,9 @@ PYEOF
     rc=1
     echo "=== agy auto-denied required tool(s): $denied ===" | tee -a "$log"
     echo "    The run reported SUCCESS but was not permitted to act." | tee -a "$log"
-    echo "    For a command, add its FIRST WORD to FORGE_AGY_COMMANDS" | tee -a "$log"
-    echo "    (e.g. FORGE_AGY_COMMANDS=\"pytest python3 git\"; 'python3 -m pytest' needs 'python3'" | tee -a "$log"
-    echo "     to be matched as the first word, so prefer the plain 'pytest x.py' form)." | tee -a "$log"
+    echo "    This worker was allowed:$(agy_denial_hint "${WCMDS[@]+${WCMDS[@]}}")" | tee -a "$log"
+    echo "    agy wraps a check as 'cd <dir> && <cmd>; echo ...', so EVERY" | tee -a "$log"
+    echo "    program in it needs a rule — cd and echo included." | tee -a "$log"
   fi
 fi
 

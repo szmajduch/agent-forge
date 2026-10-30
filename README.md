@@ -1,207 +1,217 @@
-# forge — Claude Code orkiestruje, Codex buduje
+# forge — Claude Code orchestrates, Codex builds
 
-Zestaw skryptów do workflow: **tmux + git worktree + Claude Code (orkiestrator) + Codex CLI (workerzy)**,
-ze stroną statusu wystawianą przez Cloudflare.
+A set of scripts for one workflow: **tmux + git worktrees + Claude Code (orchestrator) + Codex CLI (workers)**,
+with a status page you can expose through Cloudflare.
 
 ```
 tmux session "forge"
-├── orchestrator   Claude Code w katalogu repo — planuje, zleca, robi review, merguje
-├── dashboard      strona statusu na 127.0.0.1:8787 (+ feedback od klienta)
-├── <worker-1..N>  Codex `exec` — każdy na własnym branchu agent/<name> i worktree
-│                  (build = zmienia kod, analysis = czyta i pisze raport)
-└── tunnel         cloudflared → publiczny URL do dashboardu (FORGE_TUNNEL=1)
+├── orchestrator   Claude Code in the repo directory — plans, delegates, reviews, merges
+├── dashboard      status page on 127.0.0.1:8787 (+ client feedback)
+├── <worker-1..N>  Codex `exec` — each on its own agent/<name> branch and worktree
+│                  (build = changes code, analysis = reads and writes a report)
+└── tunnel         cloudflared → public URL for the dashboard (FORGE_TUNNEL=1)
 ```
 
 ![dashboard](docs/dashboard.png)
 
-## Instalacja (macOS) — raz, nie w projekcie
+## Install (macOS) — once, not per project
 
-Folder `forge` to narzędzie wspólne dla wszystkich projektów. Trzymaj go w jednym stałym
-miejscu (np. `~/tools/forge`), **nie kopiuj go do repo**. Do projektów trafiają tylko pliki
-z `forge-init` (sekcja niżej).
+The `forge` folder is a tool shared by all your projects. Keep it in one fixed
+place (e.g. `~/tools/forge`) and **do not copy it into a repo**. Only the files
+produced by `forge-init` belong in a project (see below).
 
-Komendy `forge-*` uruchamiaj **w repozytorium projektu**, nie w katalogu narzędzia —
-inaczej forge potraktowałby sam siebie jako projekt. Jest na to blokada z komunikatem.
+Run the `forge-*` commands **inside your project repository**, not inside the
+tool directory — otherwise forge would treat itself as the project. There is a
+guard for that, with a message.
 
 ```bash
-# zależności
+# dependencies
 brew install tmux jq git python
 npm i -g @anthropic-ai/claude-code @openai/codex
-claude          # zaloguj się raz
-codex login     # zaloguj się raz
-brew install cloudflared          # opcjonalnie, do wystawienia dashboardu
+claude          # sign in once
+codex login     # sign in once
+brew install cloudflared          # optional, to expose the dashboard
 
 # forge
 mkdir -p ~/tools && unzip forge.zip -d ~/tools   # → ~/tools/forge
-~/tools/forge/install.sh   # instaluje komendy forge-* do ~/.local/bin i sprawdza zależności
+~/tools/forge/install.sh   # installs the forge-* commands into ~/.local/bin and checks dependencies
 ```
 
-Jeśli później przeniesiesz folder `forge`, uruchom `install.sh` ponownie.
+If you move the `forge` folder later, run `install.sh` again.
 
-`install.sh` nie zmienia zmiennych środowiskowych ani plików konfiguracyjnych powłoki. Jeśli
-`~/.local/bin` nie ma w `PATH` (na macOS domyślnie nie ma), wypisze linię do dodania ręcznie:
+`install.sh` does not change environment variables or shell configuration
+files. If `~/.local/bin` is not on your `PATH` (on macOS it is not by default),
+it prints the line to add yourself:
 
 ```bash
 echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc && source ~/.zshrc
 ```
 
-Opcjonalnie [lemux](https://github.com/Photon48/lemux) — forkowanie rozmów z orkiestratorem
-w osobne okna tmux. Działa obok forge bez konfiguracji.
+Optionally [lemux](https://github.com/Photon48/lemux) — forks orchestrator
+conversations into separate tmux windows. It works alongside forge with no
+configuration.
 
-## Start w projekcie
+## Getting started in a project
 
-Wszystkie komendy `forge-*` to skrypty z katalogu `bin/` tego zestawu (nie zewnętrzne narzędzia).
-`./install.sh` tworzy dla nich krótkie launchery w `~/.local/bin`, więc działają z dowolnego katalogu.
+Every `forge-*` command is a script from this kit's `bin/` directory, not an
+external tool. `./install.sh` creates short launchers for them in
+`~/.local/bin`, so they work from any directory.
 
 ```bash
-cd ~/code/moj-projekt
+cd ~/code/my-project
 forge-init                       # PROJECT.md, CLAUDE.md, AGENTS.md, FORGE.md, .claude/settings.json
-git add -A && git commit -m "forge setup"   # ważne: workerzy startują z commita, muszą widzieć AGENTS.md
-forge-doctor                     # sprawdza, czy wszystko jest gotowe (zależności, pliki ról, modele)
-forge-up                         # otwiera sesję tmux z Claude Code w oknie 0
+git add -A && git commit -m "forge setup"   # important: workers start from a commit and must see AGENTS.md
+forge-doctor                     # checks everything is ready (dependencies, role files, models)
+forge-up                         # opens the tmux session with Claude Code in window 0
 ```
 
-W Claude Code po prostu opisz cel, np.:
+In Claude Code, just describe the goal, e.g.:
 
-> Dodaj endpoint /api/orders/export (CSV), testy i przycisk w UI. Rozdziel na workerów.
+> Add a /api/orders/export endpoint (CSV), tests and a button in the UI. Split it across workers.
 
-Claude rozpisze plan, po Twoim „ok” odpali workerów, poczeka, przejrzy diffy i zmerguje.
-Między oknami tmux skaczesz `Ctrl-b w` (lista) lub `Ctrl-b <numer>`.
+Claude will write a plan, start workers once you say "ok", wait, review the
+diffs and merge. Move between tmux windows with `Ctrl-b w` (list) or
+`Ctrl-b <number>`.
 
-**Mysz w sesji jest wyłączona** i tak ma być — przy `mouse on` kółko nie
-przewija okna z Claude Code, tylko wrzuca je w tryb kopiowania tmuxa.
-Szczegóły i jak to włączyć z powrotem: sekcja [Przewijanie i mysz](#przewijanie-i-mysz).
+**The mouse is off in the session** and that is deliberate — with `mouse on`
+the wheel stops scrolling the Claude Code window and drops it into tmux's
+copy-mode instead. Details and how to turn it back on: see
+[Scrolling and the mouse](#scrolling-and-the-mouse).
 
-## Dwa typy zadań: build i analysis
+## Two kinds of task: build and analysis
 
-Worker Codex nie musi zmieniać kodu — może też **analizować**. To ten sam
-agent, inny kontrakt na wynik:
+A Codex worker does not have to change code — it can also **analyse**. Same
+agent, different contract for the result:
 
-| Typ | `--kind` | Wynik | Gotowe, gdy |
+| Kind | `--kind` | Result | Done when |
 |---|---|---|---|
-| **build** | `build` (domyślny) | zmieniony kod | check akceptacyjny przechodzi |
-| **analysis** | `analysis` | raport | raport odpowiada na pytanie z dowodami |
+| **build** | `build` (default) | changed code | the acceptance check passes |
+| **analysis** | `analysis` | a report | the report answers the question with evidence |
 
 ```bash
-forge-spawn --kind analysis audyt-cusip "Sprawdź pokrycie CUSIP→CIK w .work/..."
+forge-spawn --kind analysis cusip-audit "Check CUSIP→CIK coverage in .work/..."
 ```
 
-Typ `analysis` używaj, gdy zadanie polega na **ustaleniu**, nie na zmianie:
-audyt danych, weryfikacja wyniku innego workera, zbadanie buga przed naprawą,
-przegląd implementacji. Nie wciskaj takiego zadania w brief typu build — nie ma
-tam testu do przejścia, a worker, któremu kazano zmieniać kod, zmieni kod,
-który miał tylko przeczytać.
+Use `analysis` when the task is to **establish** something rather than change
+it: auditing data, verifying another worker's result, investigating a bug
+before fixing it, reviewing an implementation. Do not force such a task into a
+build brief — there is no test to pass there, and a worker told to change code
+will change the code it was only supposed to read.
 
-**Raport jest wynikiem, nie notatką.** Worker pisze go do `reports/<name>.md`
-i harness **commituje go razem z pracą** — nie jest kasowany ani ucinany.
-W `.forge/agents/<name>.json` (a więc w `forge-status`, `forge-review`
-i na dashboardzie) ląduje tylko podgląd pierwszych 4 KB z odnośnikiem do
-pełnej treści. Starsze `FORGE_REPORT.md` w katalogu głównym nadal działa —
-harness przenosi go do `reports/<name>.md`.
+**The report is the deliverable, not a note.** The worker writes it to
+`reports/<name>.md` and the harness **commits it together with the work** — it
+is never deleted or truncated. Only a preview of the first 4 KB, with a pointer
+to the full text, lands in `.forge/agents/<name>.json` (and therefore in
+`forge-status`, `forge-review` and the dashboard). The older `FORGE_REPORT.md`
+in the root still works — the harness moves it to `reports/<name>.md`.
 
-Dla zadań analitycznych `AGENTS.md` wymaga wprost: źródło przy każdym
-twierdzeniu (ścieżka, wiersz, hash), rozdzielenie obserwacji od wnioskowania
-oraz tego, że **„nierozstrzygnięte" jest poprawną odpowiedzią** — lepszą od
-zgadywania.
+For analysis tasks `AGENTS.md` requires explicitly: a source for every claim
+(path, line, hash), observation kept separate from inference, and that
+**"unresolved" is a correct answer** — better than a guess.
 
-### Niezależna weryfikacja
+### Independent verification
 
-Żeby worker sprawdził pracę innego **niezależnie**, daj mu bazę sprzed tej
-pracy, a nie jego branch — inaczej odziedziczy jego uzasadnienie:
+To have a worker check another's work **independently**, give it a base from
+before that work rather than the other's branch — otherwise it inherits the
+reasoning it is meant to check:
 
 ```bash
-forge-spawn --kind analysis weryfikacja --base main "Sprawdź raport z agent/audyt..."
+forge-spawn --kind analysis verify --base main "Check the report from agent/audit..."
 ```
 
-`--base <ref>` działa jak `FORGE_BASE`, ale per worker. Flagi można podawać
-przed nazwą albo po niej.
+`--base <ref>` works like `FORGE_BASE` but per worker. Flags may be given
+before or after the name.
 
-### Dostęp do danych poza repo (`--link`)
+### Data outside the repo (`--link`)
 
-Worktree zawiera **tylko pliki śledzone przez gita**, więc wszystko z
-`.gitignore` (virtualenv, duże dane) w nim nie istnieje. Dowiąż to jawnie:
+A worktree contains **only files tracked by git**, so anything in
+`.gitignore` (a virtualenv, large data) does not exist inside it. Link it
+explicitly:
 
 ```bash
-forge-spawn --kind analysis audyt --link .venv --link .work "Sprawdź ..."
+forge-spawn --kind analysis audit --link .venv --link .work "Check ..."
 ```
 
-`--link` tworzy symlink z głównego repo do worktree i dopisuje ścieżkę do
-lokalnego `info/exclude` — wzorce typu `.venv/` ze slashem **nie łapią
-symlinków**, więc bez tego pokazywałyby się jako untracked i worker mógłby je
-scommitować. Można też ustawić `FORGE_LINK=".venv .work"`.
+`--link` creates a symlink from the main repo into the worktree and adds the
+path to the local `info/exclude` — patterns like `.venv/` with a trailing slash
+**do not match symlinks**, so without this they would show up as untracked and
+a worker could commit them. You can also set `FORGE_LINK=".venv .work"`.
 
-Sandbox `-s workspace-write` **pozwala czytać** dowiązane katalogi, ale
-**blokuje zapis** poza worktree — sprawdzone: `mkdir` w dowiązanym `.work`
-zwraca `Operation not permitted`. Dlatego artefakty pisz do worktree, a po
-review przenieś je do docelowego katalogu. Nie używaj `--add-dir` na katalog
-tylko do czytania: dałoby prawo zapisu tam, gdzie nie wolno modyfikować.
+The `-s workspace-write` sandbox **allows reading** linked directories but
+**blocks writing** outside the worktree — measured: `mkdir` in a linked `.work`
+returns `Operation not permitted`. So write artifacts into the worktree and
+move them to their destination after review. Do not use `--add-dir` for a
+read-only directory: that would grant write access where nothing may be
+modified.
 
-## Wybór modeli i dostawców
+## Choosing models and providers
 
-Worker może działać na trzech CLI: **codex** (OpenAI), **claude** (Anthropic)
-i **antigravity** (`agy`, Google). Jedna lista w `~/tools/forge/models.conf`
-mówi, który model należy do którego dostawcy i do jakiej roli się nadaje:
+A worker can run on three CLIs: **codex** (OpenAI), **claude** (Anthropic) and
+**antigravity** (`agy`, Google). One list in `~/tools/forge/models.conf` says
+which model belongs to which provider and which role it suits:
 
 ```
-<nazwa>        <dostawca>  <rola>        <kiedy użyć>
+<name>         <provider>  <role>        <when to use it>
 
-gpt-6.1-sol    codex       both          codzienne kodowanie i analiza
-opus           claude      both          review, sprzeczne dowody, architektura
-haiku          claude      worker        mechaniczne edycje, ekstrakcja
-agy-sonnet     antigravity worker        Sonnet na kredytach Google
+gpt-6.1-sol    codex       both          everyday coding and analysis
+opus           claude      both          reviews, conflicting evidence, architecture
+haiku          claude      worker        mechanical edits, extraction
+agy-sonnet     antigravity worker        Sonnet on Google credits
 default gpt-6.1-sol
 
 slug agy-sonnet  claude-sonnet-4-6
 ```
 
-- **dostawca**: `codex` \| `claude` \| `antigravity` — decyduje, które CLI
-  zostanie uruchomione i jak zostaną zbudowane argumenty.
-- **`slug`**: tylko dla `antigravity`. Mapuje nazwę z forge na nazwę, którą
-  przyjmuje `agy --model`. Jest potrzebny, bo ten sam model bywa dostępny
-  dwiema drogami (`agy-sonnet` vs `sonnet`), więc sama nazwa nie mówi, które
-  CLI uruchomić. Sprawdź `agy models` po aktualizacji CLI.
-- **rola**: `worker` \| `orchestrator` \| `both`. `forge-spawn` odmówi modelu
-  oznaczonego jako `orchestrator`, zamiast startować workera, który nie umie
-  pracować.
-- Opis po roli to wskazówka dla Claude'a, kiedy użyć danego modelu — pisz go konkretnie.
-- `default` — model dla zadań bez `--model`.
-- Nazwa spoza listy jest odrzucana, więc Claude nie wymyśli nieistniejącego modelu.
-- Model i dostawcę widać w `forge-status`, w logu workera i na dashboardzie.
-- Inny plik dla projektu: `FORGE_MODELS_FILE=/ścieżka/models.conf forge-up`.
-- `forge-models` pokazuje też, których CLI **nie masz zainstalowanych** — ich
-  modeli nie da się uruchomić.
+- **provider**: `codex` \| `claude` \| `antigravity` — decides which CLI is run
+  and how its arguments are built.
+- **`slug`**: for `antigravity` only. Maps the forge name to the name
+  `agy --model` accepts. It is needed because the same model is reachable two
+  ways (`agy-sonnet` vs `sonnet`), so the name alone does not say which CLI to
+  run. Re-check with `agy models` after a CLI update.
+- **role**: `worker` \| `orchestrator` \| `both`. `forge-spawn` refuses a model
+  marked `orchestrator` rather than starting a worker that cannot do the work.
+- The description after the role is the hint Claude uses to pick a model — make
+  it concrete.
+- `default` — the model for tasks spawned without `--model`.
+- A name outside the list is rejected, so Claude cannot invent a model that
+  does not exist.
+- The model and provider are visible in `forge-status`, in the worker log and
+  on the dashboard.
+- A different file for one project: `FORGE_MODELS_FILE=/path/models.conf forge-up`.
+- `forge-models` also shows which CLIs you **do not have installed** — their
+  models cannot be spawned.
 
-Stary dwukolumnowy `models.conf` (`<nazwa> <opis>`) nadal działa: taki wpis
-jest czytany jako `codex` + `worker`.
+The old two-column `models.conf` (`<name> <description>`) still works: such a
+row is read as `codex` + `worker`.
 
-### Kto jest orkiestratorem
+### Who the orchestrator is
 
-Orkiestratorem jest Claude Code — to on czyta `FORGE.md` i zleca zadania.
-Model wybierasz Ty:
+The orchestrator is Claude Code — it reads `FORGE.md` and delegates the work.
+You choose the model:
 
 ```bash
-FORGE_ORCH_MODEL=opus forge-up      # tylko model z models.conf o roli both/orchestrator
-FORGE_ORCH_CMD="claude --model opus" forge-up   # pełna kontrola nad komendą
+FORGE_ORCH_MODEL=opus forge-up      # only a models.conf model with role both/orchestrator
+FORGE_ORCH_CMD="claude --model opus" forge-up   # full control over the command
 ```
 
-`FORGE_ORCH_MODEL` jest walidowany: model spoza listy, model o roli `worker`
-albo model nie-Claude'owy zostanie odrzucony przy starcie, a nie w trakcie pracy.
+`FORGE_ORCH_MODEL` is validated: a model outside the list, one with role
+`worker`, or a non-Claude model is rejected at startup rather than mid-run.
 
-### Antigravity (`agy`) — dostawca zamiast Gemini CLI
+### Antigravity (`agy`) — the provider that replaced Gemini CLI
 
-Dostawca `gemini` został **usunięty 2026-10-30**. Google przestał obsługiwać
-Gemini CLI na kontach osobistych — logowanie przechodzi, a potem każde
-wywołanie kończy się błędem:
+The `gemini` provider was **removed on 2026-10-30**. Google stopped serving
+Gemini CLI to personal accounts — signing in still works, and then every call
+fails with:
 
 ```
 IneligibleTierError: This client is no longer supported for Gemini Code Assist
 for individuals.  →  https://antigravity.google
 ```
 
-Antigravity to ta ścieżka, na którą Google przekierował te konta, i **działa**
-na koncie osobistym (sprawdzone 2026-10-30 na `agy` 1.4.11: headless `agy -p`
-uruchamia się, edytuje pliki i raportuje tokeny). Jedno CLI daje dostęp do
-trzech rodzin modeli:
+Antigravity is the path Google redirected those accounts to, and it **works**
+on a personal account (verified 2026-10-30 against `agy` 1.4.11: headless
+`agy -p` runs, edits files and reports token usage). One CLI reaches three
+model families:
 
 ```
 $ agy models
@@ -211,453 +221,516 @@ claude-opus-4-6-thinking            Claude Opus 4.6 (Thinking)
 gpt-oss-120b-medium                 GPT-OSS 120B
 ```
 
-**Uwaga na rachunek:** `agy-sonnet` i `agy-opus` to te same modele co `sonnet`
-i `opus` u dostawcy `claude`, ale idą z kredytów Google, nie z Twojej
-subskrypcji Claude. Używaj ich, żeby oszczędzić limit Claude'a — nie po to, by
-dostać inną odpowiedź.
+**Note what this means for billing:** `agy-sonnet` and `agy-opus` are the same
+models as `sonnet` and `opus` under the `claude` provider, but they run on
+Google's credits rather than your Claude subscription. Use them to spare the
+Claude quota, not to get a different answer.
 
-#### `FORGE_AGY_COMMANDS` — bez tego worker nic nie uruchomi
+#### `commands.conf` — which shell commands an `agy` worker may run
 
-W trybie headless `agy` **automatycznie odrzuca** każde narzędzie, o które
-musiałby zapytać — i **mimo to kończy z `status: SUCCESS` i kodem 0**. Worker,
-któremu nie wolno było nic zrobić, wygląda wtedy identycznie jak worker, który
-uznał, że nie ma nic do roboty.
+In headless mode `agy` **auto-denies** every tool it would have to prompt for —
+and **still exits with `status: SUCCESS` and code 0**. A worker that was never
+allowed to act then looks exactly like a worker that decided there was nothing
+to do.
 
-forge radzi sobie z tym dwojako:
+forge handles that in two ways:
 
-1. Przekazuje jawną listę uprawnień (`write_file(*)`, `replace(*)`, `read_file(*)`
-   i pozostałe odczyty) przez `--settings`, czyli **sesyjnie** — Twój
-   `~/.gemini/antigravity-cli/settings.json` nie jest modyfikowany.
-2. Traktuje niepuste `denied_actions` jako **błąd workera** (`failed`), nie
-   `done`. Inaczej forge raportowałby sukces workera, który nic nie zrobił.
+1. It passes an explicit permission list (`write_file(*)`, `replace(*)`,
+   `read_file(*)` and the other reads) through `--settings`, which is
+   **session-only** — your `~/.gemini/antigravity-cli/settings.json` is never
+   modified.
+2. It treats a non-empty `denied_actions` as a **worker failure** (`failed`),
+   not `done`. Otherwise forge would report success for a worker that did
+   nothing.
 
-Polecenia shell to osobna sprawa i wymagają Twojej decyzji:
+**Why this concerns `agy` only.** The other two providers get a *spatial*
+boundary and need no list at all:
 
-```bash
-export FORGE_AGY_COMMANDS="pytest python3 git ls cat find grep"
+| Provider | What it gets | Permission model |
+|---|---|---|
+| `codex` | `-s workspace-write` | kernel sandbox: everything in the worktree, nothing outside it |
+| `claude` | `--permission-mode acceptEdits` | one mode, same effect |
+| `antigravity` | `--settings '{"permissions":{"allow":[…]}}'` | a **list of names** of actions and programs |
+
+`agy` has no equivalent of `workspace-write` — a list of names is its only
+mechanism. That is why this one provider needs configuration and the other two
+do not.
+
+**Two levels.** An `agy` worker always gets files; the shell it does not:
+
+- **`commands.conf`** is the **upper bound**, your decision. One command per
+  line or several separated by spaces; `#` comments are ignored.
+- **`forge-spawn --commands "pytest git"`** lets the orchestrator pick a
+  **subset** for one worker, matched to the acceptance check in its brief. A
+  spawn without `--commands` grants the whole bound.
+
+The orchestrator can **never exceed** `commands.conf`: asking for a command
+outside the bound aborts the spawn with a message, before the worktree is even
+created. That is deliberate — the orchestrator reads task briefs, so a brief
+can convince it that `curl` is needed. Widening the bound stays your decision,
+taken once in the file.
+
+A rule names a **program**, not a pattern, and there is no globbing (verified
+against `agy` 1.4.11):
+
+| Rule | `pytest test.py` | `curl ...` |
+|---|---|---|
+| `command(pytest)` | ✅ | ❌ |
+| `command(pytest*)` | ❌ | ❌ |
+| `command(*)` | ✅ | ✅ |
+
+**Every program in a compound command needs its own rule.** This is the trap
+worth knowing, because the denial message does not reveal it. `agy` does not
+run a bare `pytest test_t.py`; it builds:
+
+```
+cd /path/to/worktree && pytest test_t.py; echo "EXIT_STATUS: $?"
 ```
 
-Reguła dopasowuje się do **pierwszego słowa** polecenia i **nie** obsługuje
-glob (sprawdzone na `agy` 1.4.11):
+which needs `cd`, `pytest` **and** `echo`. Allowing only `pytest` denies the
+whole command, and `denied_actions` reports just `"command"` — never which part
+was missing. `cd` and `echo` are therefore in the default `commands.conf`;
+without them almost every acceptance check fails, however the task is worded.
 
-| Reguła | `pytest test.py` | `python3 -m pytest` | `curl ...` |
-|---|---|---|---|
-| `command(pytest)` | ✅ | ❌ | ❌ |
-| `command(python3)` | ❌ | ❌ | ❌ |
-| `command(python3*)` | ❌ | ❌ | ❌ |
-| `command(*)` | ✅ | ✅ | ✅ |
+**Narrowing has a floor.** An `agy` worker orients itself before acting, so a
+subset must keep `cd echo ls cat` alongside the check's own programs. Measured:
+`--commands "cd echo pytest"` was denied in the worker's **first** turn, before
+it read anything, while the same task with the whole bound passed and committed
+the fix. If you are not sure the floor is covered, omit `--commands`.
 
-Czyli `command(python3)` **nie** wystarczy na `python3 -m pytest`. W praktyce
-`agy` sięga też po `ls` na rozeznanie się w katalogu, zanim cokolwiek zrobi, więc
-lista musi obejmować narzędzia do czytania repo, nie tylko sam test. Bez
-`FORGE_AGY_COMMANDS` workerzy `--kind build` nie wykonają acceptance checku —
-`forge-doctor` o tym ostrzega.
+`forge-doctor` prints the current bound and warns when it is empty.
 
-`command(*)` pozwala na dowolne polecenie w worktree. To Twoja decyzja, nie
-domyślna wartość forge.
+**A warning about `*`.** `agy` has no sandbox, so `*` does **not** mean "any
+command in the worktree" — it means any command anywhere, including `curl` and
+`rm -rf` on paths outside the repo. The worktree is only the working directory
+(`tmux new-window -c`), not a boundary. With codex the boundary is enforced by
+the kernel sandbox; with `agy` it would be a convention and nothing more. By
+writing `*` you choose to rely on the model's judgement instead of an enforced
+limit.
 
-#### Reasoning effort jest w nazwie modelu
+`FORGE_AGY_COMMANDS` still works and **replaces** the whole file — an escape
+hatch for a one-off experiment, following forge's convention that the
+environment beats configuration.
 
-Dla modeli `agy` poziom rozumowania jest częścią sluga (`-high`/`-medium`/`-low`),
-a podanie dodatkowo `--effort` to twardy błąd (`--model X conflicts with
---effort=Y`). forge **pomija** `--effort` dla tych modeli i wypisuje o tym
-notkę, zamiast wywalić spawn.
+#### Reasoning effort is part of the model name
 
-**Lista modeli się zmienia.** Jest odświeżana z serwera, więc `models.conf`
-może się zdezaktualizować. Jak sprawdzić, co przyjmuje twoje CLI:
+For `agy` models the reasoning level is part of the slug
+(`-high`/`-medium`/`-low`), and passing `--effort` as well is a hard error
+(`--model X conflicts with --effort=Y`). forge **drops** `--effort` for these
+models and prints a note instead of failing the spawn.
+
+**The model list changes.** It is refreshed from the server, so `models.conf`
+can go stale. How to check what your CLI accepts:
 
 ```bash
-# co konto ma dostępne (lista z serwera, bywa nieaktualna w cache)
+# what the account has available (server list, the cache can be stale)
 python3 -c "import json,re;s=open('$HOME/.codex/.codex-global-state.json').read();\
 print(json.loads(re.search(r'"eligible_codex_model_slugs":\s*(\[[^]]*\])',s).group(1)))"
 
-# co faktycznie było używane
+# what was actually used
 grep -rho '"model":"[^"]*"' ~/.codex/sessions --include='*.jsonl' | sort | uniq -c | sort -rn
 
-# test rozstrzygający (w katalogu repo git); zła nazwa → model_not_found
-codex exec -s read-only -m <nazwa> "Reply with exactly: OK" < /dev/null
+# the decisive test (inside a git repo); a wrong name → model_not_found
+codex exec -s read-only -m <name> "Reply with exactly: OK" < /dev/null
 ```
 
-Tylko trzeci sposób jest dowodem — lista z cache i historia sesji mogą być
-niepełne albo przestarzałe. Dla claude i antigravity odpowiednikiem jest
-`forge-doctor --spawn`, które woła każde CLI raz, z tymi flagami, których
-forge faktycznie używa.
+Only the third is proof — the cached list and the session history can both be
+incomplete or out of date. For claude and antigravity the equivalent is
+`forge-doctor --spawn`, which calls each CLI once with the flags forge actually
+uses.
 
 ## Reasoning effort
 
-`--effort low|medium|high|xhigh|max|ultra` ustawia nakład rozumowania workera.
-Wyższy to więcej czasu i tokenów; **nie jest gwarancją poprawności** i nie
-zastępuje źródeł, testów ani oznaczania przypadków nierozstrzygniętych.
-Pominięty — model używa swojego domyślnego.
+`--effort low|medium|high|xhigh|max|ultra` sets how much reasoning a worker
+spends. Higher means more time and more tokens; it is **not a guarantee of
+correctness** and does not replace sources, tests or marking cases as
+unresolved. Omitted, the model uses its own default.
 
 ```bash
-forge-spawn --model gpt-6-astra --effort xhigh --kind analysis audyt "Sprawdź ..."
+forge-spawn --model gpt-6-astra --effort xhigh --kind analysis audit "Check ..."
 ```
 
-| Effort | Kiedy |
+| Effort | When |
 |---|---|
-| `low` | ekstrakcja danych, drobna edycja, jeden jednoznaczny krok |
-| `medium` | domyślny punkt startowy do zwykłego kodowania i analizy |
-| `high` | trudne błędy, projektowanie rozwiązania, wnioskowanie z kilku źródeł |
-| `xhigh` | złożone audyty, sprzeczne dowody, wiele zależności |
-| `max` | wyjątkowo trudne przypadki, gdy dodatkowy czas jest uzasadniony |
-| `ultra` | dostępny, ale bez udokumentowanej przewagi nad `max` |
+| `low` | data extraction, a small edit, one unambiguous step |
+| `medium` | the default starting point for ordinary coding and analysis |
+| `high` | hard bugs, designing a solution, reasoning across several sources |
+| `xhigh` | complex audits, conflicting evidence, many dependencies |
+| `max` | exceptionally hard cases, where the extra time is justified |
+| `ultra` | available, but with no documented advantage over `max` |
 
-Technicznie: `codex exec` **nie ma** flagi effortu — forge przekazuje go jako
-`-c model_reasoning_effort="<poziom>"`. Klucz `reasoning_effort` (bez prefiksu
-`model_`) jest po cichu ignorowany z ostrzeżeniem o nierozpoznanym ustawieniu,
-więc nie wpisuj go z pamięci. Sprawdzone 2026-10-28 na codex-cli 0.163.0:
-przyjęte są wszystkie sześć poziomów, a nazwa spoza listy jest odrzucana.
+Technically: `codex exec` has **no** effort flag — forge passes it as
+`-c model_reasoning_effort="<level>"`. The key `reasoning_effort` (without the
+`model_` prefix) is silently ignored with an unrecognised-setting warning, so
+do not write it from memory. Verified 2026-10-28 against codex-cli 0.163.0: all
+six levels are accepted and a name outside the list is rejected.
 
-## Komendy
+## Commands
 
-| Komenda | Co robi |
+| Command | What it does |
 |---|---|
-| `forge-spawn [--model <m>] [--effort <poziom>] [--kind build\|analysis] [--base <ref>] [--link <path>] <name> "<zadanie>"` | branch `agent/<name>` + worktree + Codex w nowym oknie tmux. Zadanie może iść też przez stdin. `--model` tylko z listy w `models.conf`. `--effort` = nakład rozumowania. `--kind analysis` = worker pisze raport, nie zmienia kodu. `--base` = inny punkt startu. `--link` = dowiąż gitignorowaną ścieżkę. |
-| `forge-models [--workers]` | lista modeli z dostawcą i rolą; `--workers` ukrywa modele tylko-orkiestratorskie |
-| `forge-usage [--json] [--all] [--since <dni>]` | zużycie tokenów per dostawca i model + kontekst/limit planu per sesja |
-| `forge-wait [names…] [--timeout s]` | czeka aż workerzy skończą, potem pokazuje status |
-| `forge-status [--json] [name]` | tabela workerów; z nazwą — raport i ostatnie linie logu |
-| `forge-review <name> [--stat]` | raport workera, commity, diff względem punktu startu |
-| `forge-merge <name> [--keep]` | `merge --no-ff` do bieżącego brancha; przy konflikcie robi abort i oznacza `conflict` |
-| `forge-cancel <name>` | zatrzymuje workera, ale **zachowuje** branch i commituje to, co już zrobił |
-| `forge-drop <name>` | **odrzuca** pracę workera (okno, worktree, branch) — Claude musi pytać |
-| `forge-clean [--merged\|--dropped\|--finished\|--all] [--yes] [--dry-run]` | sprząta po skończonych workerach: pliki stanu, worktree, branche |
-| `forge-doctor [--spawn]` | sprawdza, czy wszystko jest gotowe, zanim zlecisz pierwsze zadanie |
-| `forge-up [-d]` | startuje całą sesję |
-| `forge-init` | instaluje pliki ról w repo |
-| `test/forge-test [filtr]` | testy end-to-end całego zestawu (atrapa `codex`, nic nie dzwoni do modelu) |
+| `forge-spawn [--model <m>] [--effort <level>] [--kind build\|analysis] [--base <ref>] [--link <path>] [--commands "<progs>"] <name> "<task>"` | branch `agent/<name>` + worktree + a worker in a new tmux window. The task may also come on stdin. `--model` only from `models.conf`. `--effort` = reasoning effort. `--kind analysis` = the worker writes a report instead of changing code. `--base` = a different starting point. `--link` = link a gitignored path. `--commands` = the subset of shell commands for this worker (`antigravity` only; must fit inside `commands.conf`). |
+| `forge-models [--workers]` | lists models with provider and role; `--workers` hides orchestrator-only models |
+| `forge-usage [--json] [--all] [--since <days>]` | token usage per provider and model + context/plan quota per session |
+| `forge-wait [names…] [--timeout s]` | waits for workers to finish, then shows status |
+| `forge-status [--json] [name]` | table of workers; with a name — the report and the last log lines |
+| `forge-review <name> [--stat]` | the worker's report, commits and diff against its starting point |
+| `forge-merge <name> [--keep]` | `merge --no-ff` into the current branch; on conflict it aborts and marks `conflict` |
+| `forge-cancel <name>` | stops a worker but **keeps** the branch and commits what it already did |
+| `forge-drop <name>` | **discards** a worker's work (window, worktree, branch) — Claude must ask first |
+| `forge-clean [--merged\|--dropped\|--finished\|--all] [--yes] [--dry-run]` | cleans up after finished workers: state files, worktrees, branches |
+| `forge-doctor [--spawn]` | checks everything is ready before you delegate the first task |
+| `forge-up [-d]` | starts the whole session |
+| `forge-init` | installs the role files into the repo |
+| `test/forge-test [filter]` | end-to-end tests of the whole kit (fake `codex`, nothing calls a model) |
 
-Statusy workera: `queued → running → done | nochanges | failed`, potem
+Worker statuses: `queued → running → done | nochanges | failed`, then
 `merged | conflict | cancelled | dropped`.
-`nochanges` znaczy, że worker nic nie wniósł — dla typu build brak zmian w kodzie,
-dla analysis brak raportu. Worker analityczny, który napisał raport, kończy jako `done`.
-Stan leży w `.forge/` (automatycznie wykluczone z gita przez `.git/info/exclude`),
-worktree w `../.forge-wt/<repo>/<name>`.
+`nochanges` means the worker contributed nothing — for build, no code changes;
+for analysis, no report. An analysis worker that wrote a report finishes as
+`done`. State lives in `.forge/` (excluded from git automatically through
+`.git/info/exclude`), worktrees in `../.forge-wt/<repo>/<name>`.
 
-## Role — trzy pliki
+## Roles — three files
 
-`forge-init` instaluje układ, w którym **żadne narzędzie nie czyta roli drugiego**:
+`forge-init` installs a layout in which **no tool reads another's role**:
 
 ```
-PROJECT.md   zasady projektu — JEDYNE źródło prawdy
+PROJECT.md   project rules — the ONLY source of truth
    ↑ @PROJECT.md              ↑ @PROJECT.md
 CLAUDE.md                  AGENTS.md
-(orkiestrator)             (worker Codex)
-   ↑ @FORGE.md                + reguły workera
+(orchestrator)             (Codex worker)
+   ↑ @FORGE.md                + worker rules
 FORGE.md
 ```
 
-- **`PROJECT.md`** — zasady wspólne: środowisko, brama jakości, konwencje,
-  pułapki. **Tu piszesz zasady projektu.** `forge-init` tworzy go jako szkielet
-  do wypełnienia i **nigdy nie nadpisuje**, jeśli już istnieje.
-- **`CLAUDE.md`** — rola orkiestratora; importuje `@PROJECT.md` + `@FORGE.md`.
-- **`AGENTS.md`** — rola workera Codex; importuje `@PROJECT.md` i dokłada reguły
-  workera: tylko swój zakres, bez commitów (robi to harness), raport do
-  `reports/<name>.md`. Osobne reguły dla build (check akceptacyjny) i analysis
-  (dowód przy każdym twierdzeniu, „nierozstrzygnięte" dozwolone).
-- **`FORGE.md`** — pętla orkiestratora: plan → spawn → wait → review → merge →
-  raport. Zakazy: push, przepisywanie historii, merge bez przeczytania diffa,
-  `forge-drop` bez pytania. **Właścicielem jest forge** — `forge-init` odświeża
-  ten plik przy każdym uruchomieniu, więc nie dopisuj tu swoich zasad.
-- **`.claude/settings.json`** — komendy forge-* dozwolone bez pytania; `forge-drop`, `git push/reset/rebase`
-  wymagają potwierdzenia; `.env`, `secrets/`, `*.pem`, `*.key` zablokowane do czytania.
+- **`PROJECT.md`** — shared rules: environment, quality gate, conventions,
+  traps. **This is where you write project rules.** `forge-init` creates it as
+  a stub to fill in and **never overwrites** an existing one.
+- **`CLAUDE.md`** — the orchestrator role; imports `@PROJECT.md` + `@FORGE.md`.
+- **`AGENTS.md`** — the Codex worker role; imports `@PROJECT.md` and adds the
+  worker rules: own scope only, no commits (the harness does that), report to
+  `reports/<name>.md`. Separate rules for build (the acceptance check) and
+  analysis (evidence for every claim, "unresolved" allowed).
+- **`FORGE.md`** — the orchestrator loop: plan → spawn → wait → review → merge
+  → report. Prohibitions: pushing, rewriting history, merging without reading
+  the diff, `forge-drop` without asking. **forge owns this file** —
+  `forge-init` refreshes it on every run, so do not add your own rules here.
+- **`.claude/settings.json`** — forge-* commands allowed without prompting;
+  `forge-drop`, `git push/reset/rebase` need confirmation; `.env`, `secrets/`,
+  `*.pem`, `*.key` are blocked from being read.
 
-Dostosuj do projektu: w `PROJECT.md` opisz, jak uruchamiać testy
-(`./gradlew test`, `npm test`, `pytest`) i co jest checkiem akceptacyjnym.
+Adapt it to the project: in `PROJECT.md` describe how to run the tests
+(`./gradlew test`, `npm test`, `pytest`) and what the acceptance check is.
 
-`forge-init` można **uruchamiać wielokrotnie**. Nadpisuje tylko `FORGE.md`;
-pozostałe pliki tworzy, gdy ich nie ma, albo dokłada brakujący import. Jeśli
-wykryje stary układ jednoplikowy (`CLAUDE.md` jako symlink do `AGENTS.md`, albo
-`@FORGE.md` w `AGENTS.md`), **nie zmienia go sam** — wypisuje ostrzeżenie, bo
-to decyzja operatora.
+`forge-init` is **safe to run repeatedly**. It overwrites only `FORGE.md`;
+other files it creates when missing, or adds a missing import to. If it detects
+the old single-file layout (`CLAUDE.md` as a symlink to `AGENTS.md`, or
+`@FORGE.md` inside `AGENTS.md`), it **does not change it** — it prints a
+warning, because that is the operator's call.
 
-## Zanim zlecisz pierwsze zadanie
+## Before you delegate the first task
 
-Cztery awarie na pięć uruchomień w sesji 2026-10-28 wyszłyby na jednym
-próbnym spawnie. Dlatego jest `forge-doctor` — jedna komenda zamiast listy
-ręcznych sprawdzeń:
+Four failures out of five runs in the 2026-10-28 session would have surfaced
+from a single trial spawn. Hence `forge-doctor` — one command instead of a list
+of manual checks:
 
 ```bash
-forge-doctor            # zależności, pliki ról, czy są scommitowane, modele, końce linii
-forge-doctor --spawn    # dodatkowo jedno prawdziwe wywołanie codexa (kilka sekund)
+forge-doctor            # dependencies, role files, whether they are committed, models, line endings
+forge-doctor --spawn    # plus one real codex call (a few seconds)
 ```
 
-Kody wyjścia: `0` wszystko gra, `2` tylko ostrzeżenia, `1` coś jest zepsute.
-Dwa ostrzeżenia warte uwagi, bo nie widać ich inaczej niż po śmierci workera:
+Exit codes: `0` all good, `2` warnings only, `1` something is broken.
+Two warnings are worth attention, because nothing else reveals them until a
+worker dies:
 
-- **„invisible to workers"** — pliki ról nie są scommitowane. Worker startuje
-  z commita, więc niescommitowany `AGENTS.md` dla niego nie istnieje.
-- **„PROJECT.md is still the unfilled stub"** — nie ma zdefiniowanego checku
-  akceptacyjnego, więc każdy worker build wymyśli własny.
+- **"invisible to workers"** — the role files are not committed. A worker
+  starts from a commit, so an uncommitted `AGENTS.md` does not exist for it.
+- **"PROJECT.md is still the unfilled stub"** — there is no acceptance check
+  defined, so every build worker will invent its own.
 
-Co `forge-doctor` wyłapuje poza tym: brakujące zależności, launchery w
-`~/.local/bin` wskazujące na przeniesiony katalog forge, `CLAUDE.md` jako
-symlink do `AGENTS.md` (oba narzędzia dostają wtedy rolę drugiego), `@FORGE.md`
-w `AGENTS.md`, `default` w `models.conf` spoza listy modeli, oraz
-`core.autocrlf`, który psuje testy tylko u workerów.
+What `forge-doctor` catches besides that: missing dependencies, launchers in
+`~/.local/bin` pointing at a moved forge directory, `CLAUDE.md` as a symlink to
+`AGENTS.md` (both tools then get the other's role), `@FORGE.md` inside
+`AGENTS.md`, a `default` in `models.conf` that is not in the model list, and
+`core.autocrlf`, which breaks tests for workers only.
 
-- **`error: unexpected argument '--full-auto'`** — masz Codex CLI ≥ 0.163.0,
-  gdzie tej flagi już nie ma. Domyślna wartość w forge to teraz
-  `-s workspace-write`; jeśli widzisz ten błąd, masz starą wersję forge.
-- **Zmienna przed `forge-spawn` nie działa?** `tmux new-window` dziedziczy
-  środowisko **serwera tmux**, nie twojej powłoki. `forge-spawn` przekazuje
-  dziś `FORGE_*` jawnie przez `-e`, ale dla innych zmiennych użyj
-  `tmux set-environment -t forge NAZWA wartość`.
-- **Worker nie znajduje `.venv` / danych?** To nie jest w gicie, więc nie ma
-  tego w worktree. Użyj `--link` (sekcja wyżej) **przed** spawnem.
-- **`forge-models: command not found`** — launchery w `~/.local/bin` są
-  nieaktualne; uruchom ponownie `./install.sh`.
-- **Testy porównujące hashe plików padają tylko u workerów?** To końce linii.
-  Przy `core.autocrlf=true|input` git normalizuje CRLF przy commicie: twój
-  katalog główny zachowuje oryginalne bajty i testy przechodzą, a worker
-  dostaje z gita wersję znormalizowaną. `forge-init` ostrzega o tym układzie.
-  Naprawa: `-text` w `.gitattributes` dla tych ścieżek **i** ponowny zapis
-  (`git add --renormalize -- <ścieżka>/`) — sam atrybut nie przywróci bajtów
-  usuniętych z istniejących blobów. Sprawdzaj w świeżym worktree.
+- **`error: unexpected argument '--full-auto'`** — you have Codex CLI ≥ 0.163.0,
+  where that flag is gone. forge's default is now `-s workspace-write`; if you
+  see this error, your forge copy is old.
+- **A variable before `forge-spawn` has no effect?** `tmux new-window` inherits
+  the **tmux server's** environment, not your shell's. `forge-spawn` passes
+  `FORGE_*` explicitly through `-e` today, but for other variables use
+  `tmux set-environment -t forge NAME value`.
+- **A worker cannot find `.venv` / your data?** It is not in git, so it is not
+  in the worktree. Use `--link` (section above) **before** spawning.
+- **`forge-models: command not found`** — the launchers in `~/.local/bin` are
+  stale; run `./install.sh` again.
+- **Tests comparing file hashes fail for workers only?** That is line endings.
+  With `core.autocrlf=true|input` git normalises CRLF on commit: your main
+  checkout keeps the original bytes and the tests pass, while the worker gets
+  the normalised version from git. `forge-init` warns about this setup. The fix
+  is `-text` in `.gitattributes` for those paths **and** a rewrite
+  (`git add --renormalize -- <path>/`) — the attribute alone will not restore
+  bytes already dropped from existing blobs. Verify in a fresh worktree.
 
-**Status `done` nie znaczy, że jest produkt.** Worker może skończyć z commitem,
-którego jedyną treścią jest raport „nie dało się nic zmierzyć". Zawsze czytaj
-raport, nie tylko status.
+**Status `done` does not mean there is a deliverable.** A worker can finish
+with a commit whose only content is a report saying "nothing could be
+measured". Always read the report, not just the status.
 
-## Zatrzymywanie i sprzątanie
+## Stopping and cleaning up
 
-**`forge-cancel` vs `forge-drop`.** Oba zatrzymują workera, ale różnią się tym,
-co zostaje:
+**`forge-cancel` vs `forge-drop`.** Both stop a worker; they differ in what
+survives:
 
-| | worker | branch i worktree | to, co już zrobił |
+| | worker | branch and worktree | what it already did |
 |---|---|---|---|
-| `forge-cancel <name>` | zatrzymany | **zostają** | **commitowane** jako `[agent:<name>] cancelled: partial work` |
-| `forge-drop <name>` | zatrzymany | usunięte | przepada bezpowrotnie |
+| `forge-cancel <name>` | stopped | **kept** | **committed** as `[agent:<name>] cancelled: partial work` |
+| `forge-drop <name>` | stopped | deleted | gone irreversibly |
 
-`forge-cancel` jest do sytuacji „idzie w złą stronę / utknął / zadanie się
-zmieniło, ale chcę zobaczyć, co zrobił". Status `cancelled` można zmergować
-(`forge-merge` ostrzega, że check akceptacyjny nigdy nie przeszedł) albo
-odrzucić później przez `forge-drop`.
+`forge-cancel` is for "it is going the wrong way / it is stuck / the task
+changed, but I want to see what it did". A `cancelled` status can still be
+merged (`forge-merge` warns that the acceptance check never passed) or dropped
+later with `forge-drop`.
 
-**`forge-clean`** sprząta po skończonych workerach — pliki stanu w `.forge/`
-oraz worktree i branche tych, które je zachowały. Worker ze statusem `failed`
-zostawia worktree **celowo**, do wglądu, i nic innego go nie usuwa.
+**`forge-clean`** cleans up after finished workers — state files in `.forge/`
+plus the worktrees and branches of those that kept them. A worker with status
+`failed` keeps its worktree **deliberately**, for inspection, and nothing else
+removes it.
 
 ```bash
-forge-clean                       # tylko zmergowane — bezpieczne, to domyślny zakres
-forge-clean --dry-run             # pokaż, co by poszło, nie zmieniaj nic
-forge-clean --dropped             # + porzucone
-forge-clean --finished            # + done/nochanges/failed — TO JEST NIEZMERGOWANA PRACA
-forge-clean --all                 # + queued/running (najpierw je zatrzyma)
+forge-clean                       # merged only — safe, and the default scope
+forge-clean --dry-run             # show what would go, change nothing
+forge-clean --dropped             # + dropped
+forge-clean --finished            # + done/nochanges/failed — THIS IS UNMERGED WORK
+forge-clean --all                 # + queued/running (stops them first)
 ```
 
-Każdy zakres szerszy niż `--merged` może usunąć pracę, która nie istnieje nigdzie
-indziej, więc pyta o potwierdzenie — trzeba wpisać słowo `delete`. `--yes`
-pomija pytanie (do skryptów).
+Any scope wider than `--merged` can delete work that exists nowhere else, so it
+asks for confirmation — you have to type the word `delete`. `--yes` skips the
+prompt (for scripts).
 
-**Limit równoległych workerów.** `forge-spawn` odmawia startu, gdy biegnie już
-`FORGE_MAX_WORKERS` (domyślnie 4):
+**Parallel worker limit.** `forge-spawn` refuses to start when
+`FORGE_MAX_WORKERS` (default 4) are already running:
 
 ```
 forge: 4 worker(s) already active (limit 4): a b c d
 ```
 
-To limit w kodzie, nie prośba w prompcie — każdy worker to model plus jego check
-akceptacyjny, więc niekontrolowany fan-out potrafi położyć maszynę. Podnieś go
-przez `FORGE_MAX_WORKERS=6`, albo obejdź jednorazowo przez `--force`.
-`FORGE_MAX_WORKERS=0` wyłącza limit.
+This is a limit in code, not a request in a prompt — each worker is a model
+plus its acceptance check, so uncontrolled fan-out can take the machine down.
+Raise it with `FORGE_MAX_WORKERS=6`, or bypass it once with `--force`.
+`FORGE_MAX_WORKERS=0` disables the limit.
 
-## Zużycie tokenów
+## Token usage
 
 ```bash
-forge-usage                  # ten projekt: per model + kontekst/limit per sesja
-forge-usage --all            # wszystkie lokalne sesje, nie tylko tego repo
-forge-usage --since 7        # tylko ostatnie 7 dni
-forge-usage --json           # do skryptów
+forge-usage                  # this project: per model + context/quota per session
+forge-usage --all            # all local sessions, not just this repo
+forge-usage --since 7        # the last 7 days only
+forge-usage --json           # for scripts
 ```
 
-Nic nie dzwoni do API i żaden klucz nie jest potrzebny — czytane są wyłącznie
-lokalne logi sesji, które każde CLI i tak zapisuje. To samo widać na
-dashboardzie w kafelku **Tokens**.
+Nothing calls an API and no key is needed — only the local session logs each
+CLI writes anyway are read. The same data appears on the dashboard in the
+**Tokens** tile.
 
-**Jakość danych różni się per dostawca** i to nie jest decyzja forge, tylko
-to, co dostawcy w ogóle zapisują:
+**Data quality differs per provider**, and that is not forge's decision but
+what the providers record at all:
 
-| Dostawca | Skąd | Tokeny | Limit planu |
+| Provider | Source | Tokens | Plan quota |
 |---|---|---|---|
-| codex | `~/.codex/sessions/**/rollout-*.jsonl` | pełne, kumulatywnie per sesja | **tak** — `rate_limits.used_percent` |
-| claude | `~/.claude/projects/<repo>/<sesja>.jsonl` | pełne, sumowane per wiadomość | nie — tylko kontekst |
-| antigravity | `.forge/usage/<worker>.json` (zapisane przez forge) | pełne, z koperty `usage` | nie |
+| codex | `~/.codex/sessions/**/rollout-*.jsonl` | complete, cumulative per session | **yes** — `rate_limits.used_percent` |
+| claude | `~/.claude/projects/<repo>/<session>.jsonl` | complete, summed per message | no — context only |
+| antigravity | `.forge/usage/<worker>.json` (written by forge) | complete, from the `usage` envelope | no |
 
-Dlatego **tylko codex** pokazuje realny procent wypalonego planu. Dla pozostałych
-kolumna `PLAN QUOTA` to `n/a` — forge nie zgaduje i nie przelicza tego na złotówki,
-bo nie zna cen Twojego planu.
+So **only codex** shows a real percentage of the plan burned. For the others
+the `PLAN QUOTA` column is `n/a` — forge does not guess, and does not convert
+any of it into money, because it does not know your plan's prices.
 
-Kolumna `CONTEXT USED` to `kontekst_szczytowy / okno_modelu` — czyli jak blisko
-sesja była wymuszonej kompaktacji. Liczony jest **szczyt**, nie ostatnia
-wiadomość: po kompaktacji ostatnia wiadomość znów jest mała, co ukrywałoby fakt,
-że sesja się zapchała.
+The `CONTEXT USED` column is `peak_context / model_window` — how close the
+session came to a forced compaction. The **peak** is used, not the last
+message: after a compaction the last message is small again, which would hide
+the fact that the session had filled up.
 
-Antigravity nie trzyma trwałego logu tokenów jak codex — podaje je tylko w
-kopercie JSON na końcu biegu `-p`. Dlatego `forge-run` zapisuje ją do
-`.forge/usage/<worker>.json` w momencie zakończenia workera. Bez tego nie ma
-czego czytać, a nieudane sparsowanie JSON-a **nie** jest traktowane jako błąd
-workera — praca może być całkowicie dobra.
+Antigravity keeps no durable token log the way codex does — it reports usage
+only in the JSON envelope at the end of a `-p` run. That is why `forge-run`
+saves it to `.forge/usage/<worker>.json` when the worker finishes. Without
+that there would be nothing to read, and a failure to parse that JSON is **not**
+treated as a worker failure — the work itself may be perfectly good.
 
-### Skąd bierze się kolumna TOTAL
+### Where the TOTAL column comes from
 
-Dostawcy **nie są zgodni**, co wchodzi w ich własne `total_tokens`: u `agy` to
-`input + output` bez cache (zmierzone na wszystkich czterech rodzinach modeli
-na 1.4.11), u codexa cache jest w środku, claude nie podaje sumy per sesja
-wcale. Dlatego forge **nie ufa** żadnemu z tych pól — liczy sam:
+Providers **disagree** about what goes into their own `total_tokens`: for `agy`
+it is `input + output` with cache excluded (measured across all four model
+families on 1.4.11), codex includes cache, and claude reports no per-session
+total at all. So forge **does not trust** any of those fields — it computes its
+own:
 
 ```
 TOTAL = input + output + cached + cache_write
 ```
 
-Te cztery kubełki są rozłączne, więc suma to realny przepływ tokenów. Kolumna
-`REASON` (reasoning/thinking) **nie wchodzi** do sumy, bo u każdego dostawcy
-jest już częścią `output`, nie dodatkiem do niego (zmierzone na
-`gemini-3.8-flash-high`: `output=55` przy `thinking=54`).
+Those four buckets are disjoint, so the sum is the real token flow. The
+`REASON` column (reasoning/thinking) is **not** part of the total, because with
+every provider it is already a part of `output` rather than an addition to it
+(measured on `gemini-3.8-flash-high`: `output=55` with `thinking=54`).
 
-Pole `total_tokens` od dostawcy jest jednak dalej sprawdzane: jeśli nie zgadza
-się ani z sumą części, ani z sumą minus cache, `forge-usage` wypisuje
-**WARNING** z obiema liczbami. Czyli gdy `agy` w przyszłej wersji zmieni
-konwencję, dowiesz się o tym z komunikatu, a nie z cicho zawyżonego rachunku.
-Sama kolumna `TOTAL` pozostaje poprawna w obu konwencjach — nie zależy od tego
-pola.
+The provider's own `total_tokens` is still cross-checked: if it matches neither
+the sum of the parts nor the sum minus cache, `forge-usage` prints a
+**WARNING** with both numbers. So if a future `agy` changes convention, you
+learn it from a message rather than from a quietly inflated bill. The `TOTAL`
+column itself stays correct under either convention — it does not depend on
+that field.
 
-W tabeli `MODEL` widnieje nazwa z forge (`agy-sonnet`), nie slug — bo to ona
-mówi, z czyich kredytów poszedł bieg. `agy-sonnet` i `sonnet` to ten sam model
-na dwóch różnych rachunkach i zlanie ich w jedno ukryłoby właśnie tę różnicę.
+The `MODEL` column shows the forge name (`agy-sonnet`), not the slug, because
+that is what says whose credits paid for the run. `agy-sonnet` and `sonnet` are
+the same model on two different bills, and collapsing them would hide exactly
+that difference.
 
-## Testy
+## Tests
 
 ```bash
-test/forge-test             # wszystko
-test/forge-test merge       # tylko testy, których nazwa zawiera "merge"
+test/forge-test             # everything
+test/forge-test merge       # only tests whose name contains "merge"
 ```
 
-Każdy test dostaje własne repo w katalogu tymczasowym i **atrapę `codex`**, więc
-nic nie dzwoni do modelu i nic nie dotyka twoich projektów. Sesja tmux i katalog
-worktree są unikalne per uruchomienie, więc testy nie kolidują z działającą
-sesją `forge`. Pokrycie: obsługa argumentów każdej komendy, cykl życia workera
-(build/analysis/nochanges/failed), merge z konfliktem i abortem, `--base`,
-`--link`, limit równoległości, `forge-cancel`, `forge-clean`, `forge-doctor`.
+Every test gets its own repo in a temporary directory and a **fake `codex`**,
+so nothing calls a model and nothing touches your projects. The tmux session
+and worktree directory are unique per run, so the tests do not collide with a
+live `forge` session. Coverage: argument handling for every command, the worker
+lifecycle (build/analysis/nochanges/failed), merge with a conflict and abort,
+`--base`, `--link`, the parallelism limit, `forge-cancel`, `forge-clean`,
+`forge-doctor`.
 
-## Wrażliwe dane
+## Sensitive data
 
-Claude Code i Codex działają w chmurze, więc wszystko, co czytają, wychodzi z maszyny.
-Przed użyciem na repo firmowym sprawdź, czy polityka firmy na to pozwala. Ochrona w forge:
+Claude Code and Codex run in the cloud, so everything they read leaves the
+machine. Before using this on a company repo, check that company policy allows
+it. What forge protects:
 
-- **Workerzy Codex widzą tylko śledzone pliki.** Worktree zawiera to, co jest w gicie, więc
-  `.env` i inne pliki z `.gitignore` do nich nie trafiają. Pilnuj, żeby sekrety nie były commitowane.
-- **Orkiestrator ma blokady odczytu** w `.claude/settings.json` (`deny`): `.env*`, `secrets/`,
-  `*.pem`, `*.key`. Dopisz tam swoje ścieżki (np. `Read(./config/prod/**)`).
-- **`FORGE.md` każe Claude'owi pytać**, zamiast czytać lub przekazywać workerom dane klientów,
-  logi produkcyjne itp. Wtedy podajesz zanonimizowaną próbkę albo opis.
+- **Codex workers see tracked files only.** A worktree contains what is in git,
+  so `.env` and other `.gitignore`d files never reach them. Keep secrets out of
+  commits.
+- **The orchestrator has read blocks** in `.claude/settings.json` (`deny`):
+  `.env*`, `secrets/`, `*.pem`, `*.key`. Add your own paths there (e.g.
+  `Read(./config/prod/**)`).
+- **`FORGE.md` tells Claude to ask** rather than read or forward customer data,
+  production logs and the like. You then provide an anonymised sample or a
+  description.
 
-## Cloudflare — podgląd dla operatora i klienta
+## Cloudflare — a view for the operator and the client
 
-Dashboard nasłuchuje tylko na localhost. Wystawienie:
+The dashboard listens on localhost only. To expose it:
 
 ```bash
-export FORGE_DASH_TOKEN=$(openssl rand -hex 16)   # bez tokenu każdy z URL-em widzi logi
-export FORGE_DASH_LOGS=0                           # dla klienta: ukryj surowe logi workerów
+export FORGE_DASH_TOKEN=$(openssl rand -hex 16)   # without a token, anyone with the URL sees the logs
+export FORGE_DASH_LOGS=0                           # for a client: hide raw worker logs
 FORGE_TUNNEL=1 forge-up
-# w oknie "tunnel" pojawi się https://xxxx.trycloudflare.com → wysyłasz: <url>/?t=<token>
+# the "tunnel" window shows https://xxxx.trycloudflare.com → you send: <url>/?t=<token>
 ```
 
-Szybki tunel (`trycloudflare.com`) jest tymczasowy. Na stałe: nazwany tunel + Cloudflare Access
-(logowanie mailem klienta):
+The quick tunnel (`trycloudflare.com`) is temporary. For something permanent: a
+named tunnel + Cloudflare Access (the client signs in by email):
 
 ```bash
 cloudflared tunnel login
 cloudflared tunnel create forge
-cloudflared tunnel route dns forge forge.twojadomena.pl
+cloudflared tunnel route dns forge forge.yourdomain.com
 FORGE_TUNNEL=1 FORGE_TUNNEL_NAME=forge forge-up
 ```
-…i w panelu Cloudflare Zero Trust dodaj aplikację Access dla `forge.twojadomena.pl`.
+…and in the Cloudflare Zero Trust panel add an Access application for
+`forge.yourdomain.com`.
 
-Feedback wpisany na stronie trafia do `.forge/feedback.jsonl`. Orkiestrator czyta go przed każdą
-rundą, ale traktuje jako sugestie — prośby o zmianę uprawnień czy uruchomienie komend kieruje do Ciebie.
+Feedback typed on the page lands in `.forge/feedback.jsonl`. The orchestrator
+reads it before each round but treats it as suggestions — requests to change
+permissions or run commands are routed to you.
 
-## Przewijanie i mysz
+## Scrolling and the mouse
 
-`forge-up` **nie włącza** obsługi myszy w tmuxie (`mouse off`). To celowe:
-przy `mouse on` kółko przestaje przewijać okno z Claude Code i zamiast tego
-wrzuca je w tryb kopiowania tmuxa — widok skacze do bufora, klawisze idą do
-copy-mode, a tekst, który chciałeś przeczytać, jest poza zasięgiem.
+`forge-up` **does not enable** tmux mouse support (`mouse off`). That is
+deliberate: with `mouse on` the wheel stops scrolling the Claude Code window
+and drops it into tmux copy-mode instead — the view jumps to the buffer, keys go
+to copy-mode, and the text you wanted to read is out of reach.
 
-Dlaczego tak się dzieje — domyślny bind tmuxa dla kółka:
+Why that happens — tmux's default wheel binding:
 
 ```
 WheelUpPane  if -F "#{||:#{alternate_on},#{pane_in_mode},#{mouse_any_flag}}" \
-               { send-keys -M }      # przekaż zdarzenie do aplikacji
-               { copy-mode -e }      # albo wejdź w tryb kopiowania
+               { send-keys -M }      # forward the event to the application
+               { copy-mode -e }      # or enter copy-mode
 ```
 
-Kółko dociera do aplikacji tylko wtedy, gdy panel jest na ekranie alternatywnym
-albo aplikacja sama zgłosiła, że chce zdarzenia myszy. Claude Code 2.1.312 nie
-robi ani jednego, ani drugiego (sprawdzone: wszystkie trzy flagi = 0), więc tmux
-wybiera gałąź `copy-mode`. Z wyłączoną myszą zdarzenia kółka w ogóle nie trafiają
-do tmuxa i przewija je natywnie terminal — razem z zaznaczaniem tekstu myszą.
+The wheel reaches the application only when the pane is on the alternate screen
+or the application has itself declared that it wants mouse events. Claude Code
+2.1.312 does neither (verified: all three flags = 0), so tmux takes the
+`copy-mode` branch. With the mouse off, wheel events never reach tmux at all
+and the terminal scrolls natively — along with selecting text by mouse.
 
-To nie jest problem specyficzny dla forge; w repo Claude Code wisi kilka zgłoszeń
+This is not forge-specific; the Claude Code repo has several open reports
 ([#38810](https://github.com/anthropics/claude-code/issues/38810),
 [#67552](https://github.com/anthropics/claude-code/issues/67552),
-[#21386](https://github.com/anthropics/claude-code/issues/21386)) i **nie ma na to
-przełącznika** — zamknięto je jako „not planned" albo przez bota. Krążąca rada
-„dodaj `set -g mouse on`" dotyczy aplikacji, które zgłaszają przechwytywanie
-myszy; dla Claude Code działa odwrotnie. `CLAUDE_CODE_DISABLE_MOUSE=1` nic tu nie
-zmienia (sprawdzone — `mouse_any_flag` zostaje 0).
+[#21386](https://github.com/anthropics/claude-code/issues/21386)) and there is
+**no switch for it** — they were closed as "not planned" or by a bot. The
+widely repeated advice to "add `set -g mouse on`" applies to applications that
+declare mouse capture; for Claude Code it works the other way round.
+`CLAUDE_CODE_DISABLE_MOUSE=1` changes nothing here (verified —
+`mouse_any_flag` stays 0).
 
-Co tracisz: kółko w oknach workerów. Logi workerów są na dashboardzie, a panel
-nadal przewiniesz z klawiatury:
+What you lose: the wheel in worker windows. Worker logs are on the dashboard,
+and you can still scroll a pane from the keyboard:
 
-| Skrót | Co robi |
+| Shortcut | What it does |
 |---|---|
-| `Ctrl-b [` | tryb kopiowania: strzałki, `PgUp`/`PgDn`, `/` szuka, `q` wychodzi |
-| `Ctrl-b w` | lista okien (bez klikania) |
+| `Ctrl-b [` | copy-mode: arrows, `PgUp`/`PgDn`, `/` searches, `q` quits |
+| `Ctrl-b w` | window list (no clicking) |
 
-Jeśli wolisz mysz w tmuxie, włącz ją z powrotem:
-
-```bash
-FORGE_MOUSE=on forge-up                      # dla nowej sesji
-tmux set-option -t forge mouse on            # albo w już działającej
-```
-
-W już działającej sesji (ta opcja jest per sesja, więc zmiana działa od razu):
+If you prefer the mouse in tmux, turn it back on:
 
 ```bash
-tmux set-option -t forge mouse off           # wyłącz, gdy przewijanie wariuje
+FORGE_MOUSE=on forge-up                      # for a new session
+tmux set-option -t forge mouse on            # or in a running one
 ```
 
-## Konfiguracja (zmienne środowiskowe)
+In a running session (the option is per session, so the change is immediate):
 
-| Zmienna | Domyślnie | |
+```bash
+tmux set-option -t forge mouse off           # turn it off when scrolling misbehaves
+```
+
+## Configuration (environment variables)
+
+| Variable | Default | |
 |---|---|---|
-| `FORGE_SESSION` | `forge` | nazwa sesji tmux |
-| `FORGE_BASE` | bieżący branch | z czego workerzy startują (per worker: `--base`) |
-| `FORGE_LINK` | — | gitignorowane ścieżki dowiązywane do worktree (per worker: `--link`) |
-| `FORGE_CODEX_ARGS` | `-s workspace-write` | argumenty `codex exec`. Codex CLI 0.163.0 **nie ma już `--full-auto`** — używa `-s read-only\|workspace-write\|danger-full-access` |
-| `FORGE_CODEX_CMD` | `codex` | inny CLI z interfejsem `exec <prompt>` |
-| `FORGE_ORCH_CMD` | `claude` | komenda w oknie orkiestratora (pełna kontrola) |
-| `FORGE_ORCH_MODEL` | — | model orkiestratora z `models.conf` (rola `both`/`orchestrator`) |
-| `FORGE_CLAUDE_CMD` | `claude` | CLI dla dostawcy `claude` |
-| `FORGE_CLAUDE_ARGS` | `--permission-mode acceptEdits` | argumenty `claude -p` dla workera |
-| `FORGE_AGY_CMD` | `agy` | CLI dla dostawcy `antigravity` |
-| `FORGE_AGY_ARGS` | `--output-format json` | argumenty `agy`; `json` jest potrzebne, bo z niego czytane są tokeny |
-| `FORGE_AGY_COMMANDS` | — | polecenia, które wolno uruchomić workerowi `agy` (pierwsze słowo, bez globów) |
-| `FORGE_KEEP_WINDOW` | `1` | okno workera zostaje otwarte po zakończeniu |
-| `FORGE_REPORT_DIR` | `reports` | katalog na raporty workerów (commitowane) |
-| `FORGE_MAX_WORKERS` | `4` | limit równolegle biegnących workerów (`0` = bez limitu, `--force` = obejście) |
-| `FORGE_WT_ROOT` | `../.forge-wt/<repo>` | gdzie trzymać worktree |
-| `FORGE_DASH_PORT` | `8787` | port dashboardu |
-| `FORGE_DASH_TOKEN` | — | token dostępu do dashboardu |
-| `FORGE_DASH_LOGS` | `1` | `0` ukrywa logi na stronie |
-| `FORGE_MOUSE` | `off` | mysz w tmuxie; `on` przywraca kółko w oknach workerów, ale psuje przewijanie w oknie Claude Code ([dlaczego](#przewijanie-i-mysz)) |
+| `FORGE_SESSION` | `forge` | tmux session name |
+| `FORGE_BASE` | current branch | what workers start from (per worker: `--base`) |
+| `FORGE_LINK` | — | gitignored paths linked into the worktree (per worker: `--link`) |
+| `FORGE_CODEX_ARGS` | `-s workspace-write` | arguments for `codex exec`. Codex CLI 0.163.0 **no longer has `--full-auto`** — it uses `-s read-only\|workspace-write\|danger-full-access` |
+| `FORGE_CODEX_CMD` | `codex` | a different CLI with an `exec <prompt>` interface |
+| `FORGE_ORCH_CMD` | `claude` | the command in the orchestrator window (full control) |
+| `FORGE_ORCH_MODEL` | — | orchestrator model from `models.conf` (role `both`/`orchestrator`) |
+| `FORGE_CLAUDE_CMD` | `claude` | CLI for the `claude` provider |
+| `FORGE_CLAUDE_ARGS` | `--permission-mode acceptEdits` | arguments for `claude -p` as a worker |
+| `FORGE_AGY_CMD` | `agy` | CLI for the `antigravity` provider |
+| `FORGE_AGY_ARGS` | `--output-format json` | arguments for `agy`; `json` is required, because token usage is read from it |
+| `FORGE_AGY_COMMANDS` | — | replaces `commands.conf` (program names, no globs) |
+| `FORGE_COMMANDS_FILE` | `<forge>/commands.conf` | a different file for the `agy` command bound |
+| `FORGE_KEEP_WINDOW` | `1` | the worker window stays open after it finishes |
+| `FORGE_REPORT_DIR` | `reports` | directory for worker reports (committed) |
+| `FORGE_MAX_WORKERS` | `4` | limit of concurrently running workers (`0` = no limit, `--force` = bypass) |
+| `FORGE_WT_ROOT` | `../.forge-wt/<repo>` | where to keep worktrees |
+| `FORGE_DASH_PORT` | `8787` | dashboard port |
+| `FORGE_DASH_TOKEN` | — | dashboard access token |
+| `FORGE_DASH_LOGS` | `1` | `0` hides logs on the page |
+| `FORGE_MOUSE` | `off` | tmux mouse; `on` restores the wheel in worker windows but breaks scrolling in the Claude Code window ([why](#scrolling-and-the-mouse)) |
 
-## Wskazówki
+## Tips
 
-- Dziel pracę po granicach modułów — dwóch workerów na jednym pliku = konflikt przy merge.
-  Przy konflikcie: `FORGE_BASE=main forge-spawn <name>-fix "Przenieś zmiany z agent/<name> na aktualny main…"`
-  albo w oknie workera `git merge main`, rozwiąż konflikt, commit, i ponów `forge-merge <name>`.
-- Zacznij od 2–3 workerów; więcej zwykle oznacza więcej review niż oszczędności.
-- Okno workera po zakończeniu zostaje otwarte — możesz w nim od razu uruchomić testy.
+- Split work along module boundaries — two workers on one file means a merge
+  conflict. On a conflict:
+  `FORGE_BASE=main forge-spawn <name>-fix "Move the changes from agent/<name> onto current main…"`
+  or, in the worker's window, `git merge main`, resolve, commit, and retry
+  `forge-merge <name>`.
+- Start with 2–3 workers; more usually means more review than it saves.
+- A worker's window stays open after it finishes — you can run the tests in it
+  right away.

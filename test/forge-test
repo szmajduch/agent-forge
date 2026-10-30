@@ -968,6 +968,101 @@ t_antigravity_denial_is_a_failure() {
     "the log names the denial"
 }
 
+# --- commands.conf: the operator's bound, and the orchestrator's subset ------
+# agy has no spatial sandbox (codex gets -s workspace-write, claude gets a
+# permission mode), so its only limit is a list of command names. These cover
+# the two halves of that: the bound cannot be exceeded, and a subset narrows.
+
+# A commands.conf of its own, so these never depend on the repo's own file.
+write_commands_conf() { # write_commands_conf <content>
+  printf '%s\n' "$1" > "$TMPROOT/$CURRENT_TEST/commands.conf"
+  export FORGE_COMMANDS_FILE="$TMPROOT/$CURRENT_TEST/commands.conf"
+}
+
+t_commands_default_grants_the_whole_bound() {
+  write_commands_conf "# a comment
+ls git   pytest   # trailing comment"
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet c1 "task"
+  assert_rc 0 "$RC" "spawn without --commands"
+  local st; st="$(await c1)"
+  assert_eq "done" "$st" "worker finished"
+  local argv="$FORGE_WT_ROOT/c1/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    # Every bound command is granted, and comments are not mistaken for one.
+    grep -q 'command(ls)' "$argv" && ok || no "bound command 'ls' not granted"
+    grep -q 'command(pytest)' "$argv" && ok || no "bound command 'pytest' not granted"
+    grep -q 'command(#)' "$argv" && no "a comment became a command rule" || ok
+  else
+    no "worker never recorded argv"; no "(skipped)"; no "(skipped)"
+  fi
+  unset FORGE_COMMANDS_FILE
+}
+
+t_commands_narrows_to_the_requested_subset() {
+  write_commands_conf "ls git pytest curl"
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet --commands "pytest ls" c2 "task"
+  assert_rc 0 "$RC" "spawn with a subset of the bound"
+  local st; st="$(await c2)"
+  assert_eq "done" "$st" "worker finished"
+  local argv="$FORGE_WT_ROOT/c2/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -q 'command(pytest)' "$argv" && ok || no "requested 'pytest' not granted"
+    # The point of narrowing: what the task does not need is not granted,
+    # even though the operator allows it.
+    grep -q 'command(curl)' "$argv" && no "unrequested 'curl' leaked into the subset" || ok
+    grep -q 'command(git)' "$argv" && no "unrequested 'git' leaked into the subset" || ok
+  else
+    no "worker never recorded argv"; no "(skipped)"; no "(skipped)"
+  fi
+  unset FORGE_COMMANDS_FILE
+}
+
+t_commands_cannot_exceed_the_bound() {
+  # The orchestrator reads task briefs, so it can be argued into asking for
+  # more than a task needs. Widening stays the operator's decision.
+  write_commands_conf "ls pytest"
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet --commands "pytest curl" c3 "task"
+  assert_rc 1 "$RC" "spawn asking for a command outside the bound"
+  assert_contains "$OUT" "curl" "the refusal names the offending command"
+  # It must fail before any work exists, not leave a half-made worker behind.
+  [[ ! -d "$FORGE_WT_ROOT/c3" ]] && ok || no "a refused spawn left a worktree behind"
+  unset FORGE_COMMANDS_FILE
+}
+
+t_commands_star_bound_is_not_a_shell_glob() {
+  # Regression: `*` is a rule agy understands, but splitting the bound with an
+  # unquoted expansion turned it into the names of the files in the worktree,
+  # granting command(README.md) and no blanket permission at all.
+  write_commands_conf "*"
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet c5 "task"
+  assert_rc 0 "$RC" "spawn with a bound of '*'"
+  local st; st="$(await c5)"
+  assert_eq "done" "$st" "worker finished"
+  local argv="$FORGE_WT_ROOT/c5/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -q 'command(\*)' "$argv" && ok || no "a bound of '*' did not reach agy literally"
+    grep -q 'command(AGENTS' "$argv" && no "'*' expanded to worktree filenames" || ok
+  else
+    no "worker never recorded argv"; no "(skipped)"
+  fi
+  unset FORGE_COMMANDS_FILE
+}
+
+t_commands_rejected_for_sandboxed_providers() {
+  # codex and claude sandbox the worktree instead of listing commands, so a
+  # list there would be silently ignored — refuse it rather than mislead.
+  write_commands_conf "ls pytest"
+  write_fake_provider "$FAKEBIN/codex" codex
+  forge spawn --model gpt-6.1-sol --commands pytest c4 "task"
+  assert_rc 1 "$RC" "--commands on a codex model"
+  assert_contains "$OUT" "antigravity" "the refusal explains which provider it applies to"
+  unset FORGE_COMMANDS_FILE
+}
+
 t_antigravity_effort_is_dropped() {
   # Effort is part of the agy slug; passing --effort as well is a hard error,
   # so forge must drop it rather than fail the spawn.
@@ -1194,6 +1289,11 @@ run_test spawn-routes-to-claude         t_spawn_routes_to_claude_provider
 run_test spawn-routes-to-antigravity    t_spawn_routes_to_antigravity_provider
 run_test antigravity-denial-fails      t_antigravity_denial_is_a_failure
 run_test antigravity-effort-dropped    t_antigravity_effort_is_dropped
+run_test commands-default-whole-bound  t_commands_default_grants_the_whole_bound
+run_test commands-narrow-subset        t_commands_narrows_to_the_requested_subset
+run_test commands-cannot-exceed-bound  t_commands_cannot_exceed_the_bound
+run_test commands-star-not-a-glob      t_commands_star_bound_is_not_a_shell_glob
+run_test commands-sandboxed-refused    t_commands_rejected_for_sandboxed_providers
 run_test spawn-records-provider         t_spawn_records_provider_in_state
 run_test spawn-refuses-missing-cli      t_spawn_refuses_missing_provider_cli
 run_test models-lists-providers         t_models_lists_providers_and_roles

@@ -11,6 +11,11 @@
 #         reasoning on a hard task; it is not a guarantee of correctness.
 #         Passed to codex as -c model_reasoning_effort=<level>.
 # --force ignore the parallel-worker limit (FORGE_MAX_WORKERS, default 4).
+# --commands  shell commands this worker may run, e.g. --commands "pytest git".
+#         antigravity only; the other providers get a sandbox instead of a list.
+#         Must be a subset of commands.conf — a command outside it fails the
+#         spawn rather than widening the operator's bound. Omitted, the worker
+#         gets the whole bound. Repeatable, or space-separated in one value.
 # --link  symlink a gitignored path from the main repo into the worktree, e.g.
 #         --link .venv --link .work. A worktree contains only tracked files, so
 #         anything gitignored (a virtualenv, large data) is otherwise missing.
@@ -19,6 +24,7 @@ source "$(dirname "$0")/forge-lib.sh" || exit 1
 
 model=""; kind="build"; base_opt=""; effort=""; force=0
 links=(); [[ -n "${FORGE_LINK:-}" ]] && read -r -a links <<< "$FORGE_LINK"
+commands=()
 
 # Options are accepted both before and after the name, so a flag written after
 # it is honoured instead of silently becoming part of the task text.
@@ -35,6 +41,11 @@ parse_opts() {
       --effort=*) effort="${1#--effort=}"; shift ;;
       --link) [[ -n "${2:-}" ]] || die "--link needs a value"; links+=("$2"); shift 2 ;;
       --link=*) links+=("${1#--link=}"); shift ;;
+      # Split on whitespace so --commands "pytest git" and two flags agree.
+      --commands) [[ -n "${2:-}" ]] || die "--commands needs a value"
+                  read -r -a _c <<< "$2"; commands+=(${_c[@]+"${_c[@]}"}); shift 2 ;;
+      --commands=*) read -r -a _c <<< "${1#--commands=}"
+                    commands+=(${_c[@]+"${_c[@]}"}); shift ;;
       --force) force=1; shift ;;
       --) shift; break ;;
       *) die "unknown option $1" ;;
@@ -77,6 +88,15 @@ provider_known "$provider" || die "model '$model' names unknown provider '$provi
 # window where the operator has to go looking for the log.
 command -v "$(provider_cmd "$provider")" >/dev/null \
   || die "provider '$provider' needs '$(provider_cmd "$provider")' on PATH (see forge-doctor)"
+
+# Checked here, before the worktree exists, so a command outside the operator's
+# bound fails visibly instead of inside the tmux window. codex and claude get a
+# sandbox rather than a list, so a list would be silently ignored there.
+if [[ ${#commands[@]} -gt 0 ]]; then
+  [[ "$provider" == "antigravity" ]] \
+    || die "--commands applies only to antigravity models; '$model' runs on $provider, which sandboxes the worktree instead"
+  commands_narrow "${commands[@]}" >/dev/null
+fi
 
 valid_name "$name"
 
@@ -140,6 +160,7 @@ rm -f "$(agent_file "$name")"
 agent_set "$name" name="$name" status=queued branch="$branch" base="$base" \
   base_sha="$base_sha" worktree="$wt" model="$model" provider="$provider" \
   kind="$kind" effort="$effort" \
+  commands="${commands[*]-}" \
   title="$(head -n1 <<<"$task" | cut -c1-120)" \
   created="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
@@ -151,7 +172,7 @@ tmux_env=()
 for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
          FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS \
          FORGE_REPORT_DIR FORGE_KEEP_WINDOW \
-         FORGE_MODELS_FILE FORGE_WT_ROOT FORGE_SESSION; do
+         FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION; do
   [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
 done
 tmux new-window -d "${tmux_env[@]}" -t "$FORGE_SESSION:" -n "$name" -c "$wt" "$FORGE_HOME/bin/forge-run '$name'"
