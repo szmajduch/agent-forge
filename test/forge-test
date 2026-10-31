@@ -1151,7 +1151,12 @@ if [[ "$KIND" == "antigravity" ]]; then
   echo '{"conversation_id":"c1","status":"SUCCESS","response":"ok","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":100,"output_tokens":20,"thinking_tokens":5,"cache_read_tokens":80,"total_tokens":120}}'
 fi
 if [[ "$KIND" == "antigravity-denied" ]]; then
-  echo '{"conversation_id":"c2","status":"SUCCESS","response":"","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":2,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":12},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}'
+  # stream-json, which is what forge-run asks agy for: a step_update naming
+  # the denied command, then the envelope. The envelope alone says only
+  # {"action":"command"} and never which command, which is the whole reason
+  # forge reads the step_updates.
+  echo '{"event":"step_update","step_update":{"tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"ls -la"},"error":{"message":"user denied permission to run command:\nls -la"}}}}'
+  echo '{"event":"result","result":{"conversation_id":"c2","status":"SUCCESS","response":"","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":10,"output_tokens":2,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":12},"denied_actions":[{"action":"command","display_name":"RunCommand"}]}}'
 fi
 exit 0
 EOF
@@ -1204,8 +1209,120 @@ t_antigravity_denial_is_a_failure() {
   assert_rc 0 "$RC" "spawn an antigravity model that will be denied"
   local st; st="$(await w6)"
   assert_eq "failed" "$st" "a denied antigravity run is a failure, not done"
-  assert_contains "$(cat "$REPO/.forge/logs/w6.log")" "auto-denied" \
-    "the log names the denial"
+  # Not just "a denial happened" — WHICH command. An operator hit this with
+  # four workers and had to rerun a brief by hand with --output-format
+  # stream-json to find out, because the envelope names only the action.
+  #
+  # Asserted against FORGE's OWN message only, not the whole log. The log also
+  # contains agy's raw stream-json, which carries the command text itself — so
+  # grepping the whole file passes even when forge extracts nothing, which is
+  # exactly what the first version of this test did. Two sabotages (reverting
+  # to --output-format json, and word-splitting the command) both went
+  # unnoticed by it.
+  local msg
+  msg="$(sed -n '/agy was denied these commands/,/The run reported SUCCESS/p' \
+         "$REPO/.forge/logs/w6.log")"
+  assert_contains "$msg" "was denied these commands" \
+    "forge reports the failure as denied commands"
+  assert_contains "$msg" "ls -la" \
+    "forge's own message names the denied command"
+  assert_contains "$msg" "first program it needed was: ls" \
+    "forge names the program that was missing a rule"
+  # And the usage record keeps it, so the dashboard and forge-usage can show it.
+  if [[ -f "$REPO/.forge/usage/w6.json" ]]; then
+    assert_contains "$(cat "$REPO/.forge/usage/w6.json")" "denied_commands" \
+      "the usage record carries denied_commands"
+  else
+    no "no usage record was written for a denied worker"
+  fi
+}
+
+t_doctor_checks_every_command_in_bin() {
+  # Regression: forge-doctor checked a hand-written list of command names, so
+  # a command added later was invisible to it. forge-retry and forge-plan were
+  # both absent from an operator's PATH while doctor reported "all forge-*
+  # commands resolve" — and FORGE.md tells the orchestrator to use forge-retry,
+  # which then exits "command not found" in the middle of a run.
+  #
+  # Asserted structurally: the loop must iterate over bin/, not over names.
+  grep -q 'for src in "\$FORGE_HOME"/bin/forge-\*' "$FORGE_HOME/bin/forge-doctor" \
+    && ok || no "forge-doctor no longer derives its command list from bin/"
+  # And no hand-written list has crept back in.
+  grep -qE '^for cmd in (spawn|status|wait) ' "$FORGE_HOME/bin/forge-doctor" \
+    && no "forge-doctor has a hand-written command list again" || ok
+  # install.sh has the same property and the same failure mode.
+  grep -q 'for f in "\$HERE"/bin/forge-\*' "$FORGE_HOME/install.sh" \
+    && ok || no "install.sh no longer installs every command in bin/"
+}
+
+t_antigravity_is_asked_for_stream_json() {
+  # Why this test is separate from the two above: the stub there emits
+  # stream-json whatever flag it is given, so reverting forge to
+  # `--output-format json` changed only the argv and went unnoticed. This stub
+  # behaves like the real agy — under `json` it prints ONLY the envelope,
+  # which names the action and never the command. Measured against agy 1.4.12:
+  #   json        -> denied_actions: [{"action": "command"}]
+  #   stream-json -> the command itself, ls -la
+  local stub="$FAKEBIN/agy"
+  cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > ./ARGV.txt
+ENVELOPE='{"status":"SUCCESS","response":"","num_turns":1,"usage":{"input_tokens":1,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":2},"denied_actions":[{"action":"command"}]}'
+if [[ "$*" == *"stream-json"* ]]; then
+  echo '{"event":"step_update","step_update":{"tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"ls -la"},"error":{"message":"user denied permission to run command:\nls -la"}}}}'
+  echo "{\"event\":\"result\",\"result\":$ENVELOPE}"
+else
+  echo "$ENVELOPE"
+fi
+exit 0
+STUB
+  chmod +x "$stub"
+  forge spawn --model agy-opus w6s "task"
+  assert_rc 0 "$RC" "spawn a worker that will be denied"
+  local st; st="$(await w6s)"
+  assert_eq "failed" "$st" "a denied run is still a failure"
+  # The argv forge chose. This is the thing that decides whether the command
+  # can be named at all, so it is asserted directly.
+  local argv="$FORGE_WT_ROOT/w6s/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -q 'stream-json' "$argv" \
+      && ok || no "forge did not ask agy for stream-json, so a denial cannot name its command"
+  else
+    no "worker never recorded argv"
+  fi
+  local msg
+  msg="$(sed -n '/agy was denied/,/The run reported SUCCESS/p' \
+         "$REPO/.forge/logs/w6s.log")"
+  assert_contains "$msg" "ls -la" \
+    "the command is recovered from the stream, end to end"
+}
+
+t_antigravity_denial_names_a_compound_command_whole() {
+  # agy wraps a check as `cd <dir> && <cmd>; echo ...`, so a denied command
+  # contains spaces and shell operators. Splitting it on spaces — which an
+  # unquoted $(...) does, and which the first version of this code did —
+  # printed "ls -la" as two separate lines and would mangle a real check
+  # beyond recognition.
+  local stub="$FAKEBIN/agy"
+  cat > "$stub" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' "$@" > ./ARGV.txt
+echo '{"event":"step_update","step_update":{"tool_name":"run_command","tool_info":{"parameters":{"CommandLine":"cd /w && pytest -q; echo EXIT: $?"},"error":{"message":"user denied permission to run command:\ncd /w"}}}}'
+echo '{"event":"result","result":{"status":"SUCCESS","response":"","num_turns":1,"usage":{"input_tokens":1,"output_tokens":1,"thinking_tokens":0,"cache_read_tokens":0,"total_tokens":2},"denied_actions":[{"action":"command"}]}}'
+exit 0
+STUB
+  chmod +x "$stub"
+  forge spawn --model agy-opus w6c "task"
+  assert_rc 0 "$RC" "spawn a worker whose compound command is denied"
+  local st; st="$(await w6c)"
+  assert_eq "failed" "$st" "a denied run is a failure"
+  # The whole command on ONE line, inside forge's own message — not in agy's
+  # raw stream-json above it, which would make this pass regardless.
+  local msg
+  msg="$(sed -n '/agy was denied these commands/,/The run reported SUCCESS/p' \
+         "$REPO/.forge/logs/w6c.log")"
+  printf '%s\n' "$msg" | grep -q 'cd /w && pytest -q; echo EXIT' \
+    && ok || no "a compound denied command was split or truncated"
 }
 
 # --- commands.conf: the operator's bound, and the orchestrator's subset ------
@@ -1594,6 +1711,9 @@ run_test models-lists-default           t_models_lists_default
 run_test spawn-routes-to-claude         t_spawn_routes_to_claude_provider
 run_test spawn-routes-to-antigravity    t_spawn_routes_to_antigravity_provider
 run_test antigravity-denial-fails      t_antigravity_denial_is_a_failure
+run_test antigravity-denial-compound  t_antigravity_denial_names_a_compound_command_whole
+run_test antigravity-asks-stream-json t_antigravity_is_asked_for_stream_json
+run_test doctor-checks-all-commands    t_doctor_checks_every_command_in_bin
 run_test antigravity-effort-dropped    t_antigravity_effort_is_dropped
 run_test commands-default-whole-bound  t_commands_default_grants_the_whole_bound
 run_test commands-narrow-subset        t_commands_narrows_to_the_requested_subset

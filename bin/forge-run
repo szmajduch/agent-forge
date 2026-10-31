@@ -89,7 +89,19 @@ case "$provider" in
     # Permissions are an explicit allowlist because agy auto-denies anything
     # it would have to prompt for (see agy_permissions in forge-lib.sh) — and
     # reports SUCCESS anyway, which is why the denial check runs below.
-    read -r -a ARGS <<< "${FORGE_AGY_ARGS:---output-format json}"
+    # stream-json, not json. Both end with the same envelope (status, usage,
+    # denied_actions), but `json` prints ONLY that envelope — and its
+    # denied_actions says just {"action": "command"}, never which command.
+    # stream-json additionally emits a step_update per tool call carrying
+    # run_command.error.message, which names it:
+    #   "user denied permission to run command:\nls -la"
+    # Measured against agy 1.4.12, same brief and same allowlist:
+    #   json        -> [{"action": "command", "display_name": "RunCommand"}]
+    #   stream-json -> ['ls -la']
+    # An operator was left to rerun the brief by hand to find that out, at
+    # four workers' worth of diagnosis. Nothing is lost by the switch: the
+    # envelope is still there, so usage parsing is unaffected.
+    read -r -a ARGS <<< "${FORGE_AGY_ARGS:---output-format stream-json}"
     # The subset forge-spawn --commands recorded, or empty for the whole bound.
     read -r -a WCMDS <<< "$(agent_get "$name" commands)"
     ARGS+=(--settings "$(agy_permissions ${WCMDS[@]+"${WCMDS[@]}"})")
@@ -141,33 +153,93 @@ set -e
 # worker that did nothing. FORGE_AGY_COMMANDS widens the command allowlist.
 if [[ "$provider" == "antigravity" ]]; then
   mkdir -p "$STATE/usage"
+  # NOTE for anyone editing the Python below: it sits in a heredoc inside a
+  # $(...) substitution, which bash parses for quotes BEFORE the heredoc
+  # protects it. An apostrophe in a comment ("forge's default") makes bash
+  # fail with "unexpected EOF while looking for matching )" pointing at this
+  # line, not at the comment. Keep apostrophes and backticks out of it.
   denied="$(python3 - "$log" "$STATE/usage/$name.json" "$wt" "$model" <<'PYEOF' || true
 import json, re, sys
 log, out, cwd, model = sys.argv[1:5]
 text = open(log, encoding="utf-8", errors="replace").read()
-# The envelope is the last complete JSON object printed; notices precede it.
+
+# Two things are pulled out of the log, and they live in different places.
+#
+# 1. The envelope: the last complete JSON object carrying both usage and
+#    status. Scanned this way rather than by reading the last line because
+#    agy prints notices before it, and because this must keep working for a
+#    worker run with FORGE_AGY_ARGS="--output-format json", where the
+#    envelope is the only object there is.
+#
+# 2. The commands that were actually denied. The envelope does NOT name them
+#    — denied_actions says only {"action": "command"}. Under stream-json
+#    the default in forge since this was measured, each tool call gets a
+#    step_update whose run_command.error.message reads
+#    "user denied permission to run command:" followed by the command. That
+#    is the only place the command appears, so it is read from there and put
+#    in the failure message. Measured against agy 1.4.12, same brief and same
+#    allowlist: json named only the action "command", while stream-json named
+#    the command itself, ls -la.
 env = None
+denied_cmds = []
 for m in re.finditer(r"\{", text):
     try:
         obj, _ = json.JSONDecoder().raw_decode(text[m.start():])
     except ValueError:
         continue
-    if isinstance(obj, dict) and "usage" in obj and "status" in obj:
+    if not isinstance(obj, dict):
+        continue
+    if "usage" in obj and "status" in obj:
         env = obj
+    # stream-json nests the envelope under "result"; json has it bare.
+    res = obj.get("result")
+    if isinstance(res, dict) and "usage" in res and "status" in res:
+        env = res
+    su = obj.get("step_update")
+    if isinstance(su, dict):
+        ti = su.get("tool_info") or {}
+        msg = ((ti.get("error") or {}).get("message") or "")
+        if "denied permission to run command" in msg:
+            cmd = (ti.get("parameters") or {}).get("CommandLine")
+            if cmd and cmd not in denied_cmds:
+                denied_cmds.append(cmd)
 if env is None:
     sys.exit(0)
 json.dump({"provider": "antigravity", "cwd": cwd, "model": model,
            "status": env.get("status", ""), "usage": env.get("usage") or {},
-           "denied_actions": env.get("denied_actions") or []},
+           "denied_actions": env.get("denied_actions") or [],
+           "denied_commands": denied_cmds},
           open(out, "w"), indent=1)
-names = sorted({(d or {}).get("action", "?") for d in (env.get("denied_actions") or [])})
-if names:
-    print(",".join(names))
+
+# Printed for the shell: the commands when they are known, the bare action
+# names otherwise (a worker run with --output-format json has no step_updates).
+if denied_cmds:
+    print("CMDS\t" + "\t".join(denied_cmds))
+else:
+    names = sorted({(d or {}).get("action", "?")
+                    for d in (env.get("denied_actions") or [])})
+    if names:
+        print("ACTIONS\t" + ",".join(names))
 PYEOF
 )"
   if [[ -n "$denied" ]]; then
     rc=1
-    echo "=== agy auto-denied required tool(s): $denied ===" | tee -a "$log"
+    # The parser prints either "CMDS<tab>cmd<tab>cmd" when it recovered the
+    # actual command lines, or "ACTIONS<tab>names" when it could not (a worker
+    # run with FORGE_AGY_ARGS="--output-format json" emits no step_updates).
+    kind="${denied%%$'\t'*}"
+    rest="${denied#*$'\t'}"
+    if [[ "$kind" == "CMDS" ]]; then
+      echo "=== agy was denied these commands ===" | tee -a "$log"
+      # One per line, split on TABS only. An unquoted $(...) would word-split
+      # on spaces too and print "ls -la" as two lines, which is how this was
+      # first written and what the end-to-end test caught.
+      printf '%s\n' "$rest" | tr '\t' '\n' | sed 's/^/      /' | tee -a "$log"
+      first="$(printf '%s' "$rest" | cut -f1 | awk '{print $1}')"
+      echo "    The first program it needed was: ${first:-?}" | tee -a "$log"
+    else
+      echo "=== agy auto-denied required tool(s): $rest ===" | tee -a "$log"
+    fi
     echo "    The run reported SUCCESS but was not permitted to act." | tee -a "$log"
     echo "    This worker was allowed:$(agy_denial_hint "${WCMDS[@]+${WCMDS[@]}}")" | tee -a "$log"
     echo "    agy wraps a check as 'cd <dir> && <cmd>; echo ...', so EVERY" | tee -a "$log"
@@ -177,15 +249,22 @@ PYEOF
     # as run_command.error.message on the denied step. So say where the answer
     # is instead of pretending this message holds it. And name the usual
     # culprit: not the task's own command, but one agy ran to orient itself.
-    cat >>"$log" <<'DENYHINT'
-    The envelope does not say WHICH command was denied. To find out, rerun the
-    brief by hand with --output-format stream-json and look for the run_command
-    step whose error message contains "denied permission to run command".
-    The usual cause is not the task's own command but one agy runs to orient
-    itself on its first turn (measured: "ls -la"). forge grants cd/echo/ls/cat
-    for exactly that; a commands.conf that drops one of them brings it back.
+    if [[ "$kind" != "CMDS" ]]; then
+      # Only reachable when the operator overrode the output format, since
+      # forge now defaults to stream-json, which names the commands above.
+      cat >>"$log" <<'DENYHINT'
+    This run used --output-format json, whose envelope does not say WHICH
+    command was denied. Drop FORGE_AGY_ARGS to get the default stream-json,
+    which names it.
 DENYHINT
-    tail -7 "$log"
+    fi
+    cat >>"$log" <<'DENYHINT'
+    Note that the denied command is often NOT the one the task is about but
+    one agy runs to orient itself on its first turn, such as "ls -la". forge
+    grants cd/echo/ls/cat for exactly that, so a commands.conf that drops one
+    of them brings this back.
+DENYHINT
+    tail -12 "$log"
   fi
 fi
 

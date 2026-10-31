@@ -57,10 +57,19 @@ else caution "claude is missing (the orchestrator window will not start)"; fi
 head2 "installed launchers"
 # A launcher left over from a previous location silently runs the old forge, or
 # nothing at all. It is the one failure whose error message points nowhere.
+#
+# Derived from what is in bin/, never a hand-written list. This check used to
+# name the commands explicitly and so could not see a command that did not
+# exist when the list was written: forge-retry and forge-plan were both
+# missing from an operator's PATH, forge-doctor reported "all forge-* commands
+# resolve", and FORGE.md told the orchestrator to use forge-retry — which
+# exited "command not found" mid-run. A list that has to be updated by hand is
+# the same bug install.sh has, one layer up.
 missing_cmds=(); stale_cmds=()
-for cmd in spawn status wait review merge drop models usage init up doctor clean cancel; do
-  src="$FORGE_HOME/bin/forge-$cmd"
+for src in "$FORGE_HOME"/bin/forge-*; do
   [[ -f "$src" ]] || continue
+  case "$src" in *.sh) continue ;; esac   # forge-lib.sh is sourced, not run
+  cmd="$(basename "$src")"; cmd="${cmd#forge-}"
   found="$(command -v "forge-$cmd" 2>/dev/null || true)"
   if [[ -z "$found" ]]; then missing_cmds+=("forge-$cmd"); continue; fi
   # The launcher is a two-line shim holding the absolute path to this checkout.

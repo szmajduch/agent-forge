@@ -173,7 +173,12 @@ mkdir -p ~/tools && unzip forge.zip -d ~/tools   # → ~/tools/forge
 ~/tools/forge/install.sh   # installs the forge-* commands into ~/.local/bin and checks dependencies
 ```
 
-If you move the `forge` folder later, run `install.sh` again.
+Run `install.sh` again whenever you **move** the forge folder, and whenever you
+**pull a new version**: the launchers are created one per file in `bin/`, so a
+command added since your last install is not on your PATH and fails with
+`command not found` — including mid-run, when `FORGE.md` tells the
+orchestrator to use it. `forge-doctor` reports exactly which ones are
+missing.
 
 `install.sh` does not change environment variables or shell configuration
 files. If `~/.local/bin` is not on your `PATH` (on macOS it is not by default),
