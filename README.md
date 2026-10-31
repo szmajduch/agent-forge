@@ -652,6 +652,15 @@ What `forge-doctor` catches besides that: missing dependencies, launchers in
   (`git add --renormalize -- <path>/`) — the attribute alone will not restore
   bytes already dropped from existing blobs. Verify in a fresh worktree.
 
+  `forge-doctor` judges this by measurement, not by the setting: it counts
+  committed files that hold CRLF and separates those with a `-text` exemption
+  from those without. Only the unexempted ones are a warning, naming how many.
+  A repo whose byte-exact paths are already exempted gets an `ok` — because
+  `core.autocrlf` is not itself a fault, and a warning that is usually wrong
+  gets ignored on the day it is right. What it still cannot see is a NEW
+  directory of byte-exact data, which needs its own rule: an existing
+  `references/** -text` will not cover `references2/`.
+
 **Status `done` does not mean there is a deliverable.** A worker can finish
 with a commit whose only content is a report saying "nothing could be
 measured". Always read the report, not just the status.

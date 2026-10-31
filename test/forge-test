@@ -911,6 +911,38 @@ t_doctor_detects_uncommitted_role_files() {
   assert_contains "$OUT" "invisible to workers" "doctor warns about uncommitted role files"
 }
 
+t_doctor_warns_only_about_unprotected_crlf() {
+  # core.autocrlf rewrites bytes on commit, so a hash-comparing test passes in
+  # the operator's checkout and fails in every worker's worktree. forge-doctor
+  # warned on the SETTING alone, which is not the fault: measured in a real
+  # repo, 218 CRLF files all carried attr/-text and a fresh worktree was
+  # byte-identical. Warning there sends the operator to fix what is already
+  # correct, and a warning that is usually wrong gets ignored when it is right.
+  #
+  # So: CRLF data with no -text exemption warns; CRLF data that is exempted
+  # does not.
+  git -C "$REPO" config core.autocrlf input
+  printf 'a\r\nb\r\n' > "$REPO/evidence.xml"
+  git -C "$REPO" add -A >/dev/null 2>&1
+  git -C "$REPO" -c user.email=t@e.invalid -c user.name=t commit -qm crlf >/dev/null 2>&1
+  forge doctor
+  assert_contains "$OUT" "no -text exemption" \
+    "doctor warns when a CRLF data file is not exempted"
+
+  # Now exempt it. The verdict must flip.
+  printf '%s\n' 'evidence.xml -text' > "$REPO/.gitattributes"
+  git -C "$REPO" add -A >/dev/null 2>&1
+  git -C "$REPO" -c user.email=t@e.invalid -c user.name=t commit -qm attrs >/dev/null 2>&1
+  forge doctor
+  assert_contains "$OUT" "exempted with -text" \
+    "doctor accepts autocrlf once the byte-exact paths are exempted"
+  case "$OUT" in
+    *"no -text exemption"*)
+      no "doctor still warns about CRLF that is exempted" ;;
+    *) ok ;;
+  esac
+}
+
 t_doctor_rejects_unknown_option() {
   forge doctor --bogus
   assert_rc 1 "$RC" "forge-doctor --bogus"
@@ -1686,6 +1718,7 @@ echo "forge-doctor"
 run_test doctor-flags-missing-roles     t_doctor_flags_missing_role_files
 run_test doctor-passes-after-init       t_doctor_passes_after_init
 run_test doctor-detects-uncommitted     t_doctor_detects_uncommitted_role_files
+run_test doctor-crlf-only-unprotected   t_doctor_warns_only_about_unprotected_crlf
 run_test doctor-rejects-unknown-option  t_doctor_rejects_unknown_option
 
 echo

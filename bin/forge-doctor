@@ -145,9 +145,28 @@ if [[ "$crlf" == "true" || "$crlf" == "input" ]]; then
   done < <(git -C "$ROOT" ls-files --eol 2>/dev/null \
     | awk '$3 !~ /-text/ {sub(/^[^\t]*\t/,""); print}' \
     | grep -iE '\.(xsd|xsl|xslt|xml|json|csv|txt|html?|pds|dtd|sgml?)$' || true)
-  caution "core.autocrlf=$crlf — a fresh worktree can get different bytes than your checkout"
-  [[ "$exposed" -gt 0 ]] && note "$exposed data file(s) hold CRLF with no -text exemption"
-  note "byte-exact paths need '<path>/** -text' in .gitattributes + git add --renormalize"
+  # The verdict follows the measurement, not the setting. autocrlf alone is
+  # not a fault: a repo whose byte-exact paths are already exempted with
+  # -text is safe, and saying otherwise sends the operator to fix a file that
+  # is already correct. Measured in one such repo: 218 CRLF files, every one
+  # carrying attr/-text, and a fresh worktree byte-identical to the checkout.
+  #
+  # The distinction that matters is whether any data file holds CRLF WITHOUT
+  # an exemption — those are the ones whose bytes change in a worker's
+  # worktree while the main checkout keeps the originals.
+  protected="$(git -C "$ROOT" ls-files --eol 2>/dev/null \
+    | awk '$1 ~ /crlf/ && $3 ~ /-text/' | wc -l | tr -d ' ')"
+  if [[ "$exposed" -gt 0 ]]; then
+    caution "core.autocrlf=$crlf and $exposed data file(s) hold CRLF with no -text exemption"
+    note "a fresh worktree will get different bytes for those files than your checkout"
+    note "byte-exact paths need '<path>/** -text' in .gitattributes + git add --renormalize"
+  elif [[ "${protected:-0}" -gt 0 ]]; then
+    ok "core.autocrlf=$crlf, but all $protected CRLF file(s) are exempted with -text"
+    note "a new directory of byte-exact data needs its own rule — the existing globs will not cover it"
+  else
+    ok "core.autocrlf=$crlf and no committed file holds CRLF"
+    note "if you add byte-exact data later, exempt it with '<path>/** -text'"
+  fi
 else
   ok "core.autocrlf=${crlf:-unset} — worktrees get the same bytes as your checkout"
 fi
