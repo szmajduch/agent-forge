@@ -19,6 +19,16 @@ FILTER="${1:-}"
 # parallel run of this script are never touched.
 RUN_ID="t$$"
 export FORGE_SESSION="forge-test-$RUN_ID"
+
+# No plan-quota readings during tests. forge-run asks forge-plan for the
+# provider's remaining quota before and after a worker, which runs the
+# provider CLI again (`claude -p /usage`, `agy -p /usage`). On PATH here those
+# are stubs that record their argv to ARGV.txt, so that second call overwrote
+# the worker's own argv and failed six provider/commands tests that had
+# nothing to do with quota. It would also reach the real CLIs on a machine
+# where the stubs are absent — a test suite must not touch the operator's
+# account.
+export FORGE_NO_PLAN=1
 TMPROOT="$(mktemp -d "${TMPDIR:-/tmp}/forge-test.XXXXXX")"
 
 pass=0; fail=0; failed_names=()
@@ -1595,6 +1605,92 @@ run_test commands-sandboxed-refused    t_commands_rejected_for_sandboxed_provide
 run_test spawn-records-provider         t_spawn_records_provider_in_state
 run_test spawn-refuses-missing-cli      t_spawn_refuses_missing_provider_cli
 run_test models-lists-providers         t_models_lists_providers_and_roles
+t_plan_diff_reports_consumption() {
+  # The headline feature: what one operation cost, in plan terms.
+  local b="$TMPROOT/plan-b.json" a="$TMPROOT/plan-a.json"
+  cat > "$b" <<'JSON'
+{"providers":{"claude":{"provider":"claude","plan":"subscription","windows":[
+ {"window":"session","left_percent":70.0,"resets":null,"resets_epoch":null},
+ {"window":"week","left_percent":78.0,"resets":null,"resets_epoch":null}]}}}
+JSON
+  cat > "$a" <<'JSON'
+{"providers":{"claude":{"provider":"claude","plan":"subscription","windows":[
+ {"window":"session","left_percent":64.0,"resets":null,"resets_epoch":null},
+ {"window":"week","left_percent":78.0,"resets":null,"resets_epoch":null}]}}}
+JSON
+  local out; out="$("$FORGE_HOME/bin/forge-plan" --diff "$b" "$a" 2>&1)"
+  assert_contains "$out" "70.0% ->  64.0% left" "the drop is shown as before -> after"
+  assert_contains "$out" "-6.0 points" "consumption is quantified"
+  # A window that did not move must say so honestly. /usage reports whole
+  # percentage points, so "0%" would read as "this task was free".
+  assert_contains "$out" "<1%" "an unmoved window says '<1%', not '0%'"
+}
+
+t_plan_diff_flags_a_reset_instead_of_claiming_zero() {
+  # A window that refills mid-run leaves MORE than before. Reporting that as
+  # "<1% used" would be a plain falsehood: part of the cost was charged to a
+  # window that no longer exists, so it is not measurable from two readings.
+  local b="$TMPROOT/reset-b.json" a="$TMPROOT/reset-a.json"
+  echo '{"providers":{"claude":{"provider":"claude","plan":"s","windows":[{"window":"session","left_percent":3.0,"resets":null,"resets_epoch":null}]}}}' > "$b"
+  echo '{"providers":{"claude":{"provider":"claude","plan":"s","windows":[{"window":"session","left_percent":100.0,"resets":null,"resets_epoch":null}]}}}' > "$a"
+  local out; out="$("$FORGE_HOME/bin/forge-plan" --diff "$b" "$a" 2>&1)"
+  assert_contains "$out" "reset mid-run" "a refilled window is named as such"
+  case "$out" in
+    *"<1%"*) no "a reset was reported as '<1% used'" ;;
+    *)       ok ;;
+  esac
+}
+
+t_plan_survives_unreadable_input() {
+  # forge-run calls this after a worker has already finished. A crash here
+  # must never turn a successful worker into a failed one.
+  echo 'not json at all' > "$TMPROOT/bad.json"
+  "$FORGE_HOME/bin/forge-plan" --diff "$TMPROOT/bad.json" "$TMPROOT/bad.json" >/dev/null 2>&1
+  assert_rc 0 "$?" "malformed readings exit 0"
+  "$FORGE_HOME/bin/forge-plan" --diff /nonexistent /also-missing >/dev/null 2>&1
+  assert_rc 0 "$?" "missing readings exit 0"
+}
+
+t_plan_respects_the_opt_out() {
+  # FORGE_NO_PLAN must stop every provider CLI from being started. This test
+  # suite depends on it: the stubs on PATH record their argv, so a /usage call
+  # overwrote the worker's own ARGV.txt and failed six unrelated tests.
+  local stub="$TMPROOT/noplan-bin"
+  mkdir -p "$stub"
+  for cli in claude agy; do
+    printf '#!/usr/bin/env bash
+echo called >> "%s/CALLED.txt"
+exit 0
+' \
+      "$stub" > "$stub/$cli"
+    chmod +x "$stub/$cli"
+  done
+  ( cd "$TMPROOT" && PATH="$stub:$PATH" FORGE_NO_PLAN=1 \
+      "$FORGE_HOME/bin/forge-plan" --json >/dev/null 2>&1 )
+  [[ ! -f "$stub/CALLED.txt" ]] && ok \
+    || no "FORGE_NO_PLAN=1 still ran a provider CLI"
+}
+
+t_plan_is_forwarded_to_the_worker_window() {
+  # Regression: a worker runs in a NEW tmux window, which inherits only the
+  # variables forge-spawn passes with -e. FORGE_NO_PLAN was not on that list,
+  # so `export FORGE_NO_PLAN=1` in this script never reached forge-run and the
+  # plan reading ran anyway — overwriting the worker's ARGV.txt. Asserted on
+  # both spawn paths because forge-retry keeps its own copy of the list.
+  local missing=""
+  local f
+  for f in forge-spawn forge-retry; do
+    grep -q "FORGE_NO_PLAN" "$FORGE_HOME/bin/$f" || missing="$missing $f"
+  done
+  [[ -z "$missing" ]] && ok \
+    || no "FORGE_NO_PLAN is not forwarded to the worker window by:$missing"
+}
+
+run_test plan-diff-reports-consumption  t_plan_diff_reports_consumption
+run_test plan-diff-flags-reset          t_plan_diff_flags_a_reset_instead_of_claiming_zero
+run_test plan-survives-bad-input        t_plan_survives_unreadable_input
+run_test plan-respects-opt-out          t_plan_respects_the_opt_out
+run_test plan-forwarded-to-worker       t_plan_is_forwarded_to_the_worker_window
 run_test usage-reports-antigravity      t_usage_reports_antigravity_from_worker
 run_test usage-total-derived            t_usage_total_is_derived_not_trusted
 run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty

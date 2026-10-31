@@ -438,17 +438,17 @@ def main():
               f"{_fmt(agg['cached']):>8} {_fmt(agg['reasoning']):>8}")
 
     print()
-    print(f"{'PROVIDER':11} {'MODEL':20} {'CONTEXT USED':>13} {'PLAN QUOTA':>12}  SESSION")
+    # No PLAN QUOTA column here any more. Plan quota is ONE account-wide pool,
+    # so showing it per session displayed the same pool as "1.0% used" beside
+    # "67.0% used" — those were readings of different ages, not different
+    # allowances, and the lower (older) one was reassuring and wrong. It is
+    # now reported once, by forge-plan, which takes the newest reading and
+    # states how much is LEFT.
+    print(f"{'PROVIDER':11} {'MODEL':20} {'CONTEXT HELD':>13}  SESSION")
     for r in recs[:15]:
         ctx = _pct(r["last_total"], r["context_window"])
-        if r["quota"] and r["quota"].get("used_percent") is not None:
-            q = f"{r['quota']['used_percent']:5.1f}% used"
-        elif r["provider"] == "codex":
-            q = "  not stated"
-        else:
-            q = "         n/a"
         print(f"{r['provider']:11} {_display_model(r['model'])[:20]:20} {ctx:>13} "
-              f"{q:>12}  {r['session'][:20]}")
+              f"  {r['session'][:20]}")
 
     # A disagreement between the provider's total and the parts means the CLI
     # changed what it reports. That invalidates the TOTAL column, so it is
@@ -463,10 +463,10 @@ def main():
         print("  TOTAL is the sum of in+out+cache; please re-check the "
               "provider's usage format.")
 
-    if any(r["provider"] == "codex" and not r["quota"] for r in recs):
-        print()
-        print("note: 'not stated' means codex returned no quota window for that "
-              "session (common on plans that report credits only).")
+    print()
+    print("CONTEXT HELD is how full each session's context window is — what "
+          "decides when it")
+    print("must compact. For how much of your PLAN is left, run forge-plan.")
     if not any(r["provider"] == "antigravity" for r in recs):
         print("note: no antigravity usage recorded yet — it is written only when "
               "a worker runs on an agy model (see forge-models).")

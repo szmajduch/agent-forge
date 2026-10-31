@@ -1,0 +1,506 @@
+#!/usr/bin/env python3
+"""forge-plan [--json] [--provider <name>] — how much of each plan is LEFT.
+
+Reports remaining plan quota per provider, with the time each window resets.
+Also importable: forge-run calls read_all() before and after a worker so the
+cost of one task can be stated in plan terms, not only in tokens.
+
+Each provider is asked differently, and only one of the three is free:
+
+  codex   Read from ~/.codex/sessions/**/rollout-*.jsonl, which the CLI
+          already wrote. No process is started. The newest session wins: the
+          quota is an account-wide fact, so the most recent reading is the
+          current one — older sessions carry stale percentages, which is the
+          bug this file replaces (forge-usage used to print a per-session
+          quota column, so one account's single pool appeared as "1.0% used"
+          next to "67.0% used").
+
+  claude  `claude -p "/usage"`. Measured 2026-10-31: num_turns 0,
+          total_cost_usd 0, duration_api_ms 0 — /usage is handled locally and
+          never reaches the model, so asking does not consume the plan it
+          reports. ~1.2s.
+
+          It DOES create a transcript file (~3.8 KB) in
+          ~/.claude/projects/<slug>/, so a fresh session id is passed and that
+          one file is deleted afterwards. Measured alternatives, both worse:
+          a fixed --session-id fails the second call ("Session ID is already
+          in use"), and --resume on a fixed id appends ~3.8 KB per read
+          (~381 MB/year at one read per 5 min). CLAUDE_CONFIG_DIR isolates the
+          file but loses the subscription, returning no plan data at all.
+
+  agy     `agy -p "/usage"`. num_turns 0, total_tokens 0, and it writes
+          nothing to disk at all — nothing to clean up. ~4s. Its output is
+          TSV and already states what is REMAINING, per model family:
+
+              Gemini Models          Weekly Limit Remaining  100%  <ISO>
+              Claude and GPT models  Weekly Limit Remaining   77%  <ISO>
+
+          Those families are kept apart and never summed. "Claude and GPT
+          models" here is antigravity's own pool, which is NOT the Claude
+          subscription: the same model reached through `opus` and through
+          `agy-opus` draws on two different plans, and seeing both is the
+          point.
+
+Nothing here is a cost estimate: forge does not know your plan's prices. A
+percentage this cannot establish is reported as unknown, never as zero.
+"""
+import argparse
+import glob
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import uuid
+
+HOME = os.path.expanduser("~")
+
+# A provider CLI that hangs must not hang the dashboard or a worker's exit.
+# Generous relative to the measured 1.2s (claude) and 4s (agy), because a cold
+# start on a loaded machine is slower than a warm one, and the caller treats a
+# timeout as "unknown" rather than as an error.
+TIMEOUT = 25
+
+
+def _claude_transcript_dir():
+    """Where `claude -p` writes a transcript for the current directory.
+
+    Claude Code slugifies the absolute path: /Users/me/x -> -Users-me-x.
+    Derived rather than searched, so the file this code deletes is only ever
+    the one it just created.
+    """
+    slug = os.path.abspath(os.getcwd()).replace("/", "-")
+    return os.path.join(HOME, ".claude", "projects", slug)
+
+
+def read_claude():
+    """Remaining percentages for the Claude subscription, or None.
+
+    /usage prints prose, so the percentages are parsed with a regex. The
+    figures are whole numbers — there is no finer-grained field in the
+    envelope (checked: only `result` carries them) — which is why a short
+    worker can legitimately show no change at all.
+    """
+    if not shutil.which("claude"):
+        return None
+    sid = str(uuid.uuid4())
+    transcript = os.path.join(_claude_transcript_dir(), sid + ".jsonl")
+    try:
+        p = subprocess.run(
+            ["claude", "-p", "/usage", "--output-format", "json",
+             "--session-id", sid],
+            capture_output=True, text=True, timeout=TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    finally:
+        # Deleted whatever happened: a timeout still leaves the file behind.
+        try:
+            os.unlink(transcript)
+        except OSError:
+            pass
+    if p.returncode != 0:
+        return None
+    try:
+        text = (json.loads(p.stdout).get("result") or "")
+    except (ValueError, AttributeError):
+        return None
+
+    windows = []
+    for label, pattern in (
+            ("session", r"Current session:\s*([\d.]+)%\s*used"
+                        r"(?:\s*·\s*resets\s*([^\n·]+))?"),
+            ("week", r"Current week[^:]*:\s*([\d.]+)%\s*used"
+                     r"(?:\s*·\s*resets\s*([^\n·]+))?")):
+        m = re.search(pattern, text)
+        if not m:
+            continue
+        # Stored as remaining, which is what the caller displays. "% used" is
+        # what Claude prints; the subtraction happens once, here.
+        windows.append({
+            "window": label,
+            "left_percent": round(100.0 - float(m.group(1)), 1),
+            "resets": (m.group(2) or "").strip() or None,
+            "resets_epoch": None,
+        })
+    if not windows:
+        return None
+    return {"provider": "claude", "plan": "subscription", "windows": windows}
+
+
+def read_agy():
+    """Remaining percentages per model family, or None.
+
+    agy's output is already "Remaining", already TSV, and carries ISO
+    timestamps — so this is parsing, not interpretation.
+    """
+    if not shutil.which("agy"):
+        return None
+    try:
+        p = subprocess.run(
+            ["agy", "-p", "/usage", "--output-format", "json",
+             "--print-timeout", "%ds" % (TIMEOUT - 5)],
+            capture_output=True, text=True, timeout=TIMEOUT)
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        text = (json.loads(p.stdout).get("response") or "")
+    except (ValueError, AttributeError):
+        return None
+
+    windows = []
+    for line in text.splitlines():
+        parts = [c.strip() for c in line.split("\t")]
+        if len(parts) < 3:
+            continue
+        family, what, pct = parts[0], parts[1], parts[2]
+        if "Remaining" not in what or not pct.endswith("%"):
+            continue
+        try:
+            left = float(pct[:-1])
+        except ValueError:
+            continue
+        iso = parts[3] if len(parts) > 3 else ""
+        windows.append({
+            # "Five Hour Limit Remaining" -> "5h"; "Weekly ..." -> "week".
+            "window": "5h" if "Five Hour" in what else (
+                "week" if "Weekly" in what else what),
+            "family": family,
+            "left_percent": left,
+            "resets": iso or None,
+            "resets_epoch": _iso_epoch(iso),
+        })
+    if not windows:
+        return None
+    return {"provider": "antigravity", "plan": "antigravity", "windows": windows}
+
+
+def _iso_epoch(s):
+    """Epoch seconds from an ISO 8601 string, or None.
+
+    Z is rewritten to +00:00 because fromisoformat did not accept Z before
+    3.11 and forge supports older interpreters.
+    """
+    if not s:
+        return None
+    try:
+        import datetime
+        return datetime.datetime.fromisoformat(
+            s.replace("Z", "+00:00")).timestamp()
+    except (ValueError, ImportError):
+        return None
+
+
+def read_codex():
+    """Remaining percentages from the newest codex session on disk, or None.
+
+    No process is started: the CLI already recorded `rate_limits`. Only the
+    NEWEST reading is used, because plan quota is an account-wide fact and an
+    old session's percentage is simply out of date.
+    """
+    pattern = os.path.join(HOME, ".codex", "sessions", "**", "rollout-*.jsonl")
+    files = glob.glob(pattern, recursive=True)
+    if not files:
+        return None
+    newest = None  # (mtime, rate_limits)
+    # Newest first, and stop at the first file that has a reading: scanning
+    # every session on a busy machine is slow and cannot change the answer.
+    for path in sorted(files, key=os.path.getmtime, reverse=True)[:40]:
+        found = None
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if '"rate_limits"' not in line:
+                        continue
+                    try:
+                        payload = (json.loads(line).get("payload") or {})
+                    except ValueError:
+                        continue
+                    rl = payload.get("rate_limits")
+                    if isinstance(rl, dict) and rl:
+                        found = rl  # keep scanning: later lines are newer
+        except OSError:
+            continue
+        if found:
+            newest = (os.path.getmtime(path), found)
+            break
+    if not newest:
+        return None
+    mtime, rl = newest
+
+    windows = []
+    for key, label in (("primary", None), ("secondary", None),
+                       ("individual_limit", "individual")):
+        w = rl.get(key)
+        if not isinstance(w, dict):
+            continue
+        used = w.get("used_percent")
+        if used is None:
+            used = w.get("used_percentage")
+        if used is None:
+            continue
+        # codex names its windows by length, not by purpose, so the label is
+        # derived from window_minutes: a "primary" window is 5h on one plan
+        # and something else on another.
+        mins = w.get("window_minutes")
+        if label:
+            name = label
+        elif mins == 300:
+            name = "5h"
+        elif mins == 10080:
+            name = "week"
+        elif mins:
+            name = "%dh" % (mins // 60) if mins >= 60 else "%dm" % mins
+        else:
+            name = key
+        windows.append({
+            "window": name,
+            "left_percent": round(100.0 - float(used), 1),
+            "resets": None,
+            "resets_epoch": w.get("resets_at"),
+        })
+    # Unlike claude and agy, this reading is not taken now — it is whatever
+    # codex last wrote. After a day without running codex the percentages are
+    # a day old, and a window whose resets_at has already passed has in fact
+    # reset to full without anything recording it. Saying when it was read is
+    # the difference between a stale number and a wrong one.
+    stale = {"provider": "codex", "plan": rl.get("plan_type") or "",
+             "read_at": int(mtime), "from_disk": True}
+    if not windows:
+        credits = rl.get("credits")
+        if isinstance(credits, dict) and credits.get("unlimited"):
+            stale["windows"] = [{"window": "credits", "left_percent": 100.0,
+                                 "resets": None, "resets_epoch": None}]
+            return stale
+        return None
+    stale["windows"] = windows
+    return stale
+
+
+READERS = {"claude": read_claude, "codex": read_codex, "antigravity": read_agy}
+
+
+def read_all(providers=None, quiet=True):
+    """Every provider's remaining quota, as {provider: reading}.
+
+    A provider that cannot be read is omitted rather than recorded as zero:
+    "unknown" and "none left" must never look the same.
+
+    FORGE_NO_PLAN=1 disables every reading. The test suite sets it, because
+    `claude` and `agy` on PATH there are stubs that record the argv they were
+    called with: a second call to ask about quota overwrote the worker's own
+    argv and broke six unrelated tests. More generally, a plan figure is never
+    worth starting a provider CLI the caller did not expect.
+    """
+    if os.environ.get("FORGE_NO_PLAN") == "1":
+        return {}
+    want = providers if providers else list(READERS)
+    out = {}
+    for name in want:
+        fn = READERS.get(name)
+        if not fn:
+            continue
+        try:
+            r = fn()
+        except Exception as e:          # a provider CLI is not forge's code
+            if not quiet:
+                print("note: could not read %s plan: %s" % (name, e),
+                      file=sys.stderr)
+            r = None
+        if r:
+            out[name] = r
+    return out
+
+
+def delta(before, after):
+    """What one operation consumed, per provider and window.
+
+    Returns a list of dicts. `points` is the drop in percentage points —
+    positive means the operation consumed quota. A window present on only one
+    side is skipped: a reset between the two readings would otherwise show as
+    a large negative "gain".
+    """
+    rows = []
+    for prov, aft in (after or {}).items():
+        bef = (before or {}).get(prov)
+        if not bef:
+            continue
+        bw = {(w["window"], w.get("family")): w for w in bef["windows"]}
+        for w in aft["windows"]:
+            b = bw.get((w["window"], w.get("family")))
+            if not b:
+                continue
+            rows.append({
+                "provider": prov,
+                "window": w["window"],
+                "family": w.get("family"),
+                "before_left": b["left_percent"],
+                "after_left": w["left_percent"],
+                "points": round(b["left_percent"] - w["left_percent"], 1),
+                "resets": w.get("resets"),
+                "resets_epoch": w.get("resets_epoch"),
+            })
+    return rows
+
+
+def fmt_age(secs):
+    """How long ago a reading was taken, short."""
+    if secs < 90:
+        return "just now"
+    if secs < 5400:
+        return "%dm ago" % (secs // 60)
+    if secs < 172800:
+        return "%dh ago" % (secs // 3600)
+    return "%dd ago" % (secs // 86400)
+
+
+def fmt_reset(w):
+    """A reset time as something short and human, or ''."""
+    epoch = w.get("resets_epoch")
+    if epoch:
+        left = epoch - time.time()
+        if left <= 0:
+            # The window's reset time is in the past, so it has already
+            # refilled. The percentage beside it describes a window that no
+            # longer exists, which matters more than the timestamp.
+            return "reset since"
+        if left < 3600:
+            return "in %dm" % (left // 60)
+        if left < 86400:
+            return "in %dh %dm" % (left // 3600, (left % 3600) // 60)
+        return "in %dd %dh" % (left // 86400, (left % 86400) // 3600)
+    # Claude states a wall-clock time in prose ("Oct 31 at 3:10pm
+    # (Europe/Warsaw)"). The zone is the machine's own, so it carries no
+    # information for someone reading their own terminal — dropped to keep
+    # the column narrow enough not to truncate the time itself.
+    s = re.sub(r"\s*\([^)]*\)\s*$", "", (w.get("resets") or "")).strip()
+    # Claude already writes "Oct 31 at 3:09pm", so prefixing "at" would give
+    # "at Oct 31 at 3:09pm".
+    return s
+
+
+def bar(pct, width=10):
+    """A text gauge. Rounds up so a non-zero remainder never looks empty."""
+    filled = int(pct / 100.0 * width + 0.999)
+    return "#" * max(0, min(width, filled)) + "." * (width - max(0, min(width, filled)))
+
+
+def _load(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            return (json.load(f) or {}).get("providers") or {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _main_diff(args):
+    """What one operation consumed, printed for the worker's log.
+
+    Prints nothing at all when there is nothing to say: a worker's log is read
+    when something went wrong, and a line stating that an unmeasurable thing
+    measured zero is noise.
+    """
+    rows = delta(_load(args.diff[0]), _load(args.diff[1]))
+    if args.out:
+        try:
+            with open(args.out, "w", encoding="utf-8") as f:
+                json.dump({"at": int(time.time()), "windows": rows}, f, indent=1)
+        except OSError:
+            pass
+    if not rows:
+        return 0
+    print("=== plan used by this worker ===")
+    for r in rows:
+        fam = (r.get("family") or "")
+        name = r["window"] if not fam else "%s %s" % (fam, r["window"])
+        pts = r["points"]
+        if pts == 0.0:
+            # /usage reports whole percentage points, so a short worker really
+            # can consume nothing measurable. Saying "<1%" is true; saying
+            # "0%" would read as "this was free".
+            change = "<1% (below what the provider reports)"
+        elif pts < 0.0:
+            # More left after than before: the window refilled while the
+            # worker ran. Its cost is unknowable from these two readings —
+            # part of it was charged to a window that no longer exists. "<1%"
+            # here would be a plain falsehood.
+            change = "window reset mid-run — cost not measurable"
+        else:
+            change = "-%.1f points" % pts
+        print("    %-28s %5.1f%% -> %5.1f%% left   %s"
+              % (name[:28], r["before_left"], r["after_left"], change))
+    return 0
+
+
+def main():
+    ap = argparse.ArgumentParser(add_help=True)
+    ap.add_argument("--json", action="store_true",
+                    help="machine-readable output")
+    ap.add_argument("--provider", action="append",
+                    help="limit to one provider (repeatable)")
+    ap.add_argument("--diff", nargs=2, metavar=("BEFORE", "AFTER"),
+                    help="two --json readings: report what was consumed "
+                         "between them (used by forge-run)")
+    ap.add_argument("--out", metavar="FILE",
+                    help="with --diff, also write the result as JSON")
+    args = ap.parse_args()
+
+    if args.diff:
+        return _main_diff(args)
+
+    readings = read_all(args.provider, quiet=args.json)
+    if args.json:
+        print(json.dumps({"read_at": int(time.time()),
+                          "providers": readings}, indent=1))
+        return 0
+
+    if not readings:
+        print("no plan quota could be read.")
+        print("  codex   needs a session in ~/.codex/sessions")
+        print("  claude  needs the `claude` CLI and a subscription")
+        print("  agy     needs the `agy` CLI, signed in")
+        return 1
+
+    print("PLAN — how much is LEFT")
+    for prov in ("claude", "codex", "antigravity"):
+        r = readings.get(prov)
+        if not r:
+            continue
+        head = prov if not r["plan"] else "%s (%s)" % (prov, r["plan"])
+        if r.get("from_disk"):
+            age = int(time.time()) - r.get("read_at", 0)
+            head += "  — from its last session, %s" % fmt_age(age)
+        print("  %s" % head)
+        for w in r["windows"]:
+            fam = (w.get("family") or "")
+            name = w["window"] if not fam else "%s %s" % (fam, w["window"])
+            print("    %-30s %s %5.1f%% left  %s"
+                  % (name[:30], bar(w["left_percent"]), w["left_percent"],
+                     fmt_reset(w)))
+        if r.get("from_disk") and any(
+                w.get("resets_epoch") and w["resets_epoch"] <= time.time()
+                for w in r["windows"]):
+            print("      ('reset since' = that window refilled after this "
+                  "reading; run codex to refresh)")
+
+    missing = [p for p in READERS if p not in readings]
+    if missing:
+        print()
+        print("not reported: %s (CLI absent, not signed in, or no session yet)"
+              % ", ".join(sorted(missing)))
+    # Said every time: the two pools are easy to confuse, and confusing them
+    # is what makes someone think they have quota they do not have.
+    if "antigravity" in readings and "claude" in readings:
+        print()
+        print("note: antigravity's 'Claude and GPT models' pool is NOT your "
+              "Claude subscription —")
+        print("      the same model costs from a different plan depending on "
+              "the provider.")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

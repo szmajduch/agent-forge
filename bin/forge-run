@@ -107,6 +107,25 @@ esac
 agent_set "$name" status=running provider="$provider" started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "=== forge worker '$name' ($kind) — $provider — model: ${model:-provider default}${effort:+ — effort: $effort} — $(date) ===" > "$log"
 
+# Plan quota before the work, so what this one task cost can be stated in plan
+# terms and not only in tokens. Only this worker's own provider is asked: the
+# others cannot change because of it, and each reading costs 1-4s.
+#
+# Backgrounded deliberately. The worker starts immediately and the reading
+# lands while it runs — a provider CLI that is slow to start must not delay
+# the actual work. Failure is ignored (|| true): a missing plan figure is
+# worth less than the run.
+#
+# Run from $STATE, not from the worktree. `claude -p` writes its transcript to
+# a directory derived from the CWD, so reading the plan from inside the
+# worktree would drop a .jsonl beside the worker's own files — and forge-run
+# commits with `git add -A`, so it would land in the worker's commit.
+mkdir -p "$STATE/usage"
+plan_before="$STATE/usage/$name.plan-before.json"
+( cd "$STATE" && "$FORGE_HOME/bin/forge-plan" --json --provider "$provider" \
+    > "$plan_before" 2>/dev/null || true ) &
+plan_pid=$!
+
 set +e
 "$CMD" "${ARGS[@]}" 2>&1 | tee -a "$log"
 rc=${PIPESTATUS[0]}
@@ -222,6 +241,25 @@ else
   fi
 fi
 agent_set "$name" finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
+# Plan quota after the work. The "before" reading was backgrounded at startup,
+# so wait for it first — without that, a worker that finished in under a second
+# would compare against a file that is still being written.
+wait "$plan_pid" 2>/dev/null || true
+plan_after="$STATE/usage/$name.plan-after.json"
+( cd "$STATE" && "$FORGE_HOME/bin/forge-plan" --json --provider "$provider" \
+  > "$plan_after" 2>/dev/null || true )
+if [[ -s "$plan_before" && -s "$plan_after" ]]; then
+  # The delta is computed now, not at display time: the two readings are only
+  # comparable at this moment. By the time anyone looks, other workers and the
+  # operator's own sessions have moved the numbers.
+  #
+  # --diff lives in forge-plan rather than in a heredoc here so that it can be
+  # tested directly against saved fixtures.
+  "$FORGE_HOME/bin/forge-plan" --diff "$plan_before" "$plan_after" \
+    --out "$STATE/usage/$name.plan.json" 2>/dev/null | tee -a "$log" || true
+  rm -f "$plan_before" "$plan_after"
+fi
 
 # Keep the window open so the operator can look around; set FORGE_KEEP_WINDOW=0 to close.
 [[ "${FORGE_KEEP_WINDOW:-1}" == "1" ]] && exec "${SHELL:-bash}"

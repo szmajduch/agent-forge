@@ -109,4 +109,4 @@ jobs:
       # py_compile only proves these parse. The dashboard's behaviour is
       # covered by test/forge-dashboard-test, which the test job runs.
       - name: Check the Python scripts compile
-        run: python3 -m py_compile bin/forge-dashboard bin/forge-usage test/forge-dashboard-test || true
+        run: python3 -m py_compile bin/forge-dashboard bin/forge-usage bin/forge-plan test/forge-dashboard-test || true

@@ -526,7 +526,8 @@ six levels are accepted and a name outside the list is rejected.
 |---|---|
 | `forge-spawn [--model <m>] [--effort <level>] [--kind build\|analysis] [--base <ref>] [--link <path>] [--commands "<progs>"] <name> "<task>"` | branch `agent/<name>` + worktree + a worker in a new tmux window. The task may also come on stdin. `--model` only from `models.conf`. `--effort` = reasoning effort. `--kind analysis` = the worker writes a report instead of changing code. `--base` = a different starting point. `--link` = link a gitignored path. `--commands` = the subset of shell commands for this worker (`antigravity` only; must fit inside `commands.conf`). |
 | `forge-models [--workers]` | lists models with provider and role; `--workers` hides orchestrator-only models |
-| `forge-usage [--json] [--all] [--since <days>]` | token usage per provider and model + context/plan quota per session |
+| `forge-usage [--json] [--all] [--since <days>]` | token usage per provider and model + context held per session |
+| `forge-plan [--json] [--provider <name>]` | how much of each provider's plan is **left**, and when each window resets |
 | `forge-wait [names…] [--timeout s]` | waits for workers to finish, then shows status |
 | `forge-status [--json] [name]` | table of workers; with a name — the report and the last log lines |
 | `forge-review <name> [--stat]` | the worker's report, commits and diff against its starting point |
@@ -721,10 +722,87 @@ plus its acceptance check, so uncontrolled fan-out can take the machine down.
 Raise it with `FORGE_MAX_WORKERS=6`, or bypass it once with `--force`.
 `FORGE_MAX_WORKERS=0` disables the limit.
 
+## How much plan is left
+
+```bash
+forge-plan                   # every provider: how much quota REMAINS
+forge-plan --provider claude # one provider only
+forge-plan --json            # for scripts
+```
+
+```
+PLAN — how much is LEFT
+  claude (subscription)
+    session                        #######...  70.0% left  Oct 31 at 3:09pm
+    week                           ########..  78.0% left  Nov 5 at 5:59am
+  codex (plus)  — from its last session, 11h ago
+    5h                             ##########  99.0% left  reset since
+    week                           ######....  59.0% left  in 4d 4h
+  antigravity (antigravity)
+    Gemini Models week             ########## 100.0% left  in 6d 6h
+    Claude and GPT models week     ########..  77.0% left  in 6d 6h
+```
+
+This answers "how much do I have left", which is a different question from
+"what did I spend" — see **Token usage** below for the latter. Each provider
+is asked differently, and the differences matter:
+
+| | source | costs | leaves a file |
+|---|---|---|---|
+| `codex` | its own session logs, already on disk | nothing, no process started | — |
+| `claude` | `claude -p "/usage"` | measured: `num_turns` 0, `total_cost_usd` 0, `duration_api_ms` 0 — handled locally, never reaches the model, so asking does not consume what it reports | one transcript, which forge deletes |
+| `agy` | `agy -p "/usage"` | same: 0 turns, 0 tokens | nothing at all |
+
+Three details worth knowing:
+
+- **codex is not read live.** Its figures are whatever the CLI last wrote, so
+  the heading says how old they are, and a window whose reset time has already
+  passed is marked `reset since` rather than presented as current.
+- **antigravity's pools are separate from your Claude subscription.** Its
+  "Claude and GPT models" quota is antigravity's own: the same model reached
+  through `opus` and through `agy-opus` draws on two different plans. They are
+  shown as separate rows and never summed.
+- **The percentages are whole numbers**, because that is all the providers
+  report. There is no finer field to read.
+
+`FORGE_NO_PLAN=1` disables every reading, and `FORGE_DASH_PLAN=0` hides the
+tile without affecting the command. The test suite sets `FORGE_NO_PLAN=1`: a
+suite must not touch the operator's account.
+
+### What one worker cost
+
+`forge-run` reads its own provider's quota before and after the work and puts
+the difference in the worker's log:
+
+```
+=== plan used by this worker ===
+    session                       70.0% ->  64.0% left   -6.0 points
+    week                          78.0% ->  78.0% left   <1% (below what the provider reports)
+```
+
+Only that worker's provider is asked, the "before" reading is backgrounded so
+it cannot delay the start, and the reading runs from `.forge/` rather than the
+worktree — `claude -p` writes its transcript next to the current directory,
+and `forge-run` commits with `git add -A`, so reading from the worktree would
+have committed a transcript into the worker's own commit.
+
+Two cases are stated rather than rounded away, because rounding either one
+would be a falsehood:
+
+- a window that did not move says `<1%`, never `0%` — a short worker genuinely
+  costs less than the provider reports, but it is not free;
+- a window that **refilled** mid-run says `window reset mid-run — cost not
+  measurable`, because part of the cost was charged to a window that no longer
+  exists.
+
+Deltas overlap when workers run in parallel: with three workers at once, each
+one's figure includes the other two. The number is the plan's movement during
+that worker, not that worker's isolated cost.
+
 ## Token usage
 
 ```bash
-forge-usage                  # this project: per model + context/quota per session
+forge-usage                  # this project: per model, plus context held per session
 forge-usage --all            # all local sessions, not just this repo
 forge-usage --since 7        # the last 7 days only
 forge-usage --json           # for scripts
@@ -732,7 +810,15 @@ forge-usage --json           # for scripts
 
 Nothing calls an API and no key is needed — only the local session logs each
 CLI writes anyway are read. The same data appears on the dashboard in the
-**Tokens** tile.
+**Tokens** tile, with remaining quota in **Plan left**.
+
+`CONTEXT HELD` is how full a session's context window is, which is what
+decides when it must compact. It used to sit beside a `PLAN QUOTA` column,
+which was wrong and has been removed: plan quota is one account-wide pool, so
+printing it per session showed the same pool as `1.0% used` next to
+`67.0% used` — those were readings of different ages, not different
+allowances, and the lower, older, more reassuring one was the wrong answer.
+Remaining quota now comes from `forge-plan`, which takes the newest reading.
 
 **Data quality differs per provider**, and that is not forge's decision but
 what the providers record at all:

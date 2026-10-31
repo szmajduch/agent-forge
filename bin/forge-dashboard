@@ -25,6 +25,7 @@ token, if set) can act — forge-up warns about that at startup.
 import argparse
 import glob
 import importlib.machinery
+import importlib.util
 import hmac
 import json
 import os
@@ -137,6 +138,67 @@ _USAGE_MOD = None
 _USAGE_CACHE = {"value": None, "at": 0.0}
 _USAGE_TTL = 30.0
 
+_PLAN_MOD = None
+_PLAN_CACHE = {"value": None, "at": 0.0}
+# Far longer than _USAGE_TTL, because a plan reading STARTS A PROCESS: measured
+# 1.2s for `claude -p /usage` and ~4s for `agy -p /usage`. At the page's 3s
+# poll an uncached read would mean a provider CLI running permanently. Plan
+# windows are 5 hours and a week, so 5 minutes is far finer than the thing
+# being measured.
+_PLAN_TTL = 300.0
+_PLAN_LOCK = threading.Lock()
+
+
+def plan_summary():
+    """How much of each provider's plan is left, cached.
+
+    Returns {"providers": {...}, "read_at": epoch} or {"off": True} when
+    disabled. Never raises: the page must render without it.
+    """
+    global _PLAN_MOD
+    if os.environ.get("FORGE_DASH_PLAN", "1") != "1":
+        return {"off": True, "reason": "FORGE_DASH_PLAN=0"}
+    now = time.monotonic()
+    if _PLAN_CACHE["value"] is not None and now - _PLAN_CACHE["at"] < _PLAN_TTL:
+        return _PLAN_CACHE["value"]
+    # One reader at a time. Under ThreadingHTTPServer several polls arrive at
+    # once, and without this each would start its own `claude -p` the moment
+    # the cache expired.
+    with _PLAN_LOCK:
+        now = time.monotonic()
+        if (_PLAN_CACHE["value"] is not None
+                and now - _PLAN_CACHE["at"] < _PLAN_TTL):
+            return _PLAN_CACHE["value"]
+        value = {"providers": {}, "read_at": int(time.time())}
+        try:
+            if _PLAN_MOD is None:
+                loader = importlib.machinery.SourceFileLoader(
+                    "forge_plan", os.path.join(BIN, "forge-plan"))
+                spec = importlib.util.spec_from_loader("forge_plan", loader)
+                _PLAN_MOD = importlib.util.module_from_spec(spec)
+                argv = sys.argv
+                sys.argv = ["forge-plan"]
+                try:
+                    loader.exec_module(_PLAN_MOD)
+                finally:
+                    sys.argv = argv
+            readings = _PLAN_MOD.read_all()
+            for prov, r in readings.items():
+                value["providers"][prov] = {
+                    "plan": r.get("plan") or "",
+                    "from_disk": bool(r.get("from_disk")),
+                    "read_at": r.get("read_at"),
+                    "windows": [
+                        {"window": w["window"], "family": w.get("family"),
+                         "left": w["left_percent"],
+                         "reset": _PLAN_MOD.fmt_reset(w)}
+                        for w in r["windows"]],
+                }
+        except Exception as e:
+            value["error"] = f"{type(e).__name__}: {e}"
+        _PLAN_CACHE.update(value=value, at=now)
+        return value
+
 
 def usage_summary():
     """Token usage per provider+model, plus the live sessions' context/quota.
@@ -170,14 +232,17 @@ def usage_summary():
                 win = r["context_window"]
                 held = r["last_total"]
                 pct = round(100.0 * held / win, 1) if win and held <= win else None
-                quota = r.get("quota") or {}
+                # No per-session quota here. Plan quota is ONE account-wide
+                # pool, so printing it in a per-session row showed the same
+                # pool as "1.0% used" beside "67.0% used" — those were
+                # readings of different ages, not different allowances. It
+                # now lives in plan_summary(), read once, newest wins.
                 value["sessions"].append({
                     "provider": r["provider"],
                     "model": _USAGE_MOD._display_model(r["model"]),
                     "session": r["session"][:20],
                     "context_pct": pct,
                     "context_window": win,
-                    "quota_pct": quota.get("used_percent"),
                 })
         except Exception as e:
             value["error"] = f"{type(e).__name__}: {e}"
@@ -237,6 +302,7 @@ def build_state():
         "head": git("log", "--oneline", "-6"),
         "agents": agents,
         "usage": usage_summary(),
+        "plan": plan_summary(),
         "feedback": feedback,
         "logs": SHOW_LOGS,
         "actions": ACTIONS,
@@ -494,6 +560,7 @@ color:var(--ink);border:1px solid var(--line);border-radius:5px}
 <textarea id="text" placeholder="What should change? The orchestrator reads this before the next round."></textarea>
 <button id="send">Send</button> <span class="sub" id="sent"></span>
 <div id="fbl" style="margin-top:12px"></div></div>
+<div class="card" style="margin-top:12px"><h2>Plan left</h2><div id="plan"></div></div>
 <div class="card" style="margin-top:12px"><h2>Tokens</h2><div id="usage"></div></div>
 <div class="card" style="margin-top:12px"><h2>Main branch</h2><pre id="head"></pre></div>
 </aside></main>
@@ -517,23 +584,66 @@ function renderUsage(u){
     box.appendChild(r);
   }
   if(u.sessions.length){
-    box.appendChild(el('div','uh','context / plan'));
+    box.appendChild(el('div','uh','context held, per session'));
     for(const sx of u.sessions){
       const r=el('div','u');
       r.appendChild(el('span','',sx.provider+' '+(sx.model||'?')));
-      // A null percentage means the window or quota was not stated: say so
+      // A null percentage means the context window was not stated: say so
       // rather than drawing a bar that implies a measurement.
-      const bits=[];
-      if(sx.context_pct!=null)bits.push('ctx '+sx.context_pct+'%');
-      if(sx.quota_pct!=null)bits.push('plan '+sx.quota_pct+'%');
-      r.appendChild(el('span','m',bits.length?bits.join(' · '):'n/a'));
+      r.appendChild(el('span','m',sx.context_pct!=null?sx.context_pct+'%':'n/a'));
       box.appendChild(r);
-      const worst=Math.max(sx.context_pct!=null?sx.context_pct:0,sx.quota_pct!=null?sx.quota_pct:0);
-      if(worst>0){
-        const b=el('div','bar'+(worst>=85?' hi':worst>=60?' mid':''));
-        const i=el('i');i.style.width=Math.min(100,worst)+'%';b.appendChild(i);box.appendChild(b);
+      if(sx.context_pct>0){
+        const p=sx.context_pct;
+        const b=el('div','bar'+(p>=85?' hi':p>=60?' mid':''));
+        const i=el('i');i.style.width=Math.min(100,p)+'%';b.appendChild(i);box.appendChild(b);
       }
     }
+  }
+}
+
+// How much of each plan is LEFT. Separate from renderUsage because it answers
+// a different question: tokens say what was spent, this says what remains.
+// The bar fills with what is left, and goes red when LITTLE is left — the
+// opposite sense to the context bars above, which fill as they get worse.
+function renderPlan(p){
+  const box=document.getElementById('plan');
+  box.replaceChildren();
+  if(!p||p.off){
+    box.appendChild(el('div','m','off'));
+    return;
+  }
+  if(p.error){box.appendChild(el('div','m','could not read: '+p.error));return}
+  const provs=Object.keys(p.providers||{});
+  if(!provs.length){
+    box.appendChild(el('div','m','no plan quota reported — no provider CLI '
+      +'is signed in, or none has run yet'));
+    return;
+  }
+  for(const name of ['claude','codex','antigravity']){
+    const r=p.providers[name];
+    if(!r)continue;
+    let head=name+(r.plan?' ('+r.plan+')':'');
+    box.appendChild(el('div','uh',head));
+    if(r.from_disk){
+      // codex is read from its own session files, not asked now. Without
+      // this the page would present a day-old number as current.
+      box.appendChild(el('div','m','from its last session, not read live'));
+    }
+    for(const w of r.windows){
+      const label=(w.family?w.family+' ':'')+w.window;
+      const row=el('div','u');
+      row.appendChild(el('span','',label));
+      row.appendChild(el('b','',w.left+'% left'));
+      box.appendChild(row);
+      const b=el('div','bar'+(w.left<=15?' hi':w.left<=40?' mid':''));
+      const i=el('i');i.style.width=Math.max(0,Math.min(100,w.left))+'%';
+      b.appendChild(i);box.appendChild(b);
+      if(w.reset)box.appendChild(el('div','m','resets '+w.reset));
+    }
+  }
+  if(p.providers.antigravity&&p.providers.claude){
+    box.appendChild(el('div','m',"antigravity's ‘Claude and GPT models’ "
+      +'is its own pool, not your Claude subscription'));
   }
 }
 try{document.getElementById('author').value=localStorage.getItem('forge-author')||''}catch(e){}
@@ -590,6 +700,7 @@ async function load(){
   try{const r=await fetch(q('/api/state'),{cache:'no-store'});if(!r.ok)throw r.status;const s=await r.json();
   ACTIONS_ON=!!s.actions;
   renderUsage(s.usage);
+  renderPlan(s.plan);
   document.getElementById('repo').textContent='/ '+s.repo;
   document.getElementById('meta').textContent=s.branch+' · updated '+s.now;
   document.getElementById('head').textContent=s.head;
