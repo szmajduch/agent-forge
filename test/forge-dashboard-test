@@ -21,6 +21,7 @@ developer's ~/.codex sessions, a signed-in CLI); see test_usage_degrades.
 """
 import json
 import os
+import ast
 import re
 import shutil
 import socket
@@ -830,6 +831,100 @@ class TestRateLimitBuckets(DashboardCase):
         code, _, _ = self.get("/api/state",
                               headers={"X-Forwarded-For": "127.0.0.1"})
         self.assertEqual(200, code)
+
+
+class TestPlanIsNeverReadInTheRequestPath(unittest.TestCase):
+    """A request must not wait on a provider CLI.
+
+    Regression, measured on a real dashboard: plan_summary() used to read the
+    providers inline, so the first /api/state after each cache period took
+    5.886s while the page polls every 3s. Warm requests took 0.030s — a 200x
+    difference the operator experienced as the page freezing. The reading now
+    happens in a background thread and a request only returns what that thread
+    last stored.
+
+    Asserted structurally rather than by timing: a timing test on a CI runner
+    either needs a real provider CLI or proves nothing.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        with open(DASHBOARD, encoding="utf-8") as f:
+            cls.src = f.read()
+        cls.tree = ast.parse(cls.src)
+
+    def _func(self, name):
+        for node in ast.walk(self.tree):
+            if isinstance(node, ast.FunctionDef) and node.name == name:
+                return node
+        self.fail("%s() is gone from forge-dashboard" % name)
+
+    def test_plan_summary_starts_nothing(self):
+        """It may read the cache and the environment, nothing else."""
+        fn = self._func("plan_summary")
+        body = ast.unparse(fn)
+        for forbidden in ("read_all", "_plan_read_now", "subprocess",
+                          "_plan_mod"):
+            self.assertNotIn(
+                forbidden, body,
+                "plan_summary() references %s, so a request can block on a "
+                "provider CLI again" % forbidden)
+
+    def test_a_refresher_exists_and_is_a_daemon(self):
+        """The thread must not outlive the server.
+
+        If it were non-daemon, killing the dashboard would leave a process
+        calling provider CLIs for a dashboard nobody is running — and the
+        operator asked about exactly this.
+        """
+        self._func("plan_refresher")
+        m = re.search(r"threading\.Thread\(([^)]*)\)", self.src, re.S)
+        self.assertTrue(m, "no thread is started for the plan refresher")
+        self.assertIn("daemon=True", m.group(1),
+                      "the refresher thread is not a daemon, so it would "
+                      "survive the dashboard it belongs to")
+
+    def test_the_refresher_backs_off_when_idle(self):
+        """Fast while workers run, slow when nothing can change.
+
+        Plan windows are 5 hours and a week and the percentages are whole
+        numbers, so an idle repo cannot move the figure — and every reading
+        starts two CLIs.
+        """
+        body = ast.unparse(self._func("plan_refresher"))
+        self.assertIn("_workers_running", body,
+                      "the refresher does not check whether any worker is "
+                      "running, so it polls at the same rate when idle")
+        self.assertIn("_PLAN_INTERVAL_IDLE", body,
+                      "the refresher has no idle interval")
+
+
+class TestPlanCacheFile(DashboardCase):
+    """The reading is written where forge-plan can reuse it."""
+
+    def test_api_state_carries_a_plan_object(self):
+        status, body, _ = self.get("/api/state")
+        self.assertEqual(200, status)
+        state = json.loads(body)
+        self.assertIn("plan", state, "/api/state no longer reports the plan")
+        # "pending", "off", a reading or an error are all correct depending on
+        # timing and configuration; what must never happen is the key being
+        # absent or the request hanging.
+        self.assertIsInstance(state["plan"], dict,
+                              "plan is not an object: %r" % (state["plan"],))
+
+    def test_state_is_fast_even_on_the_first_request(self):
+        """The whole point: no request pays for a provider CLI.
+
+        A real reading takes seconds. If the request path waited for it, this
+        would fail.
+        """
+        t = time.monotonic()
+        self.get("/api/state")
+        elapsed = time.monotonic() - t
+        self.assertLess(elapsed, 3.0,
+                        "/api/state took %.2fs — a request is waiting on the "
+                        "plan reading again" % elapsed)
 
 
 class TestStartupDoesNotNeedDNS(unittest.TestCase):

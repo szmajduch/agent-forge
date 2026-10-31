@@ -448,6 +448,66 @@ def _main_diff(args):
     return 0
 
 
+# The dashboard writes its background reading here; see plan_refresher in
+# bin/forge-dashboard. Reusing it is what makes `forge-plan` instant while a
+# dashboard is up.
+CACHE_MAX_AGE = 120.0
+
+
+def _cache_path():
+    """.forge/usage/plan.json for the repo containing the current directory."""
+    d = os.path.abspath(os.getcwd())
+    while True:
+        candidate = os.path.join(d, ".forge", "usage", "plan.json")
+        if os.path.exists(candidate):
+            return candidate
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _cached_readings(providers=None):
+    """The dashboard's reading if it is fresh enough, else None.
+
+    Deliberately strict about age: a stale figure presented as current is
+    worse than taking the time to read again. CACHE_MAX_AGE is four times the
+    busy refresh interval, so an alive refresher always satisfies it and a
+    dead one never does.
+    """
+    path = _cache_path()
+    if not path:
+        return None
+    try:
+        if time.time() - os.path.getmtime(path) > CACHE_MAX_AGE:
+            return None
+        with open(path, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, ValueError):
+        return None
+    provs = (value or {}).get("providers")
+    if not isinstance(provs, dict) or not provs:
+        return None
+    # The cache stores display shapes (left, reset as text); rebuild what the
+    # printer expects, keeping the strings the dashboard already formatted.
+    out = {}
+    for name, r in provs.items():
+        if providers and name not in providers:
+            continue
+        out[name] = {
+            "provider": name,
+            "plan": r.get("plan") or "",
+            "from_disk": bool(r.get("from_disk")),
+            "read_at": r.get("read_at"),
+            "cached": True,
+            "windows": [{"window": w.get("window"), "family": w.get("family"),
+                         "left_percent": w.get("left"),
+                         "resets": w.get("reset"), "resets_epoch": None}
+                        for w in (r.get("windows") or [])],
+        }
+    return out or None
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("--json", action="store_true",
@@ -459,12 +519,25 @@ def main():
                          "between them (used by forge-run)")
     ap.add_argument("--out", metavar="FILE",
                     help="with --diff, also write the result as JSON")
+    ap.add_argument("--fresh", action="store_true",
+                    help="ignore the dashboard's cache and read the providers "
+                         "now (slower: it starts a CLI per provider)")
     args = ap.parse_args()
 
     if args.diff:
         return _main_diff(args)
 
-    readings = read_all(args.provider, quiet=args.json)
+    # Reuse the dashboard's reading when it is recent. A reading starts a
+    # provider CLI per provider (4.5-5.9s together, measured), and a running
+    # dashboard already refreshes every 30s while workers run — so asking
+    # again usually costs seconds to learn what is already on disk.
+    readings = None
+    if not args.fresh:
+        cached = _cached_readings(args.provider)
+        if cached is not None:
+            readings = cached
+    if readings is None:
+        readings = read_all(args.provider, quiet=args.json)
     if args.json:
         print(json.dumps({"read_at": int(time.time()),
                           "providers": readings}, indent=1))
@@ -483,6 +556,11 @@ def main():
         if not r:
             continue
         head = prov if not r["plan"] else "%s (%s)" % (prov, r["plan"])
+        if r.get("cached"):
+            # Say where the figure came from. Without this, a reading taken by
+            # the dashboard up to CACHE_MAX_AGE ago is indistinguishable from
+            # one taken this second, and --fresh looks like it does nothing.
+            head += "  — from the dashboard's last refresh"
         if r.get("from_disk"):
             age = int(time.time()) - r.get("read_at", 0)
             head += "  — from its last session, %s" % fmt_age(age)

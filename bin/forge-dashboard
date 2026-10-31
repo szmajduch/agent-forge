@@ -139,65 +139,144 @@ _USAGE_CACHE = {"value": None, "at": 0.0}
 _USAGE_TTL = 30.0
 
 _PLAN_MOD = None
-_PLAN_CACHE = {"value": None, "at": 0.0}
-# Far longer than _USAGE_TTL, because a plan reading STARTS A PROCESS: measured
-# 1.2s for `claude -p /usage` and ~4s for `agy -p /usage`. At the page's 3s
-# poll an uncached read would mean a provider CLI running permanently. Plan
-# windows are 5 hours and a week, so 5 minutes is far finer than the thing
-# being measured.
-_PLAN_TTL = 300.0
+# The plan reading lives here, refreshed by a background thread, and a request
+# only ever reads it. That is not a nicety: a reading STARTS PROVIDER
+# PROCESSES, measured at 4.5-5.9s for claude -p plus agy -p together, and it
+# used to run inside the request path. One /api/state in every cache period
+# therefore blocked for ~6s while the page kept polling every 3s. Measured on
+# a real dashboard: 5.886s cold, 0.030s warm — a 200x difference that the
+# operator saw as the page freezing.
+_PLAN_CACHE = {"value": None, "at": 0.0, "reading": False}
 _PLAN_LOCK = threading.Lock()
+
+# How often the thread re-reads, by whether there is anything to see. Plan
+# windows are 5 hours and a week and the percentages are whole numbers, so
+# nothing moves while no worker is running — but while one is, the figure does
+# change from minute to minute and that is exactly when it is worth watching.
+_PLAN_INTERVAL_BUSY = float(os.environ.get("FORGE_PLAN_INTERVAL", "30"))
+_PLAN_INTERVAL_IDLE = float(os.environ.get("FORGE_PLAN_INTERVAL_IDLE", "300"))
+
+# Written so forge-plan in a terminal can reuse a fresh reading instead of
+# starting the CLIs again, and so the figures survive a dashboard restart.
+PLAN_CACHE_FILE = os.path.join(STATE, "usage", "plan.json")
+
+
+def _plan_mod():
+    """forge-plan imported as a module, once."""
+    global _PLAN_MOD
+    if _PLAN_MOD is None:
+        loader = importlib.machinery.SourceFileLoader(
+            "forge_plan", os.path.join(BIN, "forge-plan"))
+        spec = importlib.util.spec_from_loader("forge_plan", loader)
+        mod = importlib.util.module_from_spec(spec)
+        argv = sys.argv
+        sys.argv = ["forge-plan"]
+        try:
+            loader.exec_module(mod)
+        finally:
+            sys.argv = argv
+        _PLAN_MOD = mod
+    return _PLAN_MOD
+
+
+def _plan_read_now():
+    """Read every provider. Slow by nature — only the thread calls this."""
+    value = {"providers": {}, "read_at": int(time.time())}
+    try:
+        mod = _plan_mod()
+        for prov, r in mod.read_all().items():
+            value["providers"][prov] = {
+                "plan": r.get("plan") or "",
+                "from_disk": bool(r.get("from_disk")),
+                "read_at": r.get("read_at"),
+                "windows": [
+                    {"window": w["window"], "family": w.get("family"),
+                     "left": w["left_percent"],
+                     "reset": mod.fmt_reset(w)}
+                    for w in r["windows"]],
+            }
+    except Exception as e:
+        value["error"] = f"{type(e).__name__}: {e}"
+    return value
+
+
+def _workers_running():
+    """True when any agent is queued or running.
+
+    Read from the state files rather than from the cached page state, so the
+    thread does not depend on anyone having loaded the page.
+    """
+    try:
+        for path in glob.glob(os.path.join(STATE, "agents", "*.json")):
+            try:
+                with open(path, encoding="utf-8") as f:
+                    if (json.load(f) or {}).get("status") in ("queued",
+                                                              "running"):
+                        return True
+            except (OSError, ValueError):
+                continue
+    except OSError:
+        pass
+    return False
+
+
+def _plan_store(value):
+    with _PLAN_LOCK:
+        _PLAN_CACHE.update(value=value, at=time.monotonic())
+    # Best effort: the figures are useful in memory even if the file cannot be
+    # written (a read-only checkout, a repo without .forge yet).
+    try:
+        os.makedirs(os.path.dirname(PLAN_CACHE_FILE), exist_ok=True)
+        tmp = PLAN_CACHE_FILE + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(value, f, indent=1)
+        os.replace(tmp, PLAN_CACHE_FILE)   # atomic: a reader never sees half
+    except OSError:
+        pass
+
+
+def _plan_load_from_disk():
+    """Seed the cache from the last run, so a restart is not blank."""
+    try:
+        with open(PLAN_CACHE_FILE, encoding="utf-8") as f:
+            value = json.load(f)
+    except (OSError, ValueError):
+        return
+    if isinstance(value, dict) and value.get("providers"):
+        with _PLAN_LOCK:
+            if _PLAN_CACHE["value"] is None:
+                _PLAN_CACHE.update(value=value, at=time.monotonic())
+
+
+def plan_refresher():
+    """Keep _PLAN_CACHE current. Runs as a daemon thread for the server's life.
+
+    Never raises: a failed reading leaves the previous one in place, with its
+    own read_at, so the page can say how old it is instead of going blank.
+    """
+    while True:
+        try:
+            _plan_store(_plan_read_now())
+        except Exception:
+            pass
+        busy = _workers_running()
+        time.sleep(_PLAN_INTERVAL_BUSY if busy else _PLAN_INTERVAL_IDLE)
 
 
 def plan_summary():
-    """How much of each provider's plan is left, cached.
+    """Whatever the refresher last read. Never starts a process, never blocks.
 
-    Returns {"providers": {...}, "read_at": epoch} or {"off": True} when
-    disabled. Never raises: the page must render without it.
+    A request must not wait on a provider CLI, so this returns the cache as it
+    is — including the "not read yet" state during the first few seconds after
+    startup, which the page shows as such rather than as "no quota".
     """
-    global _PLAN_MOD
     if os.environ.get("FORGE_DASH_PLAN", "1") != "1":
         return {"off": True, "reason": "FORGE_DASH_PLAN=0"}
-    now = time.monotonic()
-    if _PLAN_CACHE["value"] is not None and now - _PLAN_CACHE["at"] < _PLAN_TTL:
-        return _PLAN_CACHE["value"]
-    # One reader at a time. Under ThreadingHTTPServer several polls arrive at
-    # once, and without this each would start its own `claude -p` the moment
-    # the cache expired.
     with _PLAN_LOCK:
-        now = time.monotonic()
-        if (_PLAN_CACHE["value"] is not None
-                and now - _PLAN_CACHE["at"] < _PLAN_TTL):
-            return _PLAN_CACHE["value"]
-        value = {"providers": {}, "read_at": int(time.time())}
-        try:
-            if _PLAN_MOD is None:
-                loader = importlib.machinery.SourceFileLoader(
-                    "forge_plan", os.path.join(BIN, "forge-plan"))
-                spec = importlib.util.spec_from_loader("forge_plan", loader)
-                _PLAN_MOD = importlib.util.module_from_spec(spec)
-                argv = sys.argv
-                sys.argv = ["forge-plan"]
-                try:
-                    loader.exec_module(_PLAN_MOD)
-                finally:
-                    sys.argv = argv
-            readings = _PLAN_MOD.read_all()
-            for prov, r in readings.items():
-                value["providers"][prov] = {
-                    "plan": r.get("plan") or "",
-                    "from_disk": bool(r.get("from_disk")),
-                    "read_at": r.get("read_at"),
-                    "windows": [
-                        {"window": w["window"], "family": w.get("family"),
-                         "left": w["left_percent"],
-                         "reset": _PLAN_MOD.fmt_reset(w)}
-                        for w in r["windows"]],
-                }
-        except Exception as e:
-            value["error"] = f"{type(e).__name__}: {e}"
-        _PLAN_CACHE.update(value=value, at=now)
-        return value
+        value = _PLAN_CACHE["value"]
+    if value is None:
+        return {"pending": True}
+    return value
 
 
 def usage_summary():
@@ -641,6 +720,15 @@ function renderPlan(p){
       if(w.reset)box.appendChild(el('div','m','resets '+w.reset));
     }
   }
+  // How old the figures are. With a background refresher a stale reading
+  // looks exactly like a fresh one, so the age is shown — and called out
+  // when it is old enough to mean the refresher itself stopped.
+  if(p.read_at){
+    const age=Math.max(0,Math.round(Date.now()/1000-p.read_at));
+    box.appendChild(el('div','m','read '+(age<90?age+'s':Math.round(age/60)+'m')+' ago'
+      +(age>600?' — refresher may have stopped':'')));
+  }
+  if(p.error)box.appendChild(el('div','m','last read failed: '+p.error));
   if(p.providers.antigravity&&p.providers.claude){
     box.appendChild(el('div','m',"antigravity's ‘Claude and GPT models’ "
       +'is its own pool, not your Claude subscription'));
@@ -761,7 +849,23 @@ class Server(ThreadingHTTPServer):
 
 if __name__ == "__main__":
     srv = Server((args.host, args.port), H)
+    if os.environ.get("FORGE_DASH_PLAN", "1") == "1":
+        # daemon=True on purpose: the refresher must not outlive the server.
+        # Kill the dashboard — Ctrl-C, closing its tmux window, pkill — and
+        # this thread goes with the process, leaving no orphan that keeps
+        # calling provider CLIs for a dashboard nobody is running. It is also
+        # why the loop needs no shutdown handshake: there is nothing to stop.
+        _plan_load_from_disk()      # show the last known figures immediately
+        threading.Thread(target=plan_refresher, daemon=True,
+                         name="forge-plan-refresher").start()
+        print("plan: refreshing every %gs while workers run, %gs when idle"
+              % (_PLAN_INTERVAL_BUSY, _PLAN_INTERVAL_IDLE))
     print(f"forge dashboard: http://{args.host}:{args.port}" + (" (token required)" if TOKEN else ""))
+    # Flushed because these lines are the only startup confirmation the
+    # operator gets, and Python buffers stdout whenever it is not a terminal
+    # — a redirected log or a piped tmux pane would hold them until the
+    # process dies, i.e. exactly when they are no longer useful.
+    sys.stdout.flush()
     if ACTIONS:
         print("actions ENABLED: cancel / merge / retry run from the page")
         # The action gate is the opt-in, not the address, so a tunnel makes

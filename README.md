@@ -779,9 +779,36 @@ Three details worth knowing:
 - **The percentages are whole numbers**, because that is all the providers
   report. There is no finer field to read.
 
-`FORGE_NO_PLAN=1` disables every reading, and `FORGE_DASH_PLAN=0` hides the
-tile without affecting the command. The test suite sets `FORGE_NO_PLAN=1`: a
-suite must not touch the operator's account.
+### Who does the reading
+
+The dashboard refreshes the figures in a **background thread**, not in the
+request path. That matters because a reading starts a provider CLI per
+provider — measured at 4.5–5.9s for `claude -p` plus `agy -p` together — and
+it used to run inline: the first `/api/state` after each cache period took
+**5.886s** while the page polls every 3s, against **0.030s** warm. The page
+appeared to freeze once every few minutes.
+
+The thread re-reads every **30s while any worker is queued or running**, and
+every **5 minutes when none is** — plan windows are 5 hours and a week and the
+percentages are whole numbers, so an idle repo cannot move the figure, and
+every reading costs two processes. Both intervals are settable with
+`FORGE_PLAN_INTERVAL` and `FORGE_PLAN_INTERVAL_IDLE`.
+
+It is a **daemon thread**, so it dies with the dashboard: closing the window,
+`Ctrl-C` or `pkill` leaves no orphan calling provider CLIs for a dashboard
+nobody is running. There is no separate process to start, stop or clean up.
+
+Each reading is written to `.forge/usage/plan.json`, which gives two things:
+the tile shows the last known figures the moment the page loads instead of
+going blank after a restart, and `forge-plan` in a terminal reuses a reading
+under two minutes old instead of starting the CLIs again. It says when it
+does; `forge-plan --fresh` forces a live read. While a reading is in flight at
+startup the tile says `reading...`, and it always shows how old the figures
+are — a stale reading looks exactly like a fresh one otherwise.
+
+`FORGE_NO_PLAN=1` disables every reading, and `FORGE_DASH_PLAN=0` turns off
+the tile and its thread without affecting the command. The test suite sets
+`FORGE_NO_PLAN=1`: a suite must not touch the operator's account.
 
 ### What one worker cost
 
