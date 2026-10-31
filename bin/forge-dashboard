@@ -253,14 +253,32 @@ def plan_refresher():
 
     Never raises: a failed reading leaves the previous one in place, with its
     own read_at, so the page can say how old it is instead of going blank.
+
+    The wait is broken into short slices and the worker check happens in every
+    one of them. A single sleep of the idle interval was wrong, and measurably
+    so: a worker spawned a second into a 300s idle sleep ran for 20 seconds,
+    failed, and the thread never noticed — it woke up 300s later to find
+    nothing running and slept again. The busy interval could not take effect
+    during the only period it was meant for. Re-checking every few seconds
+    costs one glob of .forge/agents, no process at all.
     """
     while True:
         try:
             _plan_store(_plan_read_now())
         except Exception:
             pass
-        busy = _workers_running()
-        time.sleep(_PLAN_INTERVAL_BUSY if busy else _PLAN_INTERVAL_IDLE)
+        # Slice short enough to catch a worker that lives a few seconds, and
+        # never longer than the busy interval itself.
+        slice_s = min(5.0, max(1.0, _PLAN_INTERVAL_BUSY))
+        waited = 0.0
+        while True:
+            target = (_PLAN_INTERVAL_BUSY if _workers_running()
+                      else _PLAN_INTERVAL_IDLE)
+            if waited >= target:
+                break
+            step = min(slice_s, target - waited)
+            time.sleep(step)
+            waited += step
 
 
 def plan_summary():
