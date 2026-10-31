@@ -832,6 +832,93 @@ class TestRateLimitBuckets(DashboardCase):
         self.assertEqual(200, code)
 
 
+class TestStartupDoesNotNeedDNS(unittest.TestCase):
+    """The dashboard must bind without consulting a resolver.
+
+    Regression, measured on the macOS GitHub runner: ten dashboards in a row
+    never answered. Every one reported `port accepting: False` with
+    `URLError: <urlopen error timed out>`, the process alive and nothing
+    printed — and a port that nothing listens on gives an instant
+    ECONNREFUSED, not a timeout, so the socket existed while no one accepted
+    from it.
+
+    The cause was http.server.HTTPServer.server_bind(), which calls
+    socket.getfqdn(host) — a REVERSE DNS lookup — between bind() and
+    serve_forever(). It resolves in 0.01s on a developer machine, which is why
+    this passed locally and on ubuntu for three runs.
+
+    This test does not need a broken resolver: it makes getfqdn raise, so any
+    future server_bind that reaches DNS fails here instead of hanging on a
+    runner nobody can inspect.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.machinery
+        import importlib.util
+        loader = importlib.machinery.SourceFileLoader("forge_dash_dns",
+                                                      DASHBOARD)
+        spec = importlib.util.spec_from_loader("forge_dash_dns", loader)
+        cls.mod = importlib.util.module_from_spec(spec)
+        argv, bytecode = sys.argv, sys.dont_write_bytecode
+        sys.argv = ["forge-dashboard", "--root", ".", "--port", "0"]
+        sys.dont_write_bytecode = True
+        try:
+            loader.exec_module(cls.mod)
+        finally:
+            sys.argv, sys.dont_write_bytecode = argv, bytecode
+
+    def test_bind_does_not_call_getfqdn(self):
+        """A real bind with DNS poisoned. Behaviour, not a grep for the name."""
+        self.assertTrue(hasattr(self.mod, "Server"),
+                        "the dashboard no longer defines its own Server class; "
+                        "if it went back to ThreadingHTTPServer directly, "
+                        "startup depends on reverse DNS again")
+        calls = []
+
+        def poisoned(host=""):
+            calls.append(host)
+            raise AssertionError(
+                "server_bind called socket.getfqdn(%r) — startup now blocks "
+                "on a reverse DNS lookup, which is what made every dashboard "
+                "on the macOS runner time out" % (host,))
+
+        # Patched on the `socket` module itself, not on a name inside the
+        # dashboard: the dashboard does not import socket, so the getfqdn that
+        # HTTPServer.server_bind would reach is http.server's own reference.
+        # Poisoning that one is the only patch a reintroduced call cannot
+        # dodge.
+        import http.server as hs
+        real = hs.socket.getfqdn
+        hs.socket.getfqdn = poisoned
+        try:
+            srv = self.mod.Server(("127.0.0.1", 0), self.mod.H)
+        finally:
+            hs.socket.getfqdn = real
+        try:
+            self.assertEqual([], calls, "getfqdn was called during bind")
+            # The attribute HTTPServer would have set must still exist: other
+            # code (and BaseHTTPRequestHandler) may read it.
+            self.assertEqual("127.0.0.1", srv.server_name)
+            self.assertTrue(srv.server_port > 0, "server_port was not set")
+        finally:
+            srv.server_close()
+
+    def test_bind_is_fast_enough_to_not_be_doing_io(self):
+        """A second, independent signal: a bind that queries the network is slow.
+
+        Kept alongside the poisoning test because a future server_bind could
+        reach the network by some route other than socket.getfqdn.
+        """
+        t = time.monotonic()
+        srv = self.mod.Server(("127.0.0.1", 0), self.mod.H)
+        elapsed = time.monotonic() - t
+        srv.server_close()
+        self.assertLess(elapsed, 1.0,
+                        "binding took %.2fs — too slow for a pure bind(), "
+                        "something in server_bind is doing I/O" % elapsed)
+
+
 class TestRateLimitTable(unittest.TestCase):
     """The bucket cap, asserted against the real take_rate_token.
 

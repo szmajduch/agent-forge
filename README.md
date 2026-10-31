@@ -839,11 +839,29 @@ you cannot inspect. Both were real. A test server started with
 `stdout=subprocess.PIPE` that nobody drains blocks on its own `print` once the
 pipe fills — `bind()` has run, so the port accepts connections, but
 `serve_forever()` is never reached and nothing answers; and a readiness check
-that waits for an open port reports exactly that server as healthy. Together
-they failed every dashboard test on the macOS runner (Python 3.15, which
-printed more than the local 3.12) while ubuntu stayed green. Output now goes to
-a file, readiness means an HTTP reply, and a timeout reports the last socket
-error, whether the process is alive, and what it printed.
+that waits for an open port reports exactly that server as healthy. Output now
+goes to a file, readiness means an HTTP reply, and a timeout reports the last
+socket error, whether the process is alive, and what it printed.
+
+That last part is what earned its keep. Four macOS runs failed every dashboard
+test while ubuntu stayed green, and the pipe mechanism above — a plausible
+culprit, and a genuine bug — was **not** the cause. The diagnostic message
+found it: `port accepting: False` alongside `urlopen error timed out`, which
+cannot both be true of a port nothing listens on, because that gives an
+instant `ECONNREFUSED`. The real cause was in the dashboard, not the tests:
+`http.server.HTTPServer.server_bind()` calls `socket.getfqdn(host)` — a
+**reverse DNS lookup** — after `bind()` and before `serve_forever()`. Where
+the resolver does not answer, the listening socket exists while nothing
+accepts from it, so clients hang instead of being refused, and the process has
+printed nothing because it never reached its own startup line. It resolves in
+0.01s on a normal machine, which is why three runs' worth of local
+reproduction found nothing. `forge-dashboard` now binds through its own
+`Server.server_bind`, which calls `socketserver.TCPServer.server_bind` and
+sets `server_name` to the host — `server_name` only ever fed the CGI variable
+`SERVER_NAME`, which the dashboard never reads. This also means the dashboard
+starts on a laptop behind a captive portal, where it previously could hang.
+`TestStartupDoesNotNeedDNS` holds the line by making `getfqdn` raise during a
+real bind.
 
 GitHub Actions runs the same suite on every push and pull request, on **both
 ubuntu-latest and macos-latest**. macOS is not redundant: it ships bash 3.2,
