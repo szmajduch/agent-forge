@@ -1725,6 +1725,39 @@ run_test commands-sandboxed-refused    t_commands_rejected_for_sandboxed_provide
 run_test spawn-records-provider         t_spawn_records_provider_in_state
 run_test spawn-refuses-missing-cli      t_spawn_refuses_missing_provider_cli
 run_test models-lists-providers         t_models_lists_providers_and_roles
+t_plan_ignores_codex_records_with_no_windows() {
+  # Regression, measured 2026-10-31: codex writes more than one kind of
+  # rate_limits record per session, and the LAST one can be a separate
+  # counter with every window null:
+  #   {"limit_id":"premium","primary":null,"secondary":null,...}
+  # Taking "the last record" overwrote real figures with nothing, so
+  # forge-plan reported codex as unreadable while 85%/54% sat two lines
+  # earlier in the same file — and forge-doctor said codex was signed in,
+  # which made it look like forge-plan was broken for everyone.
+  local sess="$TMPROOT/$CURRENT_TEST/.codex/sessions/2026/10/31"
+  mkdir -p "$sess"
+  local f="$sess/rollout-2026-10-31T00-00-00-aaaa.jsonl"
+  {
+    printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":85.0,"window_minutes":300,"resets_at":9999999999},"secondary":{"used_percent":54.0,"window_minutes":10080,"resets_at":9999999999},"plan_type":"plus"}}}'
+    printf '%s\n' '{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"premium","primary":null,"secondary":null,"individual_limit":null,"plan_type":"plus"}}}'
+  } > "$f"
+  # FORGE_NO_PLAN is exported for the whole suite so that no test starts a
+  # provider CLI. codex needs no process — it is read from disk — and this
+  # test is about exactly that reading, so the opt-out is lifted here only,
+  # against a fixture HOME. It cost a round of debugging: the reading failed
+  # with the fixture in place and the path correct.
+  local out
+  out="$(HOME="$TMPROOT/$CURRENT_TEST" FORGE_NO_PLAN=0 \
+         "$FORGE_HOME/bin/forge-plan" --provider codex 2>&1)"
+  assert_contains "$out" "15.0% left" "the 5h window is read (85% used -> 15% left)"
+  assert_contains "$out" "46.0% left" "the weekly window is read (54% used -> 46% left)"
+  case "$out" in
+    *"no plan quota could be read"*)
+      no "a null-window record hid a real reading" ;;
+    *) ok ;;
+  esac
+}
+
 t_plan_diff_reports_consumption() {
   # The headline feature: what one operation cost, in plan terms.
   local b="$TMPROOT/plan-b.json" a="$TMPROOT/plan-a.json"
@@ -1806,6 +1839,7 @@ t_plan_is_forwarded_to_the_worker_window() {
     || no "FORGE_NO_PLAN is not forwarded to the worker window by:$missing"
 }
 
+run_test plan-codex-null-windows       t_plan_ignores_codex_records_with_no_windows
 run_test plan-diff-reports-consumption  t_plan_diff_reports_consumption
 run_test plan-diff-flags-reset          t_plan_diff_flags_a_reset_instead_of_claiming_zero
 run_test plan-survives-bad-input        t_plan_survives_unreadable_input

@@ -220,8 +220,21 @@ def read_codex():
                     except ValueError:
                         continue
                     rl = payload.get("rate_limits")
-                    if isinstance(rl, dict) and rl:
-                        found = rl  # keep scanning: later lines are newer
+                    if not isinstance(rl, dict) or not rl:
+                        continue
+                    # Keep only an entry that actually carries a window.
+                    # Measured 2026-10-31: codex writes more than one kind of
+                    # rate_limits record, and the LAST one in a session can be
+                    #   {"limit_id": "premium", "primary": null,
+                    #    "secondary": null, "individual_limit": null, ...}
+                    # — a separate counter with every window empty. Taking
+                    # "the last record" therefore overwrote good figures with
+                    # nothing, and forge reported codex as unreadable while
+                    # 85%/54% sat two lines earlier in the same file.
+                    if any(isinstance(rl.get(k), dict)
+                           for k in ("primary", "secondary",
+                                     "individual_limit")):
+                        found = rl   # later such lines are newer, so keep going
         except OSError:
             continue
         if found:
