@@ -96,11 +96,13 @@ CLI that is not installed — those models cannot be spawned at all.
   everything the operator allowed, which is usually more than the task needs.
   Every program in a compound command needs its own rule, because agy wraps a
   check as `cd <worktree> && <cmd>; echo "EXIT_STATUS: $?"`.
-- Narrowing has a floor. An `agy` worker orients itself before acting, so a
-  subset must keep `cd echo ls cat` alongside the check's own programs —
-  measured: `--commands "cd echo pytest"` was denied in the worker's FIRST turn,
-  before it read anything, while the same task with the whole bound passed. If
-  you are not sure the floor is covered, omit `--commands` and take the bound.
+- Narrowing has a floor, and forge now adds it for you. An `agy` worker
+  orients itself before acting (measured against agy 1.4.12: it ran the
+  requested `python3 -m pytest` fine, then was denied its own `ls -la`, ending
+  the turn with an empty answer and nothing done). So `cd echo ls cat` are
+  added to every `--commands` subset automatically — you do not need to list
+  them, and listing them anyway is harmless. The floor never exceeds
+  `commands.conf`: if the operator removed `ls` there, it stays removed.
 - `commands.conf` is the operator's upper bound and you cannot exceed it: asking
   for a command outside it fails the spawn. If a task genuinely needs one that
   is missing, say so and let the operator decide — do not work around it, and do

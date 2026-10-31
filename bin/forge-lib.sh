@@ -137,6 +137,11 @@ agent_set() {
 MODELS_FILE="${FORGE_MODELS_FILE:-$FORGE_HOME/models.conf}"
 COMMANDS_FILE="${FORGE_COMMANDS_FILE:-$FORGE_HOME/commands.conf}"
 
+# What an agy worker needs before it does anything task-specific: it runs its
+# own orientation commands first, and a denial there ends the turn. Added to
+# every --commands subset by commands_narrow, but never beyond commands.conf.
+AGY_FLOOR="${FORGE_AGY_FLOOR:-cd echo ls cat}"
+
 # Prints "<name>\t<provider>\t<role>\t<description>" for each configured model.
 # A line missing the provider/role columns is read as an old two-column file
 # (name + description) and treated as a codex worker, so an existing
@@ -258,6 +263,8 @@ commands_bound() {
 # than a task needs. It may therefore only ever pick a SUBSET: a request for
 # something outside the bound fails the spawn and names it, making the decision
 # to widen the operator's, taken once in commands.conf.
+#
+# A subset also gets AGY_FLOOR added to it, for the reason below.
 commands_narrow() {
   local bound; bound="$(commands_bound)"
   if [[ $# -eq 0 ]]; then echo "$bound"; return; fi
@@ -274,6 +281,32 @@ commands_narrow() {
     [[ $ok -eq 1 ]] || die "command '$req' is not allowed by $COMMANDS_FILE (allowed:$bound).
 Ask the operator to add it there — widening the bound is their decision, not a worker's."
     out="$out $req"
+  done
+  # Add the floor. An agy worker orients itself before it touches the task:
+  # measured against agy 1.4.12, a worker given exactly
+  # `command(cd) command(echo) command(python3) command(pytest)` ran the
+  # requested `python3 -m pytest -q .` fine and was then denied its own
+  # `ls -la`, which ended the turn with an empty response and
+  # denied_actions=[command] — reported by forge as a failure, with nothing
+  # done. The same brief under the whole bound: zero denials.
+  #
+  # The floor is therefore not a convenience, it is what makes a subset
+  # usable at all. Granting it costs nothing a worker could not already do:
+  # agy has read_file/list_directory/glob/search_file_content unconditionally,
+  # so ls/cat/find/grep add no reach, only a second way to the same bytes.
+  # This used to be documented in templates/FORGE.md and left to the
+  # orchestrator; it was still narrowed below the floor in practice, so it is
+  # enforced here instead of advised there.
+  local f
+  for f in $AGY_FLOOR; do
+    ok=0
+    for b in $out; do [[ "$f" == "$b" ]] && ok=1; done
+    [[ $ok -eq 1 ]] && continue
+    # Only if the operator's bound actually allows it. A bound that drops `ls`
+    # is the operator's choice and is not quietly overridden here.
+    ok=$unbounded
+    for b in $bound; do [[ "$f" == "$b" ]] && ok=1; done
+    [[ $ok -eq 1 ]] && out="$out $f"
   done
   set +f
   echo "$out"

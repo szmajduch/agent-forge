@@ -1249,6 +1249,59 @@ t_commands_narrows_to_the_requested_subset() {
   unset FORGE_COMMANDS_FILE
 }
 
+t_commands_subset_keeps_the_orientation_floor() {
+  # Regression, measured against agy 1.4.12: a worker granted exactly
+  # cd/echo/python3/pytest ran the requested `python3 -m pytest -q .` fine and
+  # was then DENIED its own `ls -la`, which ended the turn with an empty
+  # response and denied_actions=[command] — forge reported a failure for a
+  # worker that had done nothing. The same brief under the whole bound: zero
+  # denials. So commands_narrow adds the floor to every subset.
+  write_commands_conf "cd echo ls cat git pytest curl"
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet --commands "pytest" cf1 "task"
+  assert_rc 0 "$RC" "spawn with a subset that omits the floor"
+  local st; st="$(await cf1)"
+  assert_eq "done" "$st" "worker finished"
+  local argv="$FORGE_WT_ROOT/cf1/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -q 'command(pytest)' "$argv" && ok || no "the requested command was dropped"
+    local missing=""
+    local f
+    for f in cd echo ls cat; do
+      grep -q "command($f)" "$argv" || missing="$missing $f"
+    done
+    [[ -z "$missing" ]] && ok || no "floor not added to the subset, missing:$missing"
+    # The floor is a floor, not a widening: what the task does not need and
+    # the floor does not require must still be absent.
+    grep -q 'command(curl)' "$argv" && no "'curl' leaked in with the floor" || ok
+    grep -q 'command(git)' "$argv" && no "'git' leaked in with the floor" || ok
+  else
+    no "worker never recorded argv"; no "(skipped)"; no "(skipped)"; no "(skipped)"
+  fi
+  unset FORGE_COMMANDS_FILE
+}
+
+t_commands_floor_never_exceeds_the_bound() {
+  # The floor is capped by commands.conf. An operator who deliberately removes
+  # `ls` is not quietly overridden — otherwise the floor would be a hole in the
+  # one limit that is the operator's to set.
+  write_commands_conf "cd echo pytest"
+  write_fake_provider "$FAKEBIN/agy" antigravity
+  forge spawn --model agy-sonnet --commands "pytest" cf2 "task"
+  assert_rc 0 "$RC" "spawn where the bound itself lacks part of the floor"
+  local st; st="$(await cf2)"
+  assert_eq "done" "$st" "worker finished"
+  local argv="$FORGE_WT_ROOT/cf2/ARGV.txt"
+  if [[ -f "$argv" ]]; then
+    grep -q 'command(cd)' "$argv" && ok || no "floor member allowed by the bound was dropped"
+    grep -q 'command(ls)' "$argv" && no "the floor granted 'ls' which the bound forbids" || ok
+    grep -q 'command(cat)' "$argv" && no "the floor granted 'cat' which the bound forbids" || ok
+  else
+    no "worker never recorded argv"; no "(skipped)"; no "(skipped)"
+  fi
+  unset FORGE_COMMANDS_FILE
+}
+
 t_commands_cannot_exceed_the_bound() {
   # The orchestrator reads task briefs, so it can be argued into asking for
   # more than a task needs. Widening stays the operator's decision.
@@ -1534,6 +1587,8 @@ run_test antigravity-denial-fails      t_antigravity_denial_is_a_failure
 run_test antigravity-effort-dropped    t_antigravity_effort_is_dropped
 run_test commands-default-whole-bound  t_commands_default_grants_the_whole_bound
 run_test commands-narrow-subset        t_commands_narrows_to_the_requested_subset
+run_test commands-subset-keeps-floor   t_commands_subset_keeps_the_orientation_floor
+run_test commands-floor-under-bound    t_commands_floor_never_exceeds_the_bound
 run_test commands-cannot-exceed-bound  t_commands_cannot_exceed_the_bound
 run_test commands-star-not-a-glob      t_commands_star_bound_is_not_a_shell_glob
 run_test commands-sandboxed-refused    t_commands_rejected_for_sandboxed_providers

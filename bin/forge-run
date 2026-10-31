@@ -153,6 +153,20 @@ PYEOF
     echo "    This worker was allowed:$(agy_denial_hint "${WCMDS[@]+${WCMDS[@]}}")" | tee -a "$log"
     echo "    agy wraps a check as 'cd <dir> && <cmd>; echo ...', so EVERY" | tee -a "$log"
     echo "    program in it needs a rule — cd and echo included." | tee -a "$log"
+    # The envelope says only {"action":"command"}; it never names the command.
+    # Measured against agy 1.4.12: --output-format stream-json DOES carry it,
+    # as run_command.error.message on the denied step. So say where the answer
+    # is instead of pretending this message holds it. And name the usual
+    # culprit: not the task's own command, but one agy ran to orient itself.
+    cat >>"$log" <<'DENYHINT'
+    The envelope does not say WHICH command was denied. To find out, rerun the
+    brief by hand with --output-format stream-json and look for the run_command
+    step whose error message contains "denied permission to run command".
+    The usual cause is not the task's own command but one agy runs to orient
+    itself on its first turn (measured: "ls -la"). forge grants cd/echo/ls/cat
+    for exactly that; a commands.conf that drops one of them brings it back.
+DENYHINT
+    tail -7 "$log"
   fi
 fi
 
