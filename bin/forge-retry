@@ -35,12 +35,12 @@ status="$(agent_get "$name" status)"
 # A running worker must not be restarted underneath itself: two processes in one
 # worktree would interleave their writes. Cancel it first, deliberately.
 case "$status" in
-  failed|nochanges|cancelled) ;;
+  failed|exhausted|nochanges|cancelled) ;;
   queued|running) die "agent '$name' is still $status — forge-cancel it first, then retry" ;;
   done)   die "agent '$name' finished successfully — forge-review it, or forge-drop and respawn to redo the task" ;;
   merged) die "agent '$name' is already merged — spawn a new agent for follow-up work" ;;
   dropped) die "agent '$name' was dropped: its worktree and branch are gone, so there is nothing to continue" ;;
-  *) die "agent '$name' has status '${status:-unknown}' — only failed/nochanges/cancelled workers can be retried" ;;
+  *) die "agent '$name' has status '${status:-unknown}' — only failed/exhausted/nochanges/cancelled workers can be retried" ;;
 esac
 
 wt="$(agent_get "$name" worktree)"

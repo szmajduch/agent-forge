@@ -90,6 +90,10 @@ assert_no_file() { # assert_no_file <path> <what>
 #   report   — writes only a report (analysis worker), exits 0
 #   noop     — changes nothing, exits 0  → expect status "nochanges"
 #   fail     — writes nothing, exits 7   → expect status "failed"
+#   limit    — prints codex's real usage-limit error, exits 1 → "exhausted"
+#   limitagy — prints agy's real RESOURCE_EXHAUSTED error, exits 3 → "exhausted"
+#   limitread— exits 7 having merely PRINTED a quota error early, then lots of
+#              output: a worker whose INPUT mentioned a limit must stay "failed"
 # The mode and argv-log path are written INTO the script, not passed through the
 # environment: forge-spawn forwards only a whitelist of FORGE_* variables into
 # the worker's tmux window, so an exported FAKE_CODEX_* would never arrive.
@@ -112,6 +116,20 @@ case "$MODE" in
   legacy) echo "# legacy root report" > FORGE_REPORT.md ;;
   noop)   : ;;
   fail)   echo "fake codex failure" >&2; exit 7 ;;
+  # Verbatim from .forge/logs/ex24-audit.log (2026-10-28). The apostrophe in
+  # "You’ve" is U+2019, not ASCII: that is what codex actually prints, and a
+  # detector written against ASCII never fires.
+  limit)  echo "ERROR: You’ve hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/settings/usage to purchase more credits or try again at Oct 29th, 2026 2:04 AM."
+          exit 1 ;;
+  # Verbatim shape from .forge/logs/random-validate-v2.log (2026-10-31).
+  limitagy) echo 'error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h16m28s.'
+          echo 'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached.","status":"RESOURCE_EXHAUSTED","error_code":429,"retryable":true}'
+          exit 3 ;;
+  # A quota error in the worker's INPUT, far from the end, then real work and a
+  # genuine failure. Only the tail is scanned, so this must stay "failed".
+  limitread) echo "ERROR: You’ve hit your usage limit. (quoted from a log this worker was auditing)"
+          i=0; while [[ $i -lt 400 ]]; do echo "line $i of ordinary analysis output"; i=$((i+1)); done
+          echo "fake codex failure" >&2; exit 7 ;;
 esac
 exit 0
 EOF
@@ -318,6 +336,37 @@ t_failed_worker_keeps_worktree() {
   assert_eq "7" "$rc_field" "exit code recorded"
   # Left for inspection — that is the documented contract.
   assert_file "$FORGE_WT_ROOT/f1/.git" "failed worker's worktree kept for inspection"
+}
+
+# Running out of plan quota is not the same failure as a bad brief. ex24-audit
+# (2026-10-28) passed the entire quality gate and died writing its report; as
+# `failed` it looked exactly like a worker with a broken CLI flag, so the
+# operator had to read the log to learn it only needed a later retry.
+t_quota_limit_is_exhausted_not_failed() {
+  write_fake_codex "$FAKEBIN/codex" limit
+  forge spawn q1 "burn the plan"
+  assert_eq "exhausted" "$(await q1)" "codex usage limit reported exhausted"
+  local rc_field
+  rc_field="$(cd "$REPO" && "$BIN/forge-status" --json | jq -r '.[] | select(.name=="q1") | .exit_code')"
+  assert_eq "1" "$rc_field" "codex limit exit code recorded"
+  # The whole point of the separate status: retry must accept it, with the same
+  # brief. If retry refused, exhausted would be a dead end.
+  forge retry q1
+  assert_rc 0 "$RC" "forge-retry accepts an exhausted worker"
+}
+
+t_agy_quota_limit_is_exhausted() {
+  write_fake_codex "$FAKEBIN/codex" limitagy
+  forge spawn q2 "burn the agy plan"
+  assert_eq "exhausted" "$(await q2)" "agy RESOURCE_EXHAUSTED reported exhausted"
+}
+
+# The detector reads only the log tail. A worker auditing someone else's quota
+# error must not be relabelled because of what it read.
+t_quota_text_in_input_stays_failed() {
+  write_fake_codex "$FAKEBIN/codex" limitread
+  forge spawn q3 "audit a log that mentions a usage limit"
+  assert_eq "failed" "$(await q3)" "quota text in the worker's input stays failed"
 }
 
 t_legacy_root_report_is_moved() {
@@ -1653,6 +1702,9 @@ run_test build-worker-commits           t_build_worker_commits
 run_test analysis-worker-report         t_analysis_worker_commits_report
 run_test noop-worker-is-nochanges       t_noop_worker_is_nochanges
 run_test failed-worker-keeps-worktree   t_failed_worker_keeps_worktree
+run_test quota-limit-is-exhausted       t_quota_limit_is_exhausted_not_failed
+run_test agy-quota-limit-is-exhausted   t_agy_quota_limit_is_exhausted
+run_test quota-text-in-input-stays-failed t_quota_text_in_input_stays_failed
 run_test legacy-root-report-moved       t_legacy_root_report_is_moved
 
 echo

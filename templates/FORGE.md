@@ -66,6 +66,9 @@ told to change code will change code it should only have read.
    - Needs changes → spawn a follow-up worker with a precise fix brief
      (base it on the current branch: `forge-spawn <name>-fix --base agent/<name> "..."`).
    - `failed` → read `forge-status <name>` log, re-brief, respawn under a new name.
+   - `exhausted` → the plan ran out mid-run; the brief was never the problem.
+     Do NOT re-brief. `forge-retry <name>` after the window resets (`forge-plan`
+     shows when), or retry on a provider that still has quota.
    - `nochanges` → for build, the worker produced nothing: re-brief and respawn.
      For analysis it means no report was written, which is the same thing.
    - `cancelled` → stopped mid-task, so its acceptance check never ran. Read the

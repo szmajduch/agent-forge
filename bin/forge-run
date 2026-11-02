@@ -299,8 +299,33 @@ if [[ -f "$report_path" ]]; then
 fi
 
 if [[ $rc -ne 0 ]]; then
-  agent_set "$name" status=failed exit_code="$rc" report="$report"
-  echo "=== codex exited with $rc — worktree left uncommitted for inspection ===" | tee -a "$log"
+  # A worker that ran out of plan quota did not fail at the task: it never got
+  # to finish one. Recorded as `exhausted` rather than `failed` so the
+  # orchestrator can tell the two apart — a failed worker needs a new brief, an
+  # exhausted one needs only a later retry with the same brief. ex24-audit
+  # (2026-10-28) passed the whole quality gate and died writing its report;
+  # stored as `failed`, that near-success was indistinguishable from a worker
+  # with a bad CLI flag.
+  #
+  # The patterns below are taken from real logs, not guessed. Both matter:
+  #   codex: "ERROR: You've hit your usage limit." + "try again at <time>",
+  #          exit 1. NOTE the apostrophe is U+2019, not ASCII — an ASCII
+  #          pattern never matches.
+  #   agy:   "RESOURCE_EXHAUSTED (code 429)" / "Individual quota reached",
+  #          exit 3, with "Resets in <duration>".
+  # Only the log tail is scanned: a worker that read a quota error out of some
+  # file it was auditing must not be relabelled because of its input.
+  status_final=failed
+  if tail -c 4000 "$log" | grep -qE \
+      'hit your usage limit|RESOURCE_EXHAUSTED|Individual quota reached|quota reached'; then
+    status_final=exhausted
+  fi
+  agent_set "$name" status="$status_final" exit_code="$rc" report="$report"
+  if [[ "$status_final" == exhausted ]]; then
+    echo "=== plan quota exhausted (exit $rc) — same brief, retry later: forge-retry $name ===" | tee -a "$log"
+  else
+    echo "=== codex exited with $rc — worktree left uncommitted for inspection ===" | tee -a "$log"
+  fi
 else
   git add -A
   if git diff --cached --quiet; then

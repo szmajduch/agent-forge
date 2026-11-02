@@ -106,8 +106,11 @@ reading the diff first, and `forge-drop` (which destroys work) has to ask you.
    at any point:  forge-cancel → cancelled (branch kept, partial work committed)
                   forge-drop   → dropped   (branch and worktree deleted)
 
-   failed/nochanges/cancelled ──forge-retry──► queued  (same branch and worktree;
-                  continues from the partial work unless --fresh resets it)
+   a worker that exited because the PLAN ran out (codex "usage limit", agy
+   RESOURCE_EXHAUSTED) becomes `exhausted`, not `failed`: same brief, retry later.
+
+   failed/exhausted/nochanges/cancelled ──forge-retry──► queued  (same branch and
+                  worktree; continues from the partial work unless --fresh resets it)
 ```
 
 `done` means the run finished, **not** that there is a deliverable — always
@@ -547,8 +550,10 @@ six levels are accepted and a name outside the list is rejected.
 | `test/forge-test [filter]` | end-to-end tests of the whole kit (fake `codex`, nothing calls a model) |
 | `test/forge-dashboard-test [filter]` | the dashboard's HTTP endpoints; also run by `forge-test` |
 
-Worker statuses: `queued → running → done | nochanges | failed`, then
-`merged | conflict | cancelled | dropped`.
+Worker statuses: `queued → running → done | nochanges | failed | exhausted`,
+then `merged | conflict | cancelled | dropped`.
+`exhausted` is a worker whose provider plan ran out mid-run — it is kept apart
+from `failed` because it needs only a later retry, never a new brief.
 `nochanges` means the worker contributed nothing — for build, no code changes;
 for analysis, no report. An analysis worker that wrote a report finishes as
 `done`. State lives in `.forge/` (excluded from git automatically through
