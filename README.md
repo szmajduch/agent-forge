@@ -536,8 +536,8 @@ six levels are accepted and a name outside the list is rejected.
 | `forge-models [--workers]` | lists models with provider and role; `--workers` hides orchestrator-only models |
 | `forge-usage [--json] [--all] [--since <days>]` | token usage per provider and model + context held per session |
 | `forge-plan [--json] [--provider <name>]` | how much of each provider's plan is **left**, and when each window resets |
-| `forge-wait [names…] [--timeout s]` | waits for workers to finish, then shows status |
-| `forge-status [--json] [--ack] [name]` | table of workers plus unacknowledged dashboard notes; with a name — the report and the last log lines; `--ack` marks the notes as seen |
+| `forge-wait [names…] [--timeout s]` | waits for workers to finish, then shows status (unacknowledged notes included, on timeout too) |
+| `forge-status [--json] [--ack] [--feedback-only] [name]` | table of workers plus unacknowledged dashboard notes; with a name — the report and the last log lines; `--ack` marks the notes as seen, `--feedback-only` prints just them |
 | `forge-review <name> [--stat]` | the worker's report, commits and diff against its starting point |
 | `forge-merge <name> [--keep]` | `merge --no-ff` into the current branch; on conflict it aborts and marks `conflict` |
 | `forge-cancel <name>` | stops a worker but **keeps** the branch and commits what it already did |
@@ -1085,6 +1085,11 @@ afterwards shows up again. The mark stores the newest note's timestamp rather
 than a line count, because the dashboard appends to this file and trims it from
 the front. Notes are shown even when no worker is running — the start of a round
 is when a waiting note matters most.
+
+`forge-wait` ends by printing `forge-status`, so the notes also appear where a
+round of work finishes. On **timeout** it prints them as well (`forge-status
+--feedback-only`, without repeating the worker table): a timeout is exactly when
+a note asking whether something is stuck is worth reading.
 
 ### Actions from the page
 

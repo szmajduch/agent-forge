@@ -691,6 +691,67 @@ t_wait_returns_when_worker_finishes() {
   assert_contains "$OUT" "w1" "forge-wait prints the status table"
 }
 
+# A timeout is when a waiting note matters most ("is that worker stuck?"), and
+# it was the one path out of forge-wait that never called forge-status.
+t_wait_timeout_shows_feedback() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"is that worker stuck"}'
+  # A worker stuck in `running` that no process will ever finish: the state
+  # file is written directly, so the timeout path is reached in one second.
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' '{"name":"stuck","status":"running","branch":"agent/stuck","kind":"build","title":"stuck"}' \
+    > "$REPO/.forge/agents/stuck.json"
+  forge wait --timeout 1
+  assert_rc 2 "$RC" "timeout still exits 2"
+  assert_contains "$OUT" "still active: stuck" "the stuck worker is named"
+  assert_contains "$OUT" "is that worker stuck" "the waiting note is shown on timeout"
+}
+
+# On timeout the worker names were just printed; repeating the whole table
+# would bury them, so only the notes are added.
+t_wait_timeout_omits_the_table() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"a note"}'
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' '{"name":"stuck","status":"running","branch":"agent/stuck","kind":"build","title":"stuck"}' \
+    > "$REPO/.forge/agents/stuck.json"
+  forge wait --timeout 1
+  case "$OUT" in
+    *"MODEL/EFFORT"*) no "the timeout path reprinted the whole worker table" ;;
+    *) ok ;;
+  esac
+}
+
+# An acknowledged note must not come back on every later timeout.
+t_wait_timeout_quiet_after_ack() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"handled already"}'
+  forge status --ack
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' '{"name":"stuck","status":"running","branch":"agent/stuck","kind":"build","title":"stuck"}' \
+    > "$REPO/.forge/agents/stuck.json"
+  forge wait --timeout 1
+  assert_rc 2 "$RC" "timeout exits 2"
+  case "$OUT" in
+    *"handled already"*) no "an acknowledged note came back on timeout" ;;
+    *) ok ;;
+  esac
+}
+
+t_status_feedback_only_omits_the_table() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"just the note"}'
+  forge spawn fo1 "a worker so the table would have a row"
+  assert_eq "done" "$(await fo1)" "worker finished"
+  forge status --feedback-only
+  assert_rc 0 "$RC" "--feedback-only succeeds"
+  assert_contains "$OUT" "just the note" "the note is printed"
+  case "$OUT" in
+    *"MODEL/EFFORT"*) no "--feedback-only printed the worker table" ;;
+    *) ok ;;
+  esac
+}
+
 t_review_shows_diff_and_report() {
   forge spawn r1 "review test"
   assert_eq "done" "$(await r1)" "worker finished"
@@ -2103,6 +2164,10 @@ run_test feedback-names-agent           t_feedback_names_its_agent
 run_test feedback-ack-then-new          t_feedback_ack_then_new_note
 run_test feedback-absent-from-json      t_feedback_absent_from_json
 run_test status-rejects-unknown-flag    t_status_rejects_unknown_flag
+run_test wait-timeout-shows-feedback    t_wait_timeout_shows_feedback
+run_test wait-timeout-omits-table       t_wait_timeout_omits_the_table
+run_test wait-timeout-quiet-after-ack   t_wait_timeout_quiet_after_ack
+run_test status-feedback-only           t_status_feedback_only_omits_the_table
 run_test plan-diff-reports-consumption  t_plan_diff_reports_consumption
 run_test plan-diff-flags-reset          t_plan_diff_flags_a_reset_instead_of_claiming_zero
 run_test plan-survives-bad-input        t_plan_survives_unreadable_input

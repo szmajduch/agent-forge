@@ -52,6 +52,8 @@ told to change code will change code it should only have read.
    Pick the model per task (see "Choosing a model" below) and say in the plan
    which model each task gets.
 3. **Wait.** `forge-wait` (all) or `forge-wait name1 name2`. Don't poll in a tight loop.
+   It ends with `forge-status`, including any unanswered dashboard notes — on a
+   timeout too, which is when "is that worker stuck?" is worth reading.
 4. **Review.** For each `done` worker: `forge-review <name>`. Read the full diff.
    **`done` does not mean there is a product.** A worker can commit nothing but
    a report saying it was blocked. Judge the deliverable, never the status.

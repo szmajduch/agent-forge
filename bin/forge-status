@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# forge-status [--json] [--ack] [name]  — overview of all workers (or one).
+# forge-status [--json] [--ack] [--feedback-only] [name]
+#                               — overview of all workers (or one).
 #
 # Also reports client/operator notes left on the dashboard that have not been
 # acknowledged yet. FORGE.md tells the orchestrator to read feedback at the
@@ -11,14 +12,18 @@
 # quiet until a new one arrives. The marker stores the newest note's
 # timestamp, not a line count: the dashboard appends and trims the file from
 # the front, so line numbers do not survive.
+#
+# --feedback-only prints just those notes, for callers that have already shown
+# the worker state themselves (forge-wait on timeout).
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 
-json=0; ack=0
+json=0; ack=0; feedback_only=0
 while [[ "${1:-}" == --* ]]; do
   case "$1" in
     --json) json=1; shift ;;
     --ack)  ack=1; shift ;;
-    *) die "unknown option $1 (usage: forge-status [--json] [--ack] [name])" ;;
+    --feedback-only) feedback_only=1; shift ;;
+    *) die "unknown option $1 (usage: forge-status [--json] [--ack] [--feedback-only] [name])" ;;
   esac
 done
 
@@ -56,6 +61,11 @@ print_feedback() {
       "${fagent:+ (about $fagent)}" "$ftext"
   done
 }
+
+if [[ $feedback_only -eq 1 ]]; then
+  print_feedback
+  exit 0
+fi
 
 if [[ $ack -eq 1 ]]; then
   [[ -f "$FEEDBACK_FILE" ]] || { echo "no feedback to acknowledge"; exit 0; }

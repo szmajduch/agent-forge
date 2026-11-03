@@ -2,6 +2,11 @@
 # forge-wait [name ...] [--timeout SEC]
 # Blocks until the given workers (default: all active) leave queued/running,
 # then prints forge-status. Exit 2 on timeout. Default timeout: 1800s.
+#
+# forge-status ends with any dashboard notes nobody has acknowledged, so the
+# normal path surfaces them where a round ends. The timeout path used to exit
+# without calling it at all — and a timeout is precisely when a waiting note
+# ("is that worker stuck?") is worth reading, so it prints them too.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 timeout=1800; names=()
 while [[ $# -gt 0 ]]; do
@@ -32,7 +37,13 @@ active() {
 
 start=$SECONDS
 while [[ -n "$(active)" ]]; do
-  (( SECONDS - start >= timeout )) && { echo "timeout; still active: $(active | tr '\n' ' ')"; exit 2; }
+  if (( SECONDS - start >= timeout )); then
+    echo "timeout; still active: $(active | tr '\n' ' ')"
+    # The notes, but not the whole worker table: the names still running were
+    # just printed above, and repeating the table would bury them.
+    "$FORGE_HOME/bin/forge-status" --feedback-only || true
+    exit 2
+  fi
   sleep 5
 done
 "$FORGE_HOME/bin/forge-status"
