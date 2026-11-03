@@ -954,6 +954,16 @@ test/forge-dashboard-test            # just the dashboard's HTTP endpoints
 test/forge-dashboard-test Token      # only its tests matching "Token"
 ```
 
+A name registered with `run_test` whose function does not exist is a **failure**,
+not a pass. It used to print `ok`: the call is resolved at run time, so a missing
+function is only "command not found"; the `|| true` that keeps one broken test
+from killing the suite cannot tell a failed test from an absent one; and the
+verdict reads the assertion counter, which a function that never ran leaves
+untouched. The diagnostic goes to stderr, so it survived on a terminal and
+vanished through a pipe — five bodyless tests once reported `ok` this way.
+`forge-doctor` checks the same thing without running anything, so a registration
+that lost its definition shows up before the suite is even started.
+
 Every test gets its own repo in a temporary directory and a **fake `codex`**,
 so nothing calls a model and nothing touches your projects. The tmux session
 and worktree directory are unique per run, so the tests do not collide with a

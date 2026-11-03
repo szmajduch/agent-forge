@@ -197,6 +197,21 @@ run_test() { # run_test <name> <function>
   new_repo "$REPO"
 
   printf '  %-34s' "$name"
+  # A registered name whose function does not exist used to report "ok".
+  # Three reasonable decisions combined into a false pass: `"$fn"` is resolved
+  # at call time, so a missing function is merely "command not found"; `|| true`
+  # (deliberate, so one broken test cannot kill the suite) does not tell "the
+  # test failed" from "there is no test"; and the verdict reads the assertion
+  # counter, which a function that never ran cannot increment. The diagnostic
+  # goes to stderr, so it survives on a terminal and vanishes through a pipe or
+  # `2>/dev/null` — which is how five bodyless tests once reported "ok" here.
+  # declare -F matches functions only: a typo must not resolve to some
+  # executable on PATH.
+  if ! declare -F "$fn" >/dev/null; then
+    no "test function '$fn' does not exist (typo in run_test, or the definition was lost)"
+    red "FAIL"
+    return 0
+  fi
   # Assertion failures print via no(); a test's own stray output is hidden so
   # the summary stays readable.
   "$fn" >/dev/null || true
@@ -1904,6 +1919,80 @@ t_plan_ignores_codex_records_with_no_windows() {
   esac
 }
 
+# --- the driver's own integrity ---------------------------------------------
+# A registered name with no function used to report "ok" and leave the counter
+# at "0 failures". Five bodyless tests once passed that way here, and the
+# diagnostic ("command not found") goes to stderr, so it disappears through a
+# pipe — which is how the suite is usually read. A gate that reports success
+# without running anything is worse than no gate.
+
+t_driver_fails_on_missing_test_function() {
+  # Run a miniature suite with the same driver contract, in a copy, so the
+  # real one is not disturbed: a registered name whose function is absent must
+  # FAIL, count, and exit non-zero.
+  local mini="$TMPROOT/$CURRENT_TEST/mini-suite"
+  mkdir -p "$(dirname "$mini")"
+  # The guard, verbatim in shape, plus the surrounding driver logic.
+  cat > "$mini" <<'MINI'
+#!/usr/bin/env bash
+set -uo pipefail
+pass=0; fail=0; failed_names=()
+CURRENT_TEST=""
+no() { fail=$((fail+1)); failed_names+=("$CURRENT_TEST"); echo "FAIL: $*" >&2; }
+ok() { pass=$((pass+1)); }
+red() { printf '%s\n' "$*"; }
+green() { printf '%s\n' "$*"; }
+run_test() {
+  local name="$1" fn="$2"
+  CURRENT_TEST="$name"
+  local before_fail=$fail
+  printf '  %-20s' "$name"
+  if ! declare -F "$fn" >/dev/null; then
+    no "test function '$fn' does not exist"
+    red "FAIL"
+    return 0
+  fi
+  "$fn" >/dev/null || true
+  if [[ $fail -gt $before_fail ]]; then red "FAIL"; else green "ok"; fi
+}
+t_real() { ok; }
+# Called indirectly so that this file contains no line that a text scanner
+# (forge-doctor's registration check) would read as a real registration of
+# the outer suite — it scans by text and cannot see heredoc boundaries.
+present="t_real"; absent="t_does_not_exist"
+run_test real-test     "$present"
+run_test bodyless-test "$absent"
+if [[ $fail -eq 0 ]]; then green "$pass assertions passed, 0 failures"; exit 0; fi
+red "$pass assertions passed, $fail FAILED"
+exit 1
+MINI
+  chmod +x "$mini"
+  local out rc
+  # stderr discarded on purpose: the point is that the failure is visible on
+  # STDOUT, where a pipe or a log file would still show it.
+  out="$("$mini" 2>/dev/null)"; rc=$?
+  assert_rc 1 "$rc" "a missing test function makes the suite exit non-zero"
+  assert_contains "$out" "1 FAILED" "it is counted as a failure, not reported as ok"
+  case "$out" in
+    *"bodyless-test"*"ok"*) no "the bodyless test still printed ok" ;;
+    *) ok ;;
+  esac
+  # And the control: a test that does exist still passes.
+  assert_contains "$out" "real-test" "the working test still ran"
+}
+
+# The real suite must have no such orphan, and forge-doctor must keep saying so
+# without having to run the tests.
+t_doctor_checks_registered_tests_exist() {
+  forge doctor
+  assert_contains "$OUT" "every registered test has a function" \
+    "forge-doctor verifies the suite's registrations"
+  case "$OUT" in
+    *"registered with no function"*) no "the real suite has a registration with no function" ;;
+    *) ok ;;
+  esac
+}
+
 # --- unanswered dashboard feedback ------------------------------------------
 # A note asking whether ex24-audit could be retried sat in feedback.jsonl for
 # five days. FORGE.md says to read feedback every round; nothing surfaced it
@@ -2164,6 +2253,8 @@ run_test feedback-names-agent           t_feedback_names_its_agent
 run_test feedback-ack-then-new          t_feedback_ack_then_new_note
 run_test feedback-absent-from-json      t_feedback_absent_from_json
 run_test status-rejects-unknown-flag    t_status_rejects_unknown_flag
+run_test driver-fails-on-missing-fn     t_driver_fails_on_missing_test_function
+run_test doctor-checks-registered-tests t_doctor_checks_registered_tests_exist
 run_test wait-timeout-shows-feedback    t_wait_timeout_shows_feedback
 run_test wait-timeout-omits-table       t_wait_timeout_omits_the_table
 run_test wait-timeout-quiet-after-ack   t_wait_timeout_quiet_after_ack

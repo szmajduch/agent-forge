@@ -83,6 +83,28 @@ else
   note "run $FORGE_HOME/install.sh   (and check ~/.local/bin is on PATH)"
 fi
 
+# Every name registered with run_test must have a function to run. A missing
+# one used to print "ok": the call is resolved at run time, `|| true` cannot
+# tell a failed test from an absent one, and the verdict reads the assertion
+# counter, which a function that never ran leaves untouched. Checked here as
+# well as in the suite, because this is cheap and needs no run: a green
+# "0 failures" is what the whole gate rests on.
+suite="$FORGE_HOME/test/forge-test"
+if [[ -f "$suite" ]]; then
+  orphans=""
+  while read -r fn; do
+    [[ -n "$fn" ]] || continue
+    grep -qE "^[[:space:]]*${fn}\(\)[[:space:]]*\{" "$suite" || orphans="$orphans $fn"
+  done < <(grep -hoE '^run_test[a-z_]*[[:space:]]+[^[:space:]]+[[:space:]]+([A-Za-z_][A-Za-z0-9_]*)' "$suite" \
+           | awk '{print $3}' | sort -u)
+  if [[ -n "$orphans" ]]; then
+    nope "test names registered with no function to run:$orphans"
+    note "a typo in run_test, or a definition that was lost — those tests cannot fail"
+  else
+    ok "every registered test has a function"
+  fi
+fi
+
 head2 "project files"
 cd "$ROOT" || die "cannot enter the repository root: $ROOT"
 for f in PROJECT.md CLAUDE.md AGENTS.md FORGE.md; do
