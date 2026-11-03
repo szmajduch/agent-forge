@@ -194,6 +194,11 @@ higher effort before you re-scope the task.
 - Max parallel workers: 4 unless the operator says otherwise. `forge-spawn`
   enforces this (`FORGE_MAX_WORKERS`), so a refused spawn means wait, don't
   retry with `--force`: ask the operator if you think the limit should be higher.
+- `forge-spawn` also checks the plan: under 10% left for the model's provider it
+  asks whether to go ahead. Do not answer it blindly — the useful answer is
+  usually a note that makes the task fit what is left ("report early, skip the
+  full gate"), or moving the work to a provider with quota. State the plan
+  figure in your task plan so the operator sees it before the fan-out, not after.
 
 ## Sensitive data
 

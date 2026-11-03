@@ -10,7 +10,11 @@
 # --effort reasoning effort: low|medium|high|xhigh|max|ultra. Higher spends more
 #         reasoning on a hard task; it is not a guarantee of correctness.
 #         Passed to codex as -c model_reasoning_effort=<level>.
-# --force ignore the parallel-worker limit (FORGE_MAX_WORKERS, default 4).
+# --force ignore the parallel-worker limit (FORGE_MAX_WORKERS, default 4)
+#         and the plan-quota prompt (FORGE_MIN_PLAN, default 10 percent left).
+#         Below that, forge asks whether to spawn; the answer may also be a
+#         note ("report early, skip the full gate") that is added to the brief.
+#         FORGE_MIN_PLAN=0 disables the check.
 # --commands  shell commands this worker may run, e.g. --commands "pytest git".
 #         antigravity only; the other providers get a sandbox instead of a list.
 #         Must be a subset of commands.conf — a command outside it fails the
@@ -124,6 +128,56 @@ fi
 
 if [[ $# -gt 0 ]]; then task="$*"; else task="$(cat)"; fi
 [[ -n "${task//[[:space:]]/}" ]] || die "empty task"
+
+# A worker briefed against an empty plan cannot finish, and today forge lets it
+# start and the operator learns only from the log. On 2026-10-28/31 four
+# workers died that way: 437k tokens of codex and a full 5h window of agy, for
+# nothing. FORGE.md already says to check forge-plan before fanning out; this
+# puts the check where it cannot be skipped.
+#
+# Deliberately a PROMPT, not a refusal: only the operator knows whether 6% is
+# enough for the task at hand, and a hard `die` on a reading that can be stale
+# (codex's comes off disk, sometimes hours old) would block work that is fine.
+# The answer may also be free text, which is appended to the brief — at a low
+# quota the useful instruction is usually "skip the full gate, report early",
+# which is exactly what would have saved ex24-audit.
+plan_min="${FORGE_MIN_PLAN:-10}"
+[[ "$plan_min" =~ ^[0-9]+$ ]] || die "FORGE_MIN_PLAN must be a whole number, got '$plan_min'"
+if [[ $force -eq 0 && "$plan_min" -gt 0 ]]; then
+  left="$(plan_left_percent "$provider" "$model")"
+  # Empty means unknown, never zero: a missing CLI or a cold cache must not
+  # start blocking spawns.
+  if [[ -n "$left" ]] && [[ "$left" -lt "$plan_min" ]]; then
+    info "plan quota for '$provider' is down to ${left}% (worst window) — model '$model'"
+    info "run 'forge-plan' for the reset times"
+    # stdin is already spent by `task="$(cat)"` above, so an answer has to come
+    # from the terminal directly. Testing `-r /dev/tty` is not enough: the file
+    # is readable even with no controlling terminal, where the read then fails
+    # with "Device not configured", and taking that empty answer for a "no"
+    # cancelled the spawn in precisely the callers that cannot answer
+    # (dashboard, forge-doctor --spawn, CI). So: ask only when stderr is a
+    # terminal and /dev/tty actually opens, and treat a failed read as nobody
+    # being there rather than as a refusal.
+    answer=""; asked=0
+    if [[ -t 2 ]] && { : < /dev/tty; } 2>/dev/null; then
+      printf 'forge: spawn anyway? [y/N], or type a note for the worker: ' >&2
+      if IFS= read -r answer < /dev/tty; then asked=1; else answer=""; fi
+    fi
+    if [[ $asked -eq 1 ]]; then
+      case "$answer" in
+        ""|n|N|no|NO) die "spawn cancelled — plan quota ${left}% (below ${plan_min}%)" ;;
+        y|Y|yes|YES) ;;
+        *) task="$task
+
+## Operator note (plan quota at ${left}%)
+$answer"
+           info "note added to the brief" ;;
+      esac
+    else
+      info "no terminal to ask — spawning anyway (set FORGE_MIN_PLAN=0 to silence)"
+    fi
+  fi
+fi
 
 [[ -f "$(agent_file "$name")" ]] && \
   [[ "$(agent_get "$name" status)" != "merged" && "$(agent_get "$name" status)" != "dropped" ]] && \

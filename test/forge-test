@@ -1843,6 +1843,89 @@ t_plan_ignores_codex_records_with_no_windows() {
   esac
 }
 
+# --- plan-quota guard on spawn ----------------------------------------------
+# Four workers in late October were briefed against a plan that could not
+# finish them. The guard asks instead of letting the log report it afterwards.
+
+# A fixture HOME whose codex session reports the plan nearly spent.
+# left = 100 - used, so used_percent 98 -> 2% left, under the default floor 10.
+_low_plan_home() { # _low_plan_home <used_percent>
+  local used="$1" sess="$TMPROOT/$CURRENT_TEST/.codex/sessions/2026/11/03"
+  mkdir -p "$sess"
+  cat > "$sess/rollout-2026-11-03T00-00-00-aaaa.jsonl" <<JSON
+{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"limit_id":"codex","primary":{"used_percent":$used,"window_minutes":300,"resets_at":9999999999},"secondary":{"used_percent":$used,"window_minutes":10080,"resets_at":9999999999},"plan_type":"plus"}}}
+JSON
+  printf '%s\n' "$TMPROOT/$CURRENT_TEST"
+}
+
+# spawn_with_home <home> [extra-args...] — a spawn with the plan check live.
+# FORGE_NO_PLAN is lifted for these tests only, against a fixture HOME, so no
+# real account is ever read. stdin is closed: the brief comes as an argument,
+# and a guard that tried to read an answer from stdin must not hang here.
+spawn_with_home() {
+  local home="$1"; shift
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" HOME="$home" FORGE_NO_PLAN=0 \
+         "$BIN/forge-spawn" "$@" < /dev/null 2>&1)"
+  RC=$?
+  set -e
+}
+
+# No terminal to ask (dashboard, forge-doctor --spawn, CI): the spawn must go
+# through with a warning, never hang waiting for an answer nobody can give.
+t_plan_guard_warns_without_a_terminal() {
+  local home; home="$(_low_plan_home 98)"
+  spawn_with_home "$home" pg1 "work on a nearly-spent plan"
+  assert_rc 0 "$RC" "spawn proceeds when there is no terminal to ask"
+  assert_contains "$OUT" "down to 2%" "the remaining quota is named"
+  assert_eq "done" "$(await pg1)" "the worker still ran"
+}
+
+# The guard must cost nothing when the plan is healthy.
+t_plan_guard_silent_when_quota_is_fine() {
+  local home; home="$(_low_plan_home 5)"   # 95% left
+  spawn_with_home "$home" pg2 "plenty of plan left"
+  assert_rc 0 "$RC" "spawn proceeds"
+  case "$OUT" in
+    *"down to"*) no "the guard warned although 95% of the plan was left" ;;
+    *) ok ;;
+  esac
+}
+
+# --force is the documented way past every other guard; it must skip this one.
+t_plan_guard_skipped_by_force() {
+  local home; home="$(_low_plan_home 98)"
+  spawn_with_home "$home" --force pg3 "override the guard"
+  assert_rc 0 "$RC" "--force spawns"
+  case "$OUT" in
+    *"down to"*) no "--force still consulted the plan guard" ;;
+    *) ok ;;
+  esac
+}
+
+# An unreadable plan means UNKNOWN, not zero: a missing CLI or a cold cache
+# must never start blocking spawns.
+t_plan_guard_quiet_when_plan_unknown() {
+  local home="$TMPROOT/$CURRENT_TEST/empty-home"
+  mkdir -p "$home"
+  spawn_with_home "$home" pg4 "unknown plan"
+  assert_rc 0 "$RC" "spawn proceeds when the plan cannot be read"
+  case "$OUT" in
+    *"down to"*) no "an unreadable plan was treated as an exhausted one" ;;
+    *) ok ;;
+  esac
+}
+
+t_plan_guard_rejects_bad_floor() {
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" FORGE_MIN_PLAN=abc \
+         "$BIN/forge-spawn" pg5 "bad floor" < /dev/null 2>&1)"
+  RC=$?
+  set -e
+  assert_rc 1 "$RC" "a non-numeric FORGE_MIN_PLAN fails the spawn"
+  assert_contains "$OUT" "FORGE_MIN_PLAN" "the bad variable is named"
+}
+
 t_plan_diff_reports_consumption() {
   # The headline feature: what one operation cost, in plan terms.
   local b="$TMPROOT/plan-b.json" a="$TMPROOT/plan-a.json"
@@ -1925,6 +2008,11 @@ t_plan_is_forwarded_to_the_worker_window() {
 }
 
 run_test plan-codex-null-windows       t_plan_ignores_codex_records_with_no_windows
+run_test plan-guard-warns-no-tty        t_plan_guard_warns_without_a_terminal
+run_test plan-guard-silent-when-fine    t_plan_guard_silent_when_quota_is_fine
+run_test plan-guard-force-skips         t_plan_guard_skipped_by_force
+run_test plan-guard-unknown-is-quiet    t_plan_guard_quiet_when_plan_unknown
+run_test plan-guard-bad-floor           t_plan_guard_rejects_bad_floor
 run_test plan-diff-reports-consumption  t_plan_diff_reports_consumption
 run_test plan-diff-flags-reset          t_plan_diff_flags_a_reset_instead_of_claiming_zero
 run_test plan-survives-bad-input        t_plan_survives_unreadable_input

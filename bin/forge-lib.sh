@@ -341,3 +341,50 @@ agy_permissions() {
   set +f
   printf '{"permissions":{"allow":[%s]}}' "$rules"
 }
+
+# plan_left_percent <provider> <model> — the WORST remaining percentage across
+# that provider's plan windows, or empty when it cannot be established.
+#
+# The worst window, not the average or the first: codex on 2026-11-03 read
+# 5h=65% but week=4%, and it is the week that stops the work. Averaging those
+# would have reported a comfortable 34% while every spawn was about to die.
+#
+# Empty output means UNKNOWN and must never be treated as zero — forge-plan is
+# explicit that a percentage it cannot establish is reported as unknown. A
+# missing CLI, a cold cache or a parse change must not start blocking spawns.
+#
+# antigravity keeps two pools that are never summed, so only the one this model
+# draws on is considered: the slug decides (gemini-* → "Gemini Models",
+# everything else → "Claude and GPT models").
+plan_left_percent() {
+  local provider="$1" model="${2:-}" family="" slug=""
+  [[ "${FORGE_NO_PLAN:-}" == "1" ]] && return 0
+  if [[ "$provider" == "antigravity" ]]; then
+    slug="$(provider_slug antigravity "$model" 2>/dev/null || true)"
+    case "$slug" in
+      gemini-*) family="Gemini Models" ;;
+      *)        family="Claude and GPT models" ;;
+    esac
+  fi
+  "$FORGE_HOME/bin/forge-plan" --json --provider "$provider" 2>/dev/null \
+    | FAMILY="$family" PROVIDER="$provider" python3 -c '
+import json, os, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+rec = ((data or {}).get("providers") or {}).get(os.environ["PROVIDER"])
+if not isinstance(rec, dict):
+    sys.exit(0)
+fam = os.environ.get("FAMILY") or ""
+worst = None
+for w in rec.get("windows") or []:
+    if fam and (w.get("family") or "") != fam:
+        continue
+    left = w.get("left_percent")
+    if isinstance(left, (int, float)):
+        worst = left if worst is None else min(worst, left)
+if worst is not None:
+    print(int(worst))
+' 2>/dev/null || true
+}

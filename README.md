@@ -741,6 +741,32 @@ plus its acceptance check, so uncontrolled fan-out can take the machine down.
 Raise it with `FORGE_MAX_WORKERS=6`, or bypass it once with `--force`.
 `FORGE_MAX_WORKERS=0` disables the limit.
 
+**Plan-quota check.** A worker briefed against an empty plan cannot finish, and
+the cost is paid anyway. When the chosen model's provider has less than
+`FORGE_MIN_PLAN` percent left (default 10, worst window), `forge-spawn` asks
+before starting:
+
+```
+forge: plan quota for 'codex' is down to 4% (worst window) — model 'gpt-6.1-sol'
+forge: run 'forge-plan' for the reset times
+forge: spawn anyway? [y/N], or type a note for the worker:
+```
+
+Unlike the worker limit this is a question, not a refusal: only the operator
+knows whether 4% is enough for the task, and codex's reading comes off disk and
+can be hours old. Three answers:
+
+- **Enter** or `n` — the spawn is cancelled; no branch and no worktree are left.
+- `y` — spawn with the brief unchanged.
+- **anything else** — spawn, with what you typed appended to the brief as an
+  `## Operator note`. At a low quota the useful instruction is usually
+  "report early, skip the full gate" — which is what the brief then carries.
+
+With no terminal to ask (the dashboard, `forge-doctor --spawn`, CI) it warns and
+spawns rather than blocking. A plan it cannot read is **unknown, never zero**, so
+a missing CLI or a cold cache does not start blocking spawns. `--force` skips the
+check, and `FORGE_MIN_PLAN=0` disables it.
+
 ## How much plan is left
 
 ```bash
@@ -1162,6 +1188,7 @@ tmux set-option -t forge mouse off           # turn it off when scrolling misbeh
 | `FORGE_KEEP_WINDOW` | `1` | the worker window stays open after it finishes |
 | `FORGE_REPORT_DIR` | `reports` | directory for worker reports (committed) |
 | `FORGE_MAX_WORKERS` | `4` | limit of concurrently running workers (`0` = no limit, `--force` = bypass) |
+| `FORGE_MIN_PLAN` | `10` | percent of plan left below which `forge-spawn` asks before starting (`0` = no check, `--force` = bypass) |
 | `FORGE_WT_ROOT` | `../.forge-wt/<repo>` | where to keep worktrees |
 | `FORGE_DASH_PORT` | `8787` | dashboard port |
 | `FORGE_DASH_TOKEN` | — | dashboard access token |
