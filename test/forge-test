@@ -1843,6 +1843,90 @@ t_plan_ignores_codex_records_with_no_windows() {
   esac
 }
 
+# --- unanswered dashboard feedback ------------------------------------------
+# A note asking whether ex24-audit could be retried sat in feedback.jsonl for
+# five days. FORGE.md says to read feedback every round; nothing surfaced it
+# where the orchestrator looks.
+
+_write_feedback() { # _write_feedback <json-line>...
+  mkdir -p "$REPO/.forge"
+  : > "$REPO/.forge/feedback.jsonl"
+  local l
+  for l in "$@"; do printf '%s\n' "$l" >> "$REPO/.forge/feedback.jsonl"; done
+}
+
+t_feedback_shown_with_no_workers() {
+  # The case that matters most: the start of a round, before anything is
+  # spawned. An early `exit 0` on "no agents yet" hid the notes here.
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"anonymous","agent":"","text":"could ex24-audit be retried"}'
+  forge status
+  assert_rc 0 "$RC" "status succeeds with no workers"
+  assert_contains "$OUT" "no agents yet" "the empty listing is still shown"
+  assert_contains "$OUT" "unanswered feedback (1)" "the waiting note is surfaced"
+  assert_contains "$OUT" "could ex24-audit be retried" "the note text is printed"
+}
+
+# An empty "agent" field makes @tsv emit two adjacent tabs, which `read` with
+# IFS=$'\t' collapses: the text shifted into the agent column and printed as
+# "(about <the whole note>)" with an empty body.
+t_feedback_without_agent_keeps_its_text() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"anonymous","agent":"","text":"note with no agent"}'
+  forge status
+  assert_contains "$OUT" "note with no agent" "text survives an empty agent field"
+  case "$OUT" in
+    *"(about note with no agent)"*) no "the note text leaked into the agent column" ;;
+    *) ok ;;
+  esac
+}
+
+t_feedback_names_its_agent() {
+  _write_feedback \
+    '{"time":"2026-11-03T08:00:00","author":"operator","agent":"ex24-wire","text":"check the wire"}'
+  forge status
+  assert_contains "$OUT" "(about ex24-wire)" "a note about one worker names it"
+}
+
+# --ack closes what is on file; a note arriving afterwards must show again.
+# The mark is the newest timestamp, not a line count: the dashboard trims the
+# file from the front, so counting lines would reopen old notes.
+t_feedback_ack_then_new_note() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"anonymous","agent":"","text":"old note"}'
+  forge status --ack
+  assert_rc 0 "$RC" "--ack succeeds"
+  forge status
+  case "$OUT" in
+    *"unanswered feedback"*) no "a note stayed unanswered after --ack" ;;
+    *) ok ;;
+  esac
+  printf '%s\n' '{"time":"2026-11-03T09:00:00","author":"klient","agent":"","text":"new note"}' \
+    >> "$REPO/.forge/feedback.jsonl"
+  forge status
+  assert_contains "$OUT" "unanswered feedback (1)" "a note newer than the mark shows again"
+  assert_contains "$OUT" "new note" "and it is the new one"
+}
+
+# --json is consumed by the dashboard and by scripts: it must stay pure JSON.
+t_feedback_absent_from_json() {
+  _write_feedback \
+    '{"time":"2026-10-29T09:54:24","author":"anonymous","agent":"","text":"a note"}'
+  forge status --json
+  assert_rc 0 "$RC" "--json succeeds"
+  printf '%s' "$OUT" | jq -e . >/dev/null 2>&1 && ok || no "--json did not emit valid JSON"
+  case "$OUT" in
+    *"unanswered feedback"*) no "the feedback banner leaked into --json" ;;
+    *) ok ;;
+  esac
+}
+
+t_status_rejects_unknown_flag() {
+  forge status --nosuchflag
+  assert_rc 1 "$RC" "an unknown flag fails"
+  assert_contains "$OUT" "unknown option" "and says so"
+}
+
 # --- plan-quota guard on spawn ----------------------------------------------
 # Four workers in late October were briefed against a plan that could not
 # finish them. The guard asks instead of letting the log report it afterwards.
@@ -2013,6 +2097,12 @@ run_test plan-guard-silent-when-fine    t_plan_guard_silent_when_quota_is_fine
 run_test plan-guard-force-skips         t_plan_guard_skipped_by_force
 run_test plan-guard-unknown-is-quiet    t_plan_guard_quiet_when_plan_unknown
 run_test plan-guard-bad-floor           t_plan_guard_rejects_bad_floor
+run_test feedback-shown-no-workers      t_feedback_shown_with_no_workers
+run_test feedback-keeps-text-no-agent   t_feedback_without_agent_keeps_its_text
+run_test feedback-names-agent           t_feedback_names_its_agent
+run_test feedback-ack-then-new          t_feedback_ack_then_new_note
+run_test feedback-absent-from-json      t_feedback_absent_from_json
+run_test status-rejects-unknown-flag    t_status_rejects_unknown_flag
 run_test plan-diff-reports-consumption  t_plan_diff_reports_consumption
 run_test plan-diff-flags-reset          t_plan_diff_flags_a_reset_instead_of_claiming_zero
 run_test plan-survives-bad-input        t_plan_survives_unreadable_input

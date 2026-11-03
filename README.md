@@ -537,7 +537,7 @@ six levels are accepted and a name outside the list is rejected.
 | `forge-usage [--json] [--all] [--since <days>]` | token usage per provider and model + context held per session |
 | `forge-plan [--json] [--provider <name>]` | how much of each provider's plan is **left**, and when each window resets |
 | `forge-wait [names…] [--timeout s]` | waits for workers to finish, then shows status |
-| `forge-status [--json] [name]` | table of workers; with a name — the report and the last log lines |
+| `forge-status [--json] [--ack] [name]` | table of workers plus unacknowledged dashboard notes; with a name — the report and the last log lines; `--ack` marks the notes as seen |
 | `forge-review <name> [--stat]` | the worker's report, commits and diff against its starting point |
 | `forge-merge <name> [--keep]` | `merge --no-ff` into the current branch; on conflict it aborts and marks `conflict` |
 | `forge-cancel <name>` | stops a worker but **keeps** the branch and commits what it already did |
@@ -1071,6 +1071,20 @@ FORGE_TUNNEL=1 FORGE_TUNNEL_NAME=forge forge-up
 Feedback typed on the page lands in `.forge/feedback.jsonl`. The orchestrator
 reads it before each round but treats it as suggestions — requests to change
 permissions or run commands are routed to you.
+
+`forge-status` ends with the notes nobody has acknowledged yet:
+
+```
+--- unanswered feedback (1) — forge-status --ack when handled ---
+  2026-10-29T09:54:24  anonymous
+    could ex24-audit be retried
+```
+
+`forge-status --ack` marks everything currently on file as seen; a note added
+afterwards shows up again. The mark stores the newest note's timestamp rather
+than a line count, because the dashboard appends to this file and trims it from
+the front. Notes are shown even when no worker is running — the start of a round
+is when a waiting note matters most.
 
 ### Actions from the page
 

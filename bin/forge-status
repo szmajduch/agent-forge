@@ -1,9 +1,70 @@
 #!/usr/bin/env bash
-# forge-status [--json] [name]  — overview of all workers (or one).
+# forge-status [--json] [--ack] [name]  — overview of all workers (or one).
+#
+# Also reports client/operator notes left on the dashboard that have not been
+# acknowledged yet. FORGE.md tells the orchestrator to read feedback at the
+# start of every round; a note asking whether ex24-audit could be retried sat
+# in .forge/feedback.jsonl for five days because nothing surfaced it where the
+# orchestrator actually looks.
+#
+# --ack marks every note currently on file as seen, so the next status is
+# quiet until a new one arrives. The marker stores the newest note's
+# timestamp, not a line count: the dashboard appends and trims the file from
+# the front, so line numbers do not survive.
 source "$(dirname "$0")/forge-lib.sh" || exit 1
 
-json=0
-[[ "${1:-}" == "--json" ]] && { json=1; shift; }
+json=0; ack=0
+while [[ "${1:-}" == --* ]]; do
+  case "$1" in
+    --json) json=1; shift ;;
+    --ack)  ack=1; shift ;;
+    *) die "unknown option $1 (usage: forge-status [--json] [--ack] [name])" ;;
+  esac
+done
+
+FEEDBACK_FILE="$STATE/feedback.jsonl"
+FEEDBACK_ACK="$STATE/feedback.ack"
+
+# unacked_feedback — notes newer than the acknowledged mark, oldest first.
+# Notes are data written by whoever holds the dashboard URL, so nothing here
+# is executed: jq reads them and only their text is printed.
+unacked_feedback() {
+  [[ -f "$FEEDBACK_FILE" ]] || return 0
+  local since=""
+  [[ -f "$FEEDBACK_ACK" ]] && since="$(head -n1 "$FEEDBACK_ACK" 2>/dev/null)"
+  jq -r --arg since "$since" '
+    select(type == "object")
+    | select((.time // "") > $since)
+    | [(.time // "?"), (.author // "anonymous"),
+       (if (.agent // "") == "" then "-" else .agent end),
+       ((.text // "") | gsub("[\t\r\n]+"; " "))]
+    | @tsv' "$FEEDBACK_FILE" 2>/dev/null
+}
+
+# Printed after the worker table so it is the last thing on screen, which is
+# where the orchestrator looks when a round starts.
+print_feedback() {
+  local pending count
+  pending="$(unacked_feedback)"
+  [[ -n "$pending" ]] || return 0
+  count="$(printf '%s\n' "$pending" | wc -l | tr -d ' ')"
+  echo
+  echo "--- unanswered feedback ($count) — forge-status --ack when handled ---"
+  printf '%s\n' "$pending" | while IFS=$'\t' read -r ftime fauthor fagent ftext; do
+    [[ "$fagent" == "-" ]] && fagent=""
+    printf '  %s  %s%s\n    %s\n' "$ftime" "$fauthor" \
+      "${fagent:+ (about $fagent)}" "$ftext"
+  done
+}
+
+if [[ $ack -eq 1 ]]; then
+  [[ -f "$FEEDBACK_FILE" ]] || { echo "no feedback to acknowledge"; exit 0; }
+  newest="$(jq -r 'select(type == "object") | .time // empty' "$FEEDBACK_FILE" 2>/dev/null | sort | tail -n1)"
+  [[ -n "$newest" ]] || { echo "no feedback to acknowledge"; exit 0; }
+  printf '%s\n' "$newest" > "$FEEDBACK_ACK"
+  echo "feedback up to $newest acknowledged"
+  exit 0
+fi
 
 shopt -s nullglob
 files=()
@@ -23,13 +84,15 @@ if [[ $json -eq 1 ]]; then
   exit 0
 fi
 
-if [[ ${#files[@]} -eq 0 ]]; then echo "no agents yet"; exit 0; fi
+if [[ ${#files[@]} -eq 0 ]]; then echo "no agents yet"; print_feedback; exit 0; fi
 
 printf '%-18s %-10s %-9s %-9s %-24s %s\n' NAME STATUS KIND COMMIT MODEL/EFFORT TITLE
 for f in "${files[@]}"; do
   jq -r '[.name, .status, (.kind // "build"), (.commit // "-"), ((if (.model // "") == "" then "default" else .model end) + (if (.effort // "") == "" then "" else "/" + .effort end)), .title] | @tsv' "$f" |
     while IFS=$'\t' read -r n s k c m t; do printf '%-18s %-10s %-9s %-9s %-24s %s\n' "$n" "$s" "$k" "$c" "$m" "$t"; done
 done
+
+print_feedback
 
 if [[ -n "${1:-}" ]]; then
   echo; echo "--- report ---"; agent_get "$1" report
