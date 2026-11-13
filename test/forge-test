@@ -92,6 +92,8 @@ assert_no_file() { # assert_no_file <path> <what>
 #   hang     — never exits; the window gets killed under it → "interrupted"
 #   fail     — writes nothing, exits 7   → expect status "failed"
 #   limit    — prints codex's real usage-limit error, exits 1 → "exhausted"
+#   limitlast— quota text as the LAST line but exits 7 (a worker's own failure,
+#              not a provider abort) → "failed"
 #   limitagy — prints agy's real RESOURCE_EXHAUSTED error, exits 3 → "exhausted"
 #   limitread— exits 7 having merely PRINTED a quota error early, then lots of
 #              output: a worker whose INPUT mentioned a limit must stay "failed"
@@ -130,11 +132,20 @@ case "$MODE" in
   limitagy) echo 'error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h16m28s.'
           echo 'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached.","status":"RESOURCE_EXHAUSTED","error_code":429,"retryable":true}'
           exit 3 ;;
-  # A quota error in the worker's INPUT, far from the end, then real work and a
-  # genuine failure. Only the tail is scanned, so this must stay "failed".
+  # A quota error in the worker's INPUT, then real work and a genuine failure.
+  # The padding is 20 lines, not 400: the detector reads the last few lines,
+  # so 20 is already past it. The original 400 was enough to clear a 4000-BYTE
+  # window, which meant this mode passed without the rule being right — it was
+  # measuring the window. Kept deliberately small so it would fail again if the
+  # detector went back to scanning a large block.
   limitread) echo "ERROR: You’ve hit your usage limit. (quoted from a log this worker was auditing)"
-          i=0; while [[ $i -lt 400 ]]; do echo "line $i of ordinary analysis output"; i=$((i+1)); done
+          i=0; while [[ $i -lt 20 ]]; do echo "line $i of ordinary analysis output"; i=$((i+1)); done
           echo "fake codex failure" >&2; exit 7 ;;
+  # The hard case: the quota text is the worker's LAST line, so position alone
+  # cannot tell this from a provider that just aborted. The exit code does —
+  # a worker failing its own check exits 7, codex aborts on quota with 1.
+  limitlast) echo "audit finding: the 2026-10-28 run hit your usage limit"
+          exit 7 ;;
 esac
 exit 0
 EOF
@@ -383,9 +394,24 @@ t_quota_limit_is_exhausted_not_failed() {
 }
 
 t_agy_quota_limit_is_exhausted() {
-  write_fake_codex "$FAKEBIN/codex" limitagy
-  forge spawn q2 "burn the agy plan"
+  # Run as a real agy worker, not as a fake codex printing agy's text. The
+  # original fixture did the latter, which was fine while the detector looked
+  # only at the message; now that it also requires the provider's own quota
+  # exit code, agy's wording out of a codex worker is deliberately NOT a quota
+  # abort. Spawning the actual provider is what the test meant all along.
+  write_fake_provider "$FAKEBIN/agy" antigravity-quota
+  forge spawn --model agy-sonnet q2 "burn the agy plan"
   assert_eq "exhausted" "$(await q2)" "agy RESOURCE_EXHAUSTED reported exhausted"
+}
+
+t_agy_wording_from_another_provider_is_not_quota() {
+  # The flip side, and the reason the fixture above had to change: agy's quota
+  # wording coming out of a CODEX worker is a codex worker that printed
+  # something, not a plan that ran out. Exit 3 is not codex's quota code.
+  write_fake_codex "$FAKEBIN/codex" limitagy
+  forge spawn q6 "a codex task whose output quotes agy quota wording"
+  assert_eq "failed" "$(await q6)" \
+    "another provider's quota wording is not this provider's quota abort"
 }
 
 # The detector reads only the log tail. A worker auditing someone else's quota
@@ -394,6 +420,55 @@ t_quota_text_in_input_stays_failed() {
   write_fake_codex "$FAKEBIN/codex" limitread
   forge spawn q3 "audit a log that mentions a usage limit"
   assert_eq "failed" "$(await q3)" "quota text in the worker's input stays failed"
+}
+
+t_quota_text_at_the_end_stays_failed() {
+  # The regression. The detector used to scan `tail -c 4000`, so the guard was
+  # positional: measured on a worker that genuinely failed (exit 7) while its
+  # own output mentioned a usage limit, 0 and 50 trailing lines were both
+  # reported `exhausted`, and only ~150 lines pushed the text out of the byte
+  # window. The old limitread fixture padded with 400 lines, so it passed
+  # without the rule being right.
+  #
+  # Here the quota text IS the last line, which position alone cannot judge.
+  # The exit code decides: 7 is the worker's own acceptance check failing, not
+  # a provider aborting on quota.
+  write_fake_codex "$FAKEBIN/codex" limitlast
+  forge spawn q4 "audit the quota incident of 2026-10-28"
+  assert_eq "failed" "$(await q4)" \
+    "quota text on the last line with a worker exit code stays failed"
+}
+
+t_quota_needs_the_provider_exit_code() {
+  # The two signals are required together, so neither alone can decide. This
+  # asserts the exit-code half: the real codex quota message, which the
+  # `limit` mode reproduces verbatim from ex24-audit's log, exits 1 and must
+  # still be recognised — otherwise the fix would have traded a false
+  # `exhausted` for a false `failed`, which costs a wasted retry.
+  write_fake_codex "$FAKEBIN/codex" limit
+  forge spawn q5 "a task that runs out of plan"
+  assert_eq "exhausted" "$(await q5)" \
+    "a real provider quota abort is still exhausted"
+}
+
+t_denied_report_does_not_clobber_the_worker_kind() {
+  # `kind` holds the worker kind (build/analysis) and was reassigned inside the
+  # agy denial branch to "CMDS"/"ACTIONS". It was harmless only by accident:
+  # that branch also sets rc=1, and the later read of $kind sits in the rc==0
+  # arm, so the two never met. One edit to the rc branching away from an
+  # analysis worker being told it produced no code.
+  #
+  # Asserted against the source, because the live path is unreachable by
+  # construction — a test that ran it would prove nothing about the trap.
+  local after
+  after="$(awk '/^kind=/{next} /\$kind/{print NR}' "$FORGE_HOME/bin/forge-run")"
+  grep -n 'denied_kind=' "$FORGE_HOME/bin/forge-run" >/dev/null \
+    || no "the denial branch no longer uses a separate variable name"
+  # No assignment to `kind` may exist other than the one at the top.
+  assert_eq "1" "$(grep -c '^kind=' "$FORGE_HOME/bin/forge-run")" \
+    "the worker kind is assigned exactly once"
+  assert_eq "0" "$(grep -c '^\s*kind="\${denied' "$FORGE_HOME/bin/forge-run")" \
+    "the denial branch does not assign to the worker kind"
 }
 
 t_legacy_root_report_is_moved() {
@@ -1313,6 +1388,17 @@ if [[ "$KIND" == "antigravity" ]]; then
   echo "jetski: starting"
   echo '{"conversation_id":"c1","status":"SUCCESS","response":"ok","duration_seconds":1,"num_turns":1,"usage":{"input_tokens":100,"output_tokens":20,"thinking_tokens":5,"cache_read_tokens":80,"total_tokens":120}}'
 fi
+if [[ "$KIND" == "antigravity-quota" ]]; then
+  # Verbatim shape from .forge/logs/random-validate-v2.log (2026-10-31), and
+  # exit 3, which is what agy really returns when the plan runs out. It must
+  # run as the agy CLI rather than as a fake codex: the detector now pairs the
+  # message with the PROVIDER's own quota exit code, so "agy's text out of a
+  # codex worker" is no longer a quota abort — it is a codex worker that
+  # printed something, which is exactly the distinction being tested.
+  echo 'error: Individual quota reached. Please upgrade your subscription to increase your limits. Resets in 4h16m28s.'
+  echo 'AGY_ERROR: {"short_error":"RESOURCE_EXHAUSTED (code 429): Individual quota reached.","status":"RESOURCE_EXHAUSTED","error_code":429,"retryable":true}'
+  exit 3
+fi
 if [[ "$KIND" == "antigravity-denied" ]]; then
   # stream-json, which is what forge-run asks agy for: a step_update naming
   # the denied command, then the envelope. The envelope alone says only
@@ -2148,6 +2234,10 @@ run_test noop-worker-is-nochanges       t_noop_worker_is_nochanges
 run_test failed-worker-keeps-worktree   t_failed_worker_keeps_worktree
 run_test quota-limit-is-exhausted       t_quota_limit_is_exhausted_not_failed
 run_test agy-quota-limit-is-exhausted   t_agy_quota_limit_is_exhausted
+run_test agy-wording-needs-agy          t_agy_wording_from_another_provider_is_not_quota
+run_test quota-text-at-end-stays-failed t_quota_text_at_the_end_stays_failed
+run_test quota-needs-provider-exit-code t_quota_needs_the_provider_exit_code
+run_test denied-keeps-worker-kind       t_denied_report_does_not_clobber_the_worker_kind
 run_test quota-text-in-input-stays-failed t_quota_text_in_input_stays_failed
 run_test legacy-root-report-moved       t_legacy_root_report_is_moved
 

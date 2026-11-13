@@ -227,9 +227,15 @@ PYEOF
     # The parser prints either "CMDS<tab>cmd<tab>cmd" when it recovered the
     # actual command lines, or "ACTIONS<tab>names" when it could not (a worker
     # run with FORGE_AGY_ARGS="--output-format json" emits no step_updates).
-    kind="${denied%%$'\t'*}"
+    # NOT named `kind`: that holds the WORKER kind (build/analysis), set at the
+    # top and read again further down to word the `nochanges` message. Assigning
+    # to it here left it as "CMDS"/"ACTIONS" for the rest of the run. Harmless
+    # only by accident — this branch also sets rc=1, and the later read sits in
+    # the rc==0 arm, so the two never met. That is one edit to the rc branching
+    # away from an analysis worker being told it wrote no code.
+    denied_kind="${denied%%$'\t'*}"
     rest="${denied#*$'\t'}"
-    if [[ "$kind" == "CMDS" ]]; then
+    if [[ "$denied_kind" == "CMDS" ]]; then
       echo "=== agy was denied these commands ===" | tee -a "$log"
       # One per line, split on TABS only. An unquoted $(...) would word-split
       # on spaces too and print "ls -la" as two lines, which is how this was
@@ -249,7 +255,7 @@ PYEOF
     # as run_command.error.message on the denied step. So say where the answer
     # is instead of pretending this message holds it. And name the usual
     # culprit: not the task's own command, but one agy ran to orient itself.
-    if [[ "$kind" != "CMDS" ]]; then
+    if [[ "$denied_kind" != "CMDS" ]]; then
       # Only reachable when the operator overrode the output format, since
       # forge now defaults to stream-json, which names the commands above.
       cat >>"$log" <<'DENYHINT'
@@ -313,10 +319,64 @@ if [[ $rc -ne 0 ]]; then
   #          pattern never matches.
   #   agy:   "RESOURCE_EXHAUSTED (code 429)" / "Individual quota reached",
   #          exit 3, with "Resets in <duration>".
-  # Only the log tail is scanned: a worker that read a quota error out of some
-  # file it was auditing must not be relabelled because of its input.
+  # Scanned at the very END of the log, because that is what actually
+  # distinguishes the two cases. When a provider hits its plan limit it prints
+  # the error and aborts, so the message IS the last thing in the log. A worker
+  # that merely READ about a quota error — an analysis worker auditing an
+  # incident log, a build worker whose test output quotes one — carries on
+  # afterwards, so there is work between that text and the end.
+  #
+  # This used to scan `tail -c 4000`, which made the guard positional and not
+  # structural: measured on a worker that genuinely failed with exit 7 while
+  # mentioning a usage limit, 0 and 50 trailing lines were both reported
+  # `exhausted`, and only ~150 lines of later output pushed the text out of the
+  # byte window and gave the right answer. The existing limitread test passed
+  # only because it padded with 400 lines, so it was testing the window rather
+  # than the rule, and the comment here claimed a protection the code did not
+  # provide — which is worse than having none, since it invites trust.
+  #
+  # QUOTA_TAIL_LINES is small on purpose. codex ends with its ERROR line; agy
+  # ends with the "Resets in <duration>" line plus its AGY_ERROR envelope. A
+  # few lines of slack covers a provider that adds a parting line, while still
+  # leaving no room for a worker to produce real output after the text.
+  QUOTA_TAIL_LINES=8
+  # The exit code is the second half of the test, and it is what closes the
+  # remaining ambiguity: a worker whose LAST line quotes a quota error looks
+  # exactly like a provider that just aborted on one. It is not the same event,
+  # and the provider says so in its exit status — codex aborts on quota with 1,
+  # agy with 3 (both measured; see the log excerpts above). A worker that fails
+  # its own acceptance check exits with whatever that check returned, which is
+  # why the repro used 7.
+  #
+  # Deliberately a whitelist of the two known codes rather than "nonzero":
+  # treating any nonzero as eligible would put us straight back to deciding on
+  # the text alone. If a provider adds a quota code, this needs one entry — and
+  # the failure mode of forgetting is `failed` on a worker that is really
+  # exhausted, which costs a wasted retry and is visible in the log, rather
+  # than `exhausted` on a worker whose brief is broken, which sends the
+  # orchestrator the wrong way with FORGE.md telling it the brief was fine.
+  quota_rc=0
+  case "$provider:$rc" in
+    # codex:1 and antigravity:3 are measured, from the logs quoted above.
+    # claude:1 is NOT: no claude worker has been observed running out of plan
+    # here, and 1 is simply its general-failure code. It is listed because the
+    # text patterns are claude-shaped too ("usage limit"), and the cost of the
+    # two mistakes is asymmetric — a missing entry mislabels a real exhaustion
+    # as `failed` and wastes a retry, while a wrong entry only lets the text
+    # decide, which is what the old code did for every provider. Replace this
+    # with the real code once a claude worker has actually hit the limit.
+    codex:1|claude:1|antigravity:3) quota_rc=1 ;;
+  esac
+  # What is left, and is NOT claimed to be solved: a worker that quotes quota
+  # text in its last few lines AND exits with the provider's own quota code is
+  # indistinguishable from a real abort. Nothing here can separate them —
+  # provider stderr and worker stdout are merged by the `2>&1 | tee` above
+  # before this scan, so the stream of origin is already gone. An analysis
+  # worker auditing a quota incident is the realistic shape, and it will be
+  # misread as exhausted if it also exits 1. Saying so beats implying the
+  # detector is exact.
   status_final=failed
-  if tail -c 4000 "$log" | grep -qE \
+  if [[ $quota_rc -eq 1 ]] && tail -n "$QUOTA_TAIL_LINES" "$log" | grep -qE \
       'hit your usage limit|RESOURCE_EXHAUSTED|Individual quota reached|quota reached'; then
     status_final=exhausted
   fi

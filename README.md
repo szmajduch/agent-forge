@@ -108,6 +108,10 @@ reading the diff first, and `forge-drop` (which destroys work) has to ask you.
 
    a worker that exited because the PLAN ran out (codex "usage limit", agy
    RESOURCE_EXHAUSTED) becomes `exhausted`, not `failed`: same brief, retry later.
+   Recognised from two signals together — the message in the last few lines of
+   the log AND the provider's own quota exit code — so a worker that merely
+   READ about a quota error (an analysis worker auditing an incident) is not
+   relabelled because of what it quoted.
 
    a worker whose tmux window disappeared (reboot, tmux server crash, the
    machine asleep, a hand-typed kill-window) becomes `interrupted`: its status
@@ -562,7 +566,11 @@ six levels are accepted and a name outside the list is rejected.
 Worker statuses: `queued → running → done | nochanges | failed | exhausted |
 interrupted`, then `merged | conflict | cancelled | dropped`.
 `exhausted` is a worker whose provider plan ran out mid-run — it is kept apart
-from `failed` because it needs only a later retry, never a new brief.
+from `failed` because it needs only a later retry, never a new brief. It needs
+both the provider's quota exit code and the message at the end of the log, so
+quoting a quota error is not enough to earn the status; one case stays
+ambiguous and is documented in forge-run: a worker that quotes such a message
+on its last line and also exits with that provider's quota code.
 `interrupted` is a worker whose run never finished: its tmux window is gone, so
 forge-run can no longer write a status. It is kept apart from `failed` for the
 same reason — `failed` means the model ran and its log says why, while an
