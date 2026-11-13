@@ -20,6 +20,19 @@ valid_name "$name"
 base_sha="$(agent_get "$name" base_sha)"
 branch="$(agent_get "$name" branch)"
 
+# Both are required, because git reads a half-empty range as an EMPTY one
+# rather than as an error: with base_sha unset, `git log "..$branch"` and
+# `git diff "...$branch"` both succeed and print nothing. The reviewer then
+# sees "## commits" and "## diff" with no content and concludes the worker
+# produced nothing — a silently wrong answer about work that may well exist,
+# which is worse than a refusal. forge-spawn always records base_sha (it dies
+# on an unresolvable --base), so this is reachable only on a hand-edited or
+# pre-base_sha state file; it costs one check to say so instead of lying.
+[[ -n "$base_sha" ]] || die "agent '$name' has no base_sha recorded, so there is nothing to diff against.
+  Its state file predates that field or was edited by hand. The branch is still
+  readable directly:  git -C $ROOT log --oneline ${branch:-agent/$name}"
+[[ -n "$branch" ]] || die "agent '$name' has no branch recorded — its state file is incomplete"
+
 kind="$(agent_get "$name" kind)"; kind="${kind:-build}"
 eff="$(agent_get "$name" effort)"
 echo "# $name — $(agent_get "$name" status) [$kind${eff:+, effort: $eff}]"

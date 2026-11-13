@@ -1753,6 +1753,94 @@ t_usage_json_is_valid_when_empty() {
     && ok || no "forge-usage --json did not produce a JSON array"
 }
 
+# --- provider data that is not what forge expects ----------------------------
+# Every token figure comes out of a file another program wrote. `.get(k, 0)`
+# only covers a MISSING key; an explicit null or a string reached the sum and
+# took forge-usage down with a TypeError. forge-plan already degraded such
+# input to "unknown" ("a provider CLI is not forge's code") — the token
+# parsers did not, which is the asymmetry these cover.
+
+t_usage_survives_a_null_token_count() {
+  # Reproduced before the fix: `{"output_tokens": null}` crashed with
+  # "unsupported operand type(s) for +=: 'int' and 'NoneType'", rc=1, and the
+  # whole command printed nothing — including the records that were fine.
+  mkdir -p "$REPO/.forge/usage"
+  printf '%s\n' '{"provider":"antigravity","model":"agy-opus","cwd":"'"$REPO"'","usage":{"input_tokens":10,"output_tokens":null,"total_tokens":10}}' \
+    > "$REPO/.forge/usage/nulltok.json"
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"; RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-usage with a null token count"
+  case "$OUT" in
+    *Traceback*) no "forge-usage crashed on a null token count" ;;
+    *) ok ;;
+  esac
+  # The usable figure must survive: one odd field must not discard the record.
+  assert_eq "10" \
+    "$(printf '%s' "$OUT" | jq -r '[.[] | select(.session=="nulltok") | .input] | add // 0')" \
+    "the field that was readable is still reported"
+}
+
+t_usage_survives_a_non_numeric_token_count() {
+  mkdir -p "$REPO/.forge/usage"
+  printf '%s\n' '{"provider":"antigravity","model":"agy-opus","cwd":"'"$REPO"'","usage":{"input_tokens":"lots","output_tokens":5,"total_tokens":5}}' \
+    > "$REPO/.forge/usage/strtok.json"
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"; RC=$?
+  set -e
+  assert_rc 0 "$RC" "forge-usage with a string where a number belongs"
+  case "$OUT" in
+    *Traceback*) no "forge-usage crashed on a non-numeric token count" ;;
+    *) ok ;;
+  esac
+  assert_eq "0" \
+    "$(printf '%s' "$OUT" | jq -r '[.[] | select(.session=="strtok") | .input] | add // 0')" \
+    "an unusable value counts as zero, not as a crash"
+}
+
+t_usage_reads_a_numeric_string_as_a_number() {
+  # The other direction: coercion must not throw away a figure that is merely
+  # quoted. A provider that starts emitting "1234" is reporting 1234 tokens,
+  # and silently counting zero would understate the bill.
+  mkdir -p "$REPO/.forge/usage"
+  printf '%s\n' '{"provider":"antigravity","model":"agy-opus","cwd":"'"$REPO"'","usage":{"input_tokens":"1234","output_tokens":0,"total_tokens":1234}}' \
+    > "$REPO/.forge/usage/numstr.json"
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"
+  assert_eq "1234" \
+    "$(printf '%s' "$OUT" | jq -r '[.[] | select(.session=="numstr") | .input] | add // 0')" \
+    "a quoted number is read as that number"
+}
+
+t_usage_does_not_count_a_bool_as_a_token() {
+  # Python would take True as 1 in a sum, inventing a token out of a flag.
+  mkdir -p "$REPO/.forge/usage"
+  printf '%s\n' '{"provider":"antigravity","model":"agy-opus","cwd":"'"$REPO"'","usage":{"input_tokens":true,"output_tokens":7,"total_tokens":7}}' \
+    > "$REPO/.forge/usage/booltok.json"
+  OUT="$(cd "$REPO" && "$BIN/forge-usage" --json 2>&1)"
+  assert_eq "0" \
+    "$(printf '%s' "$OUT" | jq -r '[.[] | select(.session=="booltok") | .input] | add // 0')" \
+    "a boolean is not worth one token"
+}
+
+t_review_refuses_a_record_with_no_base() {
+  # git reads a half-empty range as an EMPTY one, so `git log "..$branch"`
+  # succeeded and printed nothing: forge-review showed "## commits" and
+  # "## diff" with no content, which reads as "this worker did nothing"
+  # about work that may well exist. A refusal is the honest answer.
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' '{"name":"nobase","status":"done","branch":"main","kind":"build","title":"no base_sha"}' \
+    > "$REPO/.forge/agents/nobase.json"
+  set +e
+  OUT="$(cd "$REPO" && "$BIN/forge-review" nobase 2>&1)"; RC=$?
+  set -e
+  assert_rc 1 "$RC" "forge-review on a record with no base_sha"
+  assert_contains "$OUT" "no base_sha recorded" "it says what is missing"
+  case "$OUT" in
+    *"## diff"*) no "forge-review printed empty diff sections instead of refusing" ;;
+    *) ok ;;
+  esac
+}
+
 # --- stale workers (interrupted) ---------------------------------------------
 # A worker's status is written by forge-run, inside the worker's own tmux
 # window. If that process dies without reaching its final lines (reboot, tmux
@@ -2579,6 +2667,14 @@ run_test plan-forwarded-to-worker       t_plan_is_forwarded_to_the_worker_window
 run_test usage-reports-antigravity      t_usage_reports_antigravity_from_worker
 run_test usage-total-derived            t_usage_total_is_derived_not_trusted
 run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty
+
+echo
+echo "provider data that is not what forge expects"
+run_test usage-survives-null-token       t_usage_survives_a_null_token_count
+run_test usage-survives-string-token     t_usage_survives_a_non_numeric_token_count
+run_test usage-reads-numeric-string      t_usage_reads_a_numeric_string_as_a_number
+run_test usage-bool-is-not-a-token       t_usage_does_not_count_a_bool_as_a_token
+run_test review-refuses-without-base     t_review_refuses_a_record_with_no_base
 
 echo
 echo "stale workers (interrupted)"
