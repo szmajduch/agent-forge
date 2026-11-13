@@ -19,6 +19,21 @@ esac
 
 wt="$(agent_get "$name" worktree)"
 
+# Refresh the agent's own state write before the window goes away. The
+# stale-worker reaper treats a queued/running agent with no window as gone,
+# and between the kill below and the final status there is slow work (the git
+# add + commit here, `worktree remove --force` in forge-drop) — long enough
+# for a concurrent forge-status to hit that gap and mislabel this worker
+# `interrupted`. Measured on a 1500-file dirty worktree: it hit on the second
+# poll. The real status still lands last, so this self-healed, but it left a
+# stray interrupted_from/finished pair on a worker nobody interrupted.
+#
+# A no-op agent_set is enough: it rewrites the file, so the reaper's grace
+# period (FORGE_REAP_GRACE, see forge-lib.sh) covers everything below. No new
+# status is introduced on purpose — a `cancelling`/`dropping` state would
+# strand the worker permanently if this command were killed mid-flight, since
+# nothing reaps or retries a status outside queued/running.
+agent_set "$name" cancel_started="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 # Killing the window takes the whole process group with it, including codex.
 tmux kill-window -t "$FORGE_SESSION:$name" 2>/dev/null || true
 

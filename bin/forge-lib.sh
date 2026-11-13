@@ -189,7 +189,7 @@ ensure_session() {
 # it is added.
 FORGE_WORKER_ENV="FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS
 FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS FORGE_AGY_FLOOR
-FORGE_REPORT_DIR FORGE_KEEP_WINDOW FORGE_NO_PLAN FORGE_LOCK_TIMEOUT
+FORGE_REPORT_DIR FORGE_KEEP_WINDOW FORGE_NO_PLAN FORGE_LOCK_TIMEOUT FORGE_REAP_GRACE
 FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION"
 
 # tmux_worker_env — prints the -e arguments for the variables that are set.
@@ -218,10 +218,22 @@ tmux_worker_env() {
 # by workers that no longer exist) and forge-wait blocks on it for the full
 # 1800s default waiting for a status that nothing will ever write.
 #
-# The ground truth is the tmux window. forge-spawn creates it with
-# `tmux new-window` BEFORE returning (verified: the window is listed by the
-# time the command exits), so there is no window-not-yet-up race for a worker
-# whose state file already says queued/running.
+# The ground truth is the tmux window, but only once that window has had a
+# chance to exist. forge-spawn writes status=queued BEFORE it calls
+# `tmux new-window` (the worktree, the exclude file and ensure_session all run
+# in between), so for a short moment a perfectly healthy worker is `queued`
+# with no window — exactly the condition tested here. Measured: a real spawn
+# with a concurrent forge-status left `interrupted_from: queued` on a worker
+# that went on to run normally, rescued only because forge-run happened to
+# overwrite the status afterwards. forge-wait would have reported that worker
+# finished, and forge-spawn would have counted its slot as free and started
+# one over FORGE_MAX_WORKERS — the very bug the reaper exists to prevent.
+#
+# So the window is only trusted as evidence after FORGE_REAP_GRACE seconds
+# without a state write. `running` is written by forge-run from inside the
+# window, so by then the window demonstrably existed and the grace period only
+# ever delays a true reap; for `queued` it is what separates "never started"
+# from "starting right now".
 #
 # Deliberately a distinct status, `interrupted`, not `failed`:
 #   - `failed` means the model ran and did not succeed. Its log explains why,
@@ -231,6 +243,13 @@ tmux_worker_env() {
 # Both are retryable, and forge-retry accepts both, but the operator needs to
 # tell "the task is hard" from "my laptop slept".
 reaped_stale=""
+
+# Seconds a queued/running agent is left alone after its last state write
+# before a missing window counts as proof it is gone. Must comfortably exceed
+# the spawn gap above (worktree creation, which is the slow part). 5s is ~50x
+# the measured gap on this repo and still well under forge-wait's 5s poll, so
+# a genuinely dead worker is reclassified on the first or second poll.
+FORGE_REAP_GRACE="${FORGE_REAP_GRACE:-5}"
 
 # tmux_window_names — one window name per line, empty if the session or the
 # whole tmux server is gone. Both cases exit 1 with no output, which is the
@@ -247,12 +266,32 @@ tmux_window_names() {
 # Called by the commands that READ worker state and would otherwise act on a
 # lie: forge-status (shows it), forge-wait (blocks on it) and forge-spawn
 # (counts it against the limit). Not called by forge-run, which IS the worker.
+# reap_grace_sentinel — an empty file backdated FORGE_REAP_GRACE seconds, so a
+# state file's age is a plain `-nt` comparison. Done this way because there is
+# no portable shell arithmetic on timestamps: `date -v` is BSD-only, `date -d`
+# is GNU-only, `stat` takes -f here and -c there, and `find -mmin` rejects the
+# fractional minutes a seconds-scale grace needs (checked: both /usr/bin/find
+# and bfs refuse -mmin -0.1). python3 is already a hard dependency
+# (forge-doctor checks for it), and os.utime needs no date flags at all.
+#
+# Prints the sentinel path; the caller removes it. On any failure it prints
+# nothing, and the caller then skips the age check rather than reaping on a
+# guess.
+reap_grace_sentinel() {
+  local s
+  s="$(mktemp "${TMPDIR:-/tmp}/forge-reap.XXXXXX")" || return 1
+  python3 -c 'import os,sys,time; t=time.time()-float(sys.argv[2]); os.utime(sys.argv[1],(t,t))' \
+    "$s" "$FORGE_REAP_GRACE" 2>/dev/null || { rm -f "$s"; return 1; }
+  printf '%s\n' "$s"
+}
+
 reap_stale() {
   reaped_stale=""
-  local windows f name status
+  local windows f name status sentinel
   shopt -s nullglob
   local files=("$STATE"/agents/*.json)
   [[ ${#files[@]} -gt 0 ]] || return 0
+  sentinel="$(reap_grace_sentinel || true)"
 
   # Read the window list once, not per agent: with the session gone this is a
   # failed tmux call, and doing it per worker made forge-status visibly slow.
@@ -266,11 +305,17 @@ reap_stale() {
     # grep -x against the whole list: a worker named "api" must not be kept
     # alive by a window named "api-tests".
     printf '%s\n' "$windows" | grep -qxF "$name" && continue
+    # Written within the grace period: too young to judge. Without the
+    # sentinel (mktemp or python3 unavailable) the check is skipped rather
+    # than guessed at — the pre-grace behaviour, which is wrong only in this
+    # narrow race and never leaves a dead worker unreaped.
+    [[ -n "$sentinel" && "$f" -nt "$sentinel" ]] && continue
     agent_set "$name" status=interrupted \
       finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
       interrupted_from="$status"
     reaped_stale="$reaped_stale $name"
   done
+  [[ -n "$sentinel" ]] && rm -f "$sentinel"
   return 0
 }
 

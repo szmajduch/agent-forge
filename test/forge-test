@@ -1783,6 +1783,15 @@ orphan_a_worker() { # orphan_a_worker <name>
       | grep -qxF "$n" || break
     sleep 0.25; i=$((i+1))
   done
+  # The reaper ignores a state file written within FORGE_REAP_GRACE seconds, so
+  # that a worker still being spawned is not mistaken for a dead one. These
+  # tests kill the window a fraction of a second after the worker started, so
+  # without this they would assert on a worker the reaper is deliberately
+  # still protecting. Backdating the file is the honest way to say "this one
+  # has been gone a while": the alternative, sleeping out the grace, would add
+  # FORGE_REAP_GRACE seconds to every test here.
+  python3 -c 'import os,sys,time; t=time.time()-3600; os.utime(sys.argv[1],(t,t))' \
+    "$REPO/.forge/agents/$n.json"
 }
 
 t_status_reaps_a_dead_worker() {
@@ -1878,6 +1887,73 @@ t_reap_survives_a_missing_tmux_session() {
   forge status
   assert_rc 0 "$RC" "forge-status with no tmux session at all"
   assert_eq "interrupted" "$(status_of orphan)" "reclassified with the session gone"
+}
+
+t_queued_worker_is_not_reaped_before_its_window_opens() {
+  # The regression the grace period exists for. forge-spawn writes
+  # status=queued BEFORE `tmux new-window`, so for a moment a healthy worker is
+  # queued with no window — the reaper's exact trigger. Reproduced on a real
+  # spawn with a concurrent forge-status: it left `interrupted_from: queued` on
+  # a worker that went on to run fine, and forge-spawn would have counted its
+  # slot as free and started one over FORGE_MAX_WORKERS.
+  #
+  # Simulated the same way forge-spawn creates it — state file first, no window
+  # — because racing the real spawn is inherently flaky. A fresh state file must
+  # survive the reap; the stale-worker tests above cover the opposite case.
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' '{"name":"notyet","status":"queued","branch":"agent/notyet","kind":"build","title":"window not open yet"}' \
+    > "$REPO/.forge/agents/notyet.json"
+  forge status
+  assert_rc 0 "$RC" "forge-status with a just-queued worker"
+  assert_eq "queued" "$(status_of_raw notyet)" \
+    "a worker queued moments ago is not reaped before its window can open"
+}
+
+t_queued_worker_is_reaped_once_the_grace_passes() {
+  # The other half: the grace period must only DELAY a true reap, never
+  # cancel it. Same file, backdated past the grace, must still be reclassified
+  # — otherwise a worker that really died while queued is never cleaned up.
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' '{"name":"gone","status":"queued","branch":"agent/gone","kind":"build","title":"died while queued"}' \
+    > "$REPO/.forge/agents/gone.json"
+  python3 -c 'import os,sys,time; t=time.time()-120; os.utime(sys.argv[1],(t,t))' \
+    "$REPO/.forge/agents/gone.json"
+  forge status
+  assert_eq "interrupted" "$(status_of gone)" \
+    "a worker whose state write is older than the grace is still reaped"
+  assert_eq "queued" "$(cd "$REPO" && "$BIN/forge-status" --json \
+    | jq -r '.[] | select(.name=="gone") | .interrupted_from')" \
+    "and it records that it was queued, not running"
+}
+
+t_cancel_does_not_leave_an_interrupted_mark() {
+  # forge-cancel kills the window and only then does its git work, so a
+  # concurrent reader used to see a queued/running agent with no window and
+  # write interrupted_from/finished onto a worker nobody interrupted. The
+  # final status always landed last, so the only trace was those stray
+  # fields — which is what this asserts on.
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+for i in $(seq 1 400); do printf 'payload %s\n' "$i" > "file_$i.txt"; done
+sleep 30
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn cxr "cancel me under a reader"
+  local i=0
+  while [[ $i -lt 60 ]]; do
+    [[ -f "$FORGE_WT_ROOT/cxr/file_400.txt" ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+  # Hammer the reaper for the whole of cancel's git work.
+  ( for _ in $(seq 1 40); do (cd "$REPO" && "$BIN/forge-status" >/dev/null 2>&1); done ) &
+  local ham=$!
+  forge cancel cxr
+  assert_rc 0 "$RC" "forge-cancel under a concurrent reader"
+  wait $ham 2>/dev/null || true
+  assert_eq "cancelled" "$(status_of_raw cxr)" "ends up cancelled"
+  assert_eq "-" "$(cd "$REPO" && "$BIN/forge-status" --json \
+    | jq -r '.[] | select(.name=="cxr") | .interrupted_from // "-"')" \
+    "no stray interrupted_from on a cancelled worker"
 }
 
 # --- worker environment forwarding -------------------------------------------
@@ -2514,6 +2590,9 @@ run_test live-worker-not-reaped         t_live_worker_is_not_reaped
 run_test reaper-exact-window-match      t_reaper_matches_window_names_exactly
 run_test interrupted-can-be-retried     t_interrupted_worker_can_be_retried
 run_test reap-without-tmux-session      t_reap_survives_a_missing_tmux_session
+run_test queued-survives-spawn-gap      t_queued_worker_is_not_reaped_before_its_window_opens
+run_test queued-reaped-after-grace      t_queued_worker_is_reaped_once_the_grace_passes
+run_test cancel-leaves-no-interrupted   t_cancel_does_not_leave_an_interrupted_mark
 
 echo
 echo "worker environment forwarding"

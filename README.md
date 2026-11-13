@@ -112,7 +112,10 @@ reading the diff first, and `forge-drop` (which destroys work) has to ask you.
    a worker whose tmux window disappeared (reboot, tmux server crash, the
    machine asleep, a hand-typed kill-window) becomes `interrupted`: its status
    is written by forge-run FROM INSIDE that window, so nothing is left alive to
-   finish it. forge-status/-wait/-spawn reclassify it when they read the state.
+   finish it. forge-status/-wait/-spawn reclassify it when they read the state,
+   but only once its state file has been untouched for FORGE_REAP_GRACE seconds
+   — forge-spawn writes `queued` before it opens the window, so without that
+   pause a worker that is merely still starting would be declared dead.
 
    failed/exhausted/nochanges/cancelled/interrupted ──forge-retry──► queued
                   (same branch and worktree; continues from the partial work
@@ -1228,6 +1231,7 @@ tmux set-option -t forge mouse off           # turn it off when scrolling misbeh
 | `FORGE_REPORT_DIR` | `reports` | directory for worker reports (committed) |
 | `FORGE_MAX_WORKERS` | `4` | limit of concurrently running workers (`0` = no limit, `--force` = bypass) |
 | `FORGE_MIN_PLAN` | `10` | percent of plan left below which `forge-spawn` asks before starting (`0` = no check, `--force` = bypass) |
+| `FORGE_REAP_GRACE` | `5` | seconds a queued/running worker is left alone after its last state write before a missing tmux window counts as proof it is gone |
 | `FORGE_WT_ROOT` | `../.forge-wt/<repo>` | where to keep worktrees |
 | `FORGE_DASH_PORT` | `8787` | dashboard port |
 | `FORGE_DASH_TOKEN` | — | dashboard access token |
