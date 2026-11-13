@@ -110,6 +110,10 @@ valid_name "$name"
 max_workers="${FORGE_MAX_WORKERS:-4}"
 [[ "$max_workers" =~ ^[0-9]+$ ]] || die "FORGE_MAX_WORKERS must be a whole number, got '$max_workers'"
 if [[ $force -eq 0 && "$max_workers" -gt 0 ]]; then
+  # Before counting: a worker whose window is gone is not active, and without
+  # this it would hold a slot against the limit forever (measured — a killed
+  # window left the agent `running` and blocked every later spawn).
+  reap_stale; report_stale
   shopt -s nullglob
   active=0; active_names=""
   for f in "$STATE"/agents/*.json; do
@@ -221,18 +225,20 @@ agent_set "$name" name="$name" status=queued branch="$branch" base="$base" \
 ensure_session
 # tmux new-window inherits the tmux *server's* environment, not this shell's, so
 # `FORGE_CODEX_ARGS=... forge-spawn ...` would silently not reach the worker.
-# Pass the worker-facing variables explicitly with -e.
+# The list lives in forge-lib.sh (FORGE_WORKER_ENV) because forge-retry starts
+# workers too, and when this block was duplicated the two copies drifted.
+#
+# Read line-by-line rather than by word-splitting: FORGE_AGY_COMMANDS and
+# FORGE_AGY_FLOOR are space-separated lists, so a value here can contain
+# spaces and must survive as one argument.
 tmux_env=()
-for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
-         FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS \
-         FORGE_REPORT_DIR FORGE_KEEP_WINDOW FORGE_NO_PLAN \
-         FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION; do
-  [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
-done
+while IFS= read -r _line; do
+  [[ -n "$_line" ]] && tmux_env+=("$_line")
+done < <(tmux_worker_env)
 # Guarded expansion: under set -u bash 3.2 (macOS) treats an empty array as
 # unbound and aborts. The array is non-empty today only because forge-lib.sh
-# always defines FORGE_SESSION and it is on the list above, so the bare form
-# would be a latent break the moment that list changes.
+# always defines FORGE_SESSION and it is on that list, so the bare form
+# would be a latent break the moment the list changes.
 tmux new-window -d ${tmux_env[@]+"${tmux_env[@]}"} -t "$FORGE_SESSION:" -n "$name" -c "$wt" "$FORGE_HOME/bin/forge-run '$name'"
 
 echo "spawned $name ($kind) on $branch from $base, $provider model: ${model:-provider default}${effort:+, effort: $effort} (worktree: $wt, tmux: $FORGE_SESSION:$name)"

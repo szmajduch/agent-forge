@@ -76,6 +76,13 @@ if [[ $ack -eq 1 ]]; then
   exit 0
 fi
 
+# A worker whose tmux window is gone can never have its status written, so it
+# is reclassified before anything is printed — otherwise status reports
+# `running` for a worker that no longer exists. Runs for --json too: the
+# orchestrator reads that, and it must not be told a dead worker is live. The
+# note goes to stderr, so --json stays parseable.
+reap_stale; report_stale
+
 shopt -s nullglob
 files=()
 if [[ -n "${1:-}" ]]; then
@@ -96,10 +103,12 @@ fi
 
 if [[ ${#files[@]} -eq 0 ]]; then echo "no agents yet"; print_feedback; exit 0; fi
 
-printf '%-18s %-10s %-9s %-9s %-24s %s\n' NAME STATUS KIND COMMIT MODEL/EFFORT TITLE
+# Status column is 12 wide: `interrupted` is 11 characters, and at 10 it
+# pushed every later column out of line on exactly the rows that need reading.
+printf '%-18s %-12s %-9s %-9s %-24s %s\n' NAME STATUS KIND COMMIT MODEL/EFFORT TITLE
 for f in "${files[@]}"; do
   jq -r '[.name, .status, (.kind // "build"), (.commit // "-"), ((if (.model // "") == "" then "default" else .model end) + (if (.effort // "") == "" then "" else "/" + .effort end)), .title] | @tsv' "$f" |
-    while IFS=$'\t' read -r n s k c m t; do printf '%-18s %-10s %-9s %-9s %-24s %s\n' "$n" "$s" "$k" "$c" "$m" "$t"; done
+    while IFS=$'\t' read -r n s k c m t; do printf '%-18s %-12s %-9s %-9s %-24s %s\n' "$n" "$s" "$k" "$c" "$m" "$t"; done
 done
 
 print_feedback

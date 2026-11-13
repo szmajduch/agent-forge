@@ -24,6 +24,10 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
+# Reads state only. The reap is done by the caller below, in the main shell:
+# active() is invoked as $(active), so anything it changed in its own variables
+# — including which workers it reclaimed — dies with the subshell, and the
+# operator would never be told why the wait ended.
 active() {
   local f s
   shopt -s nullglob
@@ -36,6 +40,12 @@ active() {
 }
 
 start=$SECONDS
+# Reaped before every poll, not once up front: a worker can die at any point
+# during the wait, which is the case this exists for. Without it the loop
+# blocks for the full timeout on a status nothing is left alive to write —
+# measured: killing a running worker's window made forge-wait sit out its
+# whole 1800s default.
+reap_stale; report_stale
 while [[ -n "$(active)" ]]; do
   if (( SECONDS - start >= timeout )); then
     echo "timeout; still active: $(active | tr '\n' ' ')"
@@ -45,5 +55,6 @@ while [[ -n "$(active)" ]]; do
     exit 2
   fi
   sleep 5
+  reap_stale; report_stale
 done
 "$FORGE_HOME/bin/forge-status"

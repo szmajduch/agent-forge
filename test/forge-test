@@ -89,6 +89,7 @@ assert_no_file() { # assert_no_file <path> <what>
 #   ok       — writes a report + a code change, exits 0
 #   report   — writes only a report (analysis worker), exits 0
 #   noop     — changes nothing, exits 0  → expect status "nochanges"
+#   hang     — never exits; the window gets killed under it → "interrupted"
 #   fail     — writes nothing, exits 7   → expect status "failed"
 #   limit    — prints codex's real usage-limit error, exits 1 → "exhausted"
 #   limitagy — prints agy's real RESOURCE_EXHAUSTED error, exits 3 → "exhausted"
@@ -116,6 +117,10 @@ case "$MODE" in
   legacy) echo "# legacy root report" > FORGE_REPORT.md ;;
   noop)   : ;;
   fail)   echo "fake codex failure" >&2; exit 7 ;;
+  # Never exits on its own. Used by the stale-worker tests, which kill the
+  # window out from under a worker that is genuinely still running — the one
+  # state in which forge-run can no longer write a status.
+  hang)   sleep 300 ;;
   # Verbatim from .forge/logs/ex24-audit.log (2026-10-28). The apostrophe in
   # "You’ve" is U+2019, not ASCII: that is what codex actually prints, and a
   # detector written against ASCII never fires.
@@ -175,6 +180,13 @@ await() { # await <name> [max_seconds]
 status_of() { # status_of <name>
   (cd "$REPO" && "$BIN/forge-status" --json 2>/dev/null \
     | jq -r --arg n "$1" '.[] | select(.name==$n) | .status')
+}
+
+# The status as it sits on disk, without going through forge-status — which
+# reaps stale workers as a side effect of reading. Needed to assert on the
+# state BEFORE any reader has run.
+status_of_raw() { # status_of_raw <name>
+  jq -r '.status // empty' "$REPO/.forge/agents/$1.json" 2>/dev/null
 }
 
 # --- test driver -------------------------------------------------------------
@@ -713,9 +725,7 @@ t_wait_timeout_shows_feedback() {
     '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"is that worker stuck"}'
   # A worker stuck in `running` that no process will ever finish: the state
   # file is written directly, so the timeout path is reached in one second.
-  mkdir -p "$REPO/.forge/agents"
-  printf '%s\n' '{"name":"stuck","status":"running","branch":"agent/stuck","kind":"build","title":"stuck"}' \
-    > "$REPO/.forge/agents/stuck.json"
+  _fake_stuck_worker stuck
   forge wait --timeout 1
   assert_rc 2 "$RC" "timeout still exits 2"
   assert_contains "$OUT" "still active: stuck" "the stuck worker is named"
@@ -727,9 +737,7 @@ t_wait_timeout_shows_feedback() {
 t_wait_timeout_omits_the_table() {
   _write_feedback \
     '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"a note"}'
-  mkdir -p "$REPO/.forge/agents"
-  printf '%s\n' '{"name":"stuck","status":"running","branch":"agent/stuck","kind":"build","title":"stuck"}' \
-    > "$REPO/.forge/agents/stuck.json"
+  _fake_stuck_worker stuck
   forge wait --timeout 1
   case "$OUT" in
     *"MODEL/EFFORT"*) no "the timeout path reprinted the whole worker table" ;;
@@ -742,9 +750,7 @@ t_wait_timeout_quiet_after_ack() {
   _write_feedback \
     '{"time":"2026-10-29T09:54:24","author":"klient","agent":"","text":"handled already"}'
   forge status --ack
-  mkdir -p "$REPO/.forge/agents"
-  printf '%s\n' '{"name":"stuck","status":"running","branch":"agent/stuck","kind":"build","title":"stuck"}' \
-    > "$REPO/.forge/agents/stuck.json"
+  _fake_stuck_worker stuck
   forge wait --timeout 1
   assert_rc 2 "$RC" "timeout exits 2"
   case "$OUT" in
@@ -1747,6 +1753,204 @@ t_usage_json_is_valid_when_empty() {
     && ok || no "forge-usage --json did not produce a JSON array"
 }
 
+# --- stale workers (interrupted) ---------------------------------------------
+# A worker's status is written by forge-run, inside the worker's own tmux
+# window. If that process dies without reaching its final lines (reboot, tmux
+# server crash, machine asleep, a hand-typed `tmux kill-window`), the status
+# stays `running` forever: nothing else ever writes it. Measured before the
+# fix — the agent held a FORGE_MAX_WORKERS slot permanently and forge-wait
+# blocked on it for its whole 1800s default.
+
+# Spawns a worker that will not exit on its own, waits until it is running,
+# then kills its window the way a crash would — behind forge's back.
+orphan_a_worker() { # orphan_a_worker <name>
+  local n="$1" i=0 st
+  write_fake_codex "$FAKEBIN/codex" hang
+  forge spawn "$n" "task for $n"
+  # Wait for forge-run to have written status=running, so the test is not
+  # racing the window's own startup.
+  while [[ $i -lt 60 ]]; do
+    st="$(status_of "$n")"
+    [[ "$st" == running ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+  tmux kill-window -t "$FORGE_SESSION:$n" 2>/dev/null || true
+  # tmux is asynchronous about reaping the window; wait for it to be gone so
+  # the assertions below test the reaper and not tmux's own timing.
+  i=0
+  while [[ $i -lt 40 ]]; do
+    tmux list-windows -t "$FORGE_SESSION" -F '#W' 2>/dev/null \
+      | grep -qxF "$n" || break
+    sleep 0.25; i=$((i+1))
+  done
+}
+
+t_status_reaps_a_dead_worker() {
+  orphan_a_worker orphan
+  assert_eq "running" "$(status_of_raw orphan)" "status in the file before any reader runs"
+  forge status
+  assert_rc 0 "$RC" "forge-status with a dead worker"
+  assert_eq "interrupted" "$(status_of orphan)" "dead worker is reclassified"
+  assert_contains "$OUT" "marked interrupted" "status explains what it changed"
+}
+
+t_interrupted_is_distinct_from_failed() {
+  # The two must not be conflated: `failed` means the model ran and did not
+  # succeed, and its log says why. `interrupted` means the run never finished,
+  # so the log explains nothing. forge-retry treats both as retryable, but the
+  # operator needs to tell "the task is hard" from "my laptop slept".
+  orphan_a_worker orphan
+  forge status
+  assert_eq "interrupted" "$(status_of orphan)" "not recorded as failed"
+  # The status it was reclassified FROM is kept, so the record is not lost.
+  local from
+  from="$(cd "$REPO" && "$BIN/forge-status" --json \
+          | jq -r '.[] | select(.name=="orphan") | .interrupted_from')"
+  assert_eq "running" "$from" "the status it was interrupted from is recorded"
+}
+
+t_dead_worker_frees_the_spawn_slot() {
+  # The bug this exists for: a dead worker counted against FORGE_MAX_WORKERS
+  # forever, so the limit was eaten by workers that no longer existed and no
+  # further spawn was possible without --force.
+  export FORGE_MAX_WORKERS=1
+  orphan_a_worker orphan
+  write_fake_codex "$FAKEBIN/codex"        # back to the default "ok" mode
+  forge spawn second "a task that should be allowed to start"
+  assert_rc 0 "$RC" "spawn after the only slot's worker died"
+  assert_eq "interrupted" "$(status_of orphan)" "the dead worker was reclassified"
+  unset FORGE_MAX_WORKERS
+}
+
+t_wait_does_not_block_on_a_dead_worker() {
+  # forge-wait polls for a status that nothing is alive to write, so without
+  # the reap it sits out its entire timeout. A short timeout keeps the test
+  # fast while still proving the point: it must return 0 (all finished), not
+  # 2 (timed out).
+  orphan_a_worker orphan
+  forge wait --timeout 20 orphan
+  assert_rc 0 "$RC" "forge-wait returns rather than timing out"
+  assert_eq "interrupted" "$(status_of orphan)" "the worker it was waiting on"
+}
+
+t_live_worker_is_not_reaped() {
+  # The reaper must key on the window, so a worker that is merely slow is left
+  # alone. Without this the fix would kill every running worker.
+  write_fake_codex "$FAKEBIN/codex" hang
+  forge spawn slowpoke "a task that takes a while"
+  local i=0
+  while [[ $i -lt 60 ]]; do
+    [[ "$(status_of slowpoke)" == running ]] && break
+    sleep 0.25; i=$((i+1))
+  done
+  forge status
+  assert_eq "running" "$(status_of slowpoke)" "a live worker keeps its status"
+  assert_contains "$OUT" "slowpoke" "and is still listed"
+  (cd "$REPO" && "$BIN/forge-cancel" slowpoke >/dev/null 2>&1) || true
+}
+
+t_reaper_matches_window_names_exactly() {
+  # A worker named "api" must not be kept alive by an unrelated window named
+  # "api-tests": the window list is matched with grep -x, not a substring.
+  orphan_a_worker api
+  tmux new-window -d -t "$FORGE_SESSION:" -n api-tests "sleep 60" 2>/dev/null || true
+  forge status
+  assert_eq "interrupted" "$(status_of api)" "a prefix-sharing window does not shield it"
+  tmux kill-window -t "$FORGE_SESSION:api-tests" 2>/dev/null || true
+}
+
+t_interrupted_worker_can_be_retried() {
+  orphan_a_worker orphan
+  forge status                             # reclassify
+  write_fake_codex "$FAKEBIN/codex"        # default "ok": the retry should finish
+  forge retry orphan
+  assert_rc 0 "$RC" "forge-retry accepts an interrupted worker"
+  local st; st="$(await orphan 40)"
+  assert_eq "done" "$st" "the retried worker completes"
+}
+
+t_reap_survives_a_missing_tmux_session() {
+  # After a reboot the whole tmux server is gone, not just one window. tmux
+  # then exits 1 with no output for list-windows, which must read as "no live
+  # workers", not as an error that aborts forge-status under `set -e`.
+  orphan_a_worker orphan
+  tmux kill-session -t "$FORGE_SESSION" 2>/dev/null || true
+  forge status
+  assert_rc 0 "$RC" "forge-status with no tmux session at all"
+  assert_eq "interrupted" "$(status_of orphan)" "reclassified with the session gone"
+}
+
+# --- worker environment forwarding -------------------------------------------
+
+t_worker_env_list_is_complete() {
+  # Mechanical, and the real guard behind this: tmux new-window inherits the
+  # tmux SERVER's environment, so any variable not passed with -e never
+  # reaches the worker — silently. The list used to be duplicated in
+  # forge-spawn and forge-retry, and both copies were missing
+  # FORGE_LOCK_TIMEOUT and FORGE_AGY_FLOOR even though forge-lib.sh, sourced
+  # by forge-run inside the window, reads them.
+  #
+  # So instead of naming variables here, derive what the worker-side code
+  # actually reads and require the list to cover it. A new ${FORGE_*} read in
+  # forge-run or forge-lib.sh fails this test until it is forwarded.
+  local derived declared missing
+  derived="$(grep -hoE '\$\{FORGE_[A-Z_]+' \
+               "$FORGE_HOME/bin/forge-run" "$FORGE_HOME/bin/forge-lib.sh" \
+             | sed 's/\${//' | sort -u)"
+  declared="$(sed -n '/^FORGE_WORKER_ENV="/,/"$/p' "$FORGE_HOME/bin/forge-lib.sh" \
+              | tr -d '"' | sed 's/^FORGE_WORKER_ENV=//' \
+              | tr ' ' '\n' | grep -E '^FORGE_' | sort -u)"
+  # FORGE_HOME is set by forge-lib.sh from its own path, so it is never
+  # inherited and must not be forwarded.
+  derived="$(printf '%s\n' "$derived" | grep -vxF FORGE_HOME || true)"
+  missing="$(comm -23 <(printf '%s\n' "$derived") <(printf '%s\n' "$declared"))"
+  [[ -z "$missing" ]] && ok || no \
+    "read by worker-side code but not in FORGE_WORKER_ENV: $(printf '%s' "$missing" | tr '\n' ' ')"
+}
+
+t_worker_env_defined_once() {
+  # The list exists in exactly one place. Two copies drift: that is how the
+  # missing variables above went unnoticed in both.
+  local spawn_copies retry_copies
+  spawn_copies="$(grep -c 'FORGE_CODEX_CMD FORGE_CODEX_ARGS' "$FORGE_HOME/bin/forge-spawn" || true)"
+  retry_copies="$(grep -c 'FORGE_CODEX_CMD FORGE_CODEX_ARGS' "$FORGE_HOME/bin/forge-retry" || true)"
+  assert_eq "0" "$spawn_copies" "forge-spawn no longer keeps its own copy of the list"
+  assert_eq "0" "$retry_copies" "forge-retry no longer keeps its own copy of the list"
+  grep -q '^FORGE_WORKER_ENV=' "$FORGE_HOME/bin/forge-lib.sh" \
+    && ok || no "FORGE_WORKER_ENV is not defined in forge-lib.sh"
+}
+
+t_worker_env_reaches_the_worker() {
+  # End to end, through a real tmux window: the value of a forwarded variable
+  # must arrive in the worker, not merely be named in the source.
+  #
+  # FORGE_REPORT_DIR is the probe because forge-run — which runs INSIDE the
+  # window — reads it and creates that directory before invoking the provider.
+  # So the directory existing in the worktree proves the value crossed the tmux
+  # boundary. The report file itself is not asserted on: the fake provider
+  # writes to a hardcoded "reports/", so it would prove nothing either way.
+  export FORGE_REPORT_DIR=handoff
+  forge spawn envcheck "a task whose report directory is set by the operator"
+  local st; st="$(await envcheck 40)"
+  assert_eq "done" "$st" "worker finished"
+  [[ -d "$FORGE_WT_ROOT/envcheck/handoff" ]] && ok \
+    || no "FORGE_REPORT_DIR did not reach the worker: $FORGE_WT_ROOT/envcheck/handoff was never created"
+  unset FORGE_REPORT_DIR
+}
+
+t_worker_env_forwards_values_with_spaces() {
+  # FORGE_AGY_FLOOR and FORGE_AGY_COMMANDS are space-separated lists, so the
+  # -e arguments are read line by line rather than word-split. Word-splitting
+  # would turn "cd echo ls" into three arguments and corrupt the window's
+  # environment.
+  local out
+  out="$(cd "$REPO" && FORGE_AGY_FLOOR="cd echo ls cat" bash -c '
+    source "'"$FORGE_HOME"'/bin/forge-lib.sh" >/dev/null 2>&1
+    tmux_worker_env' 2>/dev/null | grep -A1 -x -- '-e' | grep FORGE_AGY_FLOOR)"
+  assert_contains "$out" "FORGE_AGY_FLOOR=cd echo ls cat" \
+    "a space-separated value stays one argument"
+}
+
 # =============================================================================
 
 echo
@@ -1998,6 +2202,31 @@ t_doctor_checks_registered_tests_exist() {
 # five days. FORGE.md says to read feedback every round; nothing surfaced it
 # where the orchestrator looks.
 
+# A worker that is genuinely alive but will never finish, for the tests that
+# need forge-wait to reach its TIMEOUT path. The state file alone is not
+# enough any more: forge-wait reclassifies a queued/running agent whose tmux
+# window is gone as `interrupted` and returns, which is correct behaviour and
+# the opposite of what these tests want to exercise. So a real window is
+# opened under the agent's name, and the wait then times out as it would on a
+# worker that is merely slow.
+_fake_stuck_worker() { # _fake_stuck_worker <name>
+  local n="$1"
+  mkdir -p "$REPO/.forge/agents"
+  printf '%s\n' "{\"name\":\"$n\",\"status\":\"running\",\"branch\":\"agent/$n\",\"kind\":\"build\",\"title\":\"$n\"}" \
+    > "$REPO/.forge/agents/$n.json"
+  tmux has-session -t "$FORGE_SESSION" 2>/dev/null \
+    || tmux new-session -d -s "$FORGE_SESSION" -n orchestrator 2>/dev/null || true
+  tmux new-window -d -t "$FORGE_SESSION:" -n "$n" "sleep 120" 2>/dev/null || true
+  # The reaper reads the window list, so the window must be listed before the
+  # test proceeds or it would race tmux's own startup.
+  local i=0
+  while [[ $i -lt 40 ]]; do
+    tmux list-windows -t "$FORGE_SESSION" -F '#W' 2>/dev/null \
+      | grep -qxF "$n" && break
+    sleep 0.25; i=$((i+1))
+  done
+}
+
 _write_feedback() { # _write_feedback <json-line>...
   mkdir -p "$REPO/.forge"
   : > "$REPO/.forge/feedback.jsonl"
@@ -2228,17 +2457,24 @@ exit 0
 
 t_plan_is_forwarded_to_the_worker_window() {
   # Regression: a worker runs in a NEW tmux window, which inherits only the
-  # variables forge-spawn passes with -e. FORGE_NO_PLAN was not on that list,
-  # so `export FORGE_NO_PLAN=1` in this script never reached forge-run and the
-  # plan reading ran anyway — overwriting the worker's ARGV.txt. Asserted on
-  # both spawn paths because forge-retry keeps its own copy of the list.
+  # variables passed with -e. FORGE_NO_PLAN was not on that list, so
+  # `export FORGE_NO_PLAN=1` in this script never reached forge-run and the
+  # plan reading ran anyway — overwriting the worker's ARGV.txt.
+  #
+  # The list used to be duplicated in forge-spawn and forge-retry, so this
+  # checked both files for the name. It now lives once in forge-lib.sh as
+  # FORGE_WORKER_ENV (see worker-env-defined-once), and both spawn paths build
+  # their -e arguments from it via tmux_worker_env — so the invariant to assert
+  # is that the variable is in that list and that each path uses it.
+  grep -q 'FORGE_NO_PLAN' "$FORGE_HOME/bin/forge-lib.sh" \
+    && ok || no "FORGE_NO_PLAN is not in FORGE_WORKER_ENV (forge-lib.sh)"
   local missing=""
   local f
   for f in forge-spawn forge-retry; do
-    grep -q "FORGE_NO_PLAN" "$FORGE_HOME/bin/$f" || missing="$missing $f"
+    grep -q 'tmux_worker_env' "$FORGE_HOME/bin/$f" || missing="$missing $f"
   done
   [[ -z "$missing" ]] && ok \
-    || no "FORGE_NO_PLAN is not forwarded to the worker window by:$missing"
+    || no "these spawn paths do not pass the worker environment to tmux:$missing"
 }
 
 run_test plan-codex-null-windows       t_plan_ignores_codex_records_with_no_windows
@@ -2267,6 +2503,24 @@ run_test plan-forwarded-to-worker       t_plan_is_forwarded_to_the_worker_window
 run_test usage-reports-antigravity      t_usage_reports_antigravity_from_worker
 run_test usage-total-derived            t_usage_total_is_derived_not_trusted
 run_test usage-json-valid-when-empty    t_usage_json_is_valid_when_empty
+
+echo
+echo "stale workers (interrupted)"
+run_test status-reaps-dead-worker       t_status_reaps_a_dead_worker
+run_test interrupted-not-failed         t_interrupted_is_distinct_from_failed
+run_test dead-worker-frees-slot         t_dead_worker_frees_the_spawn_slot
+run_test wait-skips-dead-worker         t_wait_does_not_block_on_a_dead_worker
+run_test live-worker-not-reaped         t_live_worker_is_not_reaped
+run_test reaper-exact-window-match      t_reaper_matches_window_names_exactly
+run_test interrupted-can-be-retried     t_interrupted_worker_can_be_retried
+run_test reap-without-tmux-session      t_reap_survives_a_missing_tmux_session
+
+echo
+echo "worker environment forwarding"
+run_test worker-env-list-complete       t_worker_env_list_is_complete
+run_test worker-env-defined-once        t_worker_env_defined_once
+run_test worker-env-reaches-worker      t_worker_env_reaches_the_worker
+run_test worker-env-spaces-survive      t_worker_env_forwards_values_with_spaces
 
 # The dashboard is an HTTP server, so its tests start the real process and
 # speak HTTP to it; that reads far better in Python than in bash assertions.

@@ -173,6 +173,116 @@ ensure_session() {
     || tmux new-session -d -s "$FORGE_SESSION" -n orchestrator -c "$ROOT"
 }
 
+# The worker-facing environment, passed to tmux with -e.
+#
+# tmux new-window inherits the tmux SERVER's environment, not the calling
+# shell's, so a variable not named here never reaches the worker — silently,
+# which is the whole hazard. Kept in one place because forge-spawn and
+# forge-retry both start workers and a list that exists twice drifts: when this
+# was duplicated, FORGE_LOCK_TIMEOUT and FORGE_AGY_FLOOR were missing from both
+# copies even though forge-lib.sh (sourced by forge-run, inside the window)
+# reads them.
+#
+# The rule for adding one: if any code reachable from forge-run reads it, it
+# belongs here. test/forge-test asserts that mechanically against the sources,
+# so a new ${FORGE_*} read in forge-run or forge-lib.sh fails the suite until
+# it is added.
+FORGE_WORKER_ENV="FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS
+FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS FORGE_AGY_FLOOR
+FORGE_REPORT_DIR FORGE_KEEP_WINDOW FORGE_NO_PLAN FORGE_LOCK_TIMEOUT
+FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION"
+
+# tmux_worker_env — prints the -e arguments for the variables that are set.
+# Output is word-split by the caller, so it carries no value containing
+# whitespace; none of the above is a list with spaces except FORGE_AGY_COMMANDS
+# and FORGE_AGY_FLOOR, which is why the caller reads this into an array with
+# the newline-delimited form below instead.
+tmux_worker_env() {
+  local v
+  for v in $FORGE_WORKER_ENV; do
+    [[ -n "${!v:-}" ]] && printf -- '-e\n%s=%s\n' "$v" "${!v}"
+  done
+  return 0
+}
+
+# --- stale workers -------------------------------------------------------------
+# A worker's status is written by forge-run, which runs inside the worker's own
+# tmux window. Every terminal status (done/failed/nochanges/exhausted) is
+# therefore written by the same process that is doing the work — so if that
+# process dies without running its last lines, the status stays `running`
+# forever. A reboot, a tmux server crash, the machine going to sleep, or a
+# hand-typed `tmux kill-window` all do that.
+#
+# Measured: killing a running worker's window leaves it `running` indefinitely.
+# It then counts against FORGE_MAX_WORKERS forever (so the spawn limit is eaten
+# by workers that no longer exist) and forge-wait blocks on it for the full
+# 1800s default waiting for a status that nothing will ever write.
+#
+# The ground truth is the tmux window. forge-spawn creates it with
+# `tmux new-window` BEFORE returning (verified: the window is listed by the
+# time the command exits), so there is no window-not-yet-up race for a worker
+# whose state file already says queued/running.
+#
+# Deliberately a distinct status, `interrupted`, not `failed`:
+#   - `failed` means the model ran and did not succeed. Its log explains why,
+#     and forge-retry extends the brief with that log.
+#   - `interrupted` means the run never got to finish. There is nothing to
+#     learn from the log and nothing was decided about the task.
+# Both are retryable, and forge-retry accepts both, but the operator needs to
+# tell "the task is hard" from "my laptop slept".
+reaped_stale=""
+
+# tmux_window_names — one window name per line, empty if the session or the
+# whole tmux server is gone. Both cases exit 1 with no output, which is the
+# correct reading: no windows means no live workers.
+tmux_window_names() {
+  tmux list-windows -t "$FORGE_SESSION" -F '#W' 2>/dev/null || true
+}
+
+# reap_stale — marks queued/running agents whose tmux window is gone as
+# `interrupted`. Sets $reaped_stale to the names it changed, so a caller can
+# report them. Safe to call repeatedly: an agent already moved out of
+# queued/running is not considered again.
+#
+# Called by the commands that READ worker state and would otherwise act on a
+# lie: forge-status (shows it), forge-wait (blocks on it) and forge-spawn
+# (counts it against the limit). Not called by forge-run, which IS the worker.
+reap_stale() {
+  reaped_stale=""
+  local windows f name status
+  shopt -s nullglob
+  local files=("$STATE"/agents/*.json)
+  [[ ${#files[@]} -gt 0 ]] || return 0
+
+  # Read the window list once, not per agent: with the session gone this is a
+  # failed tmux call, and doing it per worker made forge-status visibly slow.
+  windows="$(tmux_window_names)"
+
+  for f in "${files[@]}"; do
+    status="$(jq -r '.status // empty' "$f" 2>/dev/null)"
+    case "$status" in queued|running) ;; *) continue ;; esac
+    name="$(jq -r '.name // empty' "$f" 2>/dev/null)"
+    [[ -n "$name" ]] || continue
+    # grep -x against the whole list: a worker named "api" must not be kept
+    # alive by a window named "api-tests".
+    printf '%s\n' "$windows" | grep -qxF "$name" && continue
+    agent_set "$name" status=interrupted \
+      finished="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+      interrupted_from="$status"
+    reaped_stale="$reaped_stale $name"
+  done
+  return 0
+}
+
+# Prints a one-line note about what reap_stale just changed, to stderr so it
+# never lands in --json output.
+report_stale() {
+  [[ -n "$reaped_stale" ]] || return 0
+  info "marked interrupted (tmux window gone, status will never be written):$reaped_stale"
+  info "  retry with: forge-retry <name>   (or forge-drop <name> to discard)"
+  return 0
+}
+
 # --- providers -----------------------------------------------------------------
 # A provider is a CLI that can run a worker non-interactively. Each one differs
 # in three ways that forge has to know about, so they are kept together here

@@ -85,7 +85,10 @@ BIN = os.path.dirname(os.path.abspath(__file__))
 ACTION_CMDS = {
     "cancel": ("forge-cancel", ("queued", "running")),
     "merge":  ("forge-merge", ("done", "cancelled", "nochanges")),
-    "retry":  ("forge-retry", ("failed", "exhausted", "nochanges", "cancelled")),
+    # interrupted: the worker's window died, so nothing will ever write its
+    # real status. Retrying is the normal response and forge-retry accepts it.
+    "retry":  ("forge-retry", ("failed", "exhausted", "nochanges", "cancelled",
+                               "interrupted")),
 }
 ACTION_TIMEOUT = 120  # forge-merge can take a while on a large tree
 ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
@@ -386,9 +389,10 @@ def build_state():
         agents.append(a)
     # exhausted ranks beside failed: both need the operator, but an
     # exhausted worker needs only a later retry, not a new brief.
+    # interrupted ranks beside failed/exhausted: all three need the operator.
     order = {"running": 0, "queued": 1, "conflict": 2, "failed": 3,
-             "exhausted": 4, "done": 5, "cancelled": 6, "nochanges": 7,
-             "merged": 8, "dropped": 9}
+             "exhausted": 4, "interrupted": 5, "done": 6, "cancelled": 7,
+             "nochanges": 8, "merged": 9, "dropped": 10}
     agents.sort(key=lambda a: (order.get(a.get("status"), 9), a.get("created", "")))
     feedback = []
     try:
@@ -667,7 +671,7 @@ color:var(--ink);border:1px solid var(--line);border-radius:5px}
 <script>
 const T=new URLSearchParams(location.search).get('t')||'';
 const q=p=>p+(T?(p.includes('?')?'&':'?')+'t='+encodeURIComponent(T):'');
-const C={running:'--run',queued:'--idle',done:'--ok',merged:'--ok',failed:'--bad',exhausted:'--warn',conflict:'--warn',cancelled:'--warn',nochanges:'--idle',dropped:'--idle'};
+const C={running:'--run',queued:'--idle',done:'--ok',merged:'--ok',failed:'--bad',exhausted:'--warn',interrupted:'--warn',conflict:'--warn',cancelled:'--warn',nochanges:'--idle',dropped:'--idle'};
 const el=(t,cls,txt)=>{const e=document.createElement(t);if(cls)e.className=cls;if(txt!=null)e.textContent=txt;return e};
 const open=new Set();
 const fmtTok=n=>n>=1e6?(n/1e6).toFixed(2)+'M':n>=1e3?(n/1e3).toFixed(1)+'k':String(n);
@@ -759,7 +763,7 @@ try{document.getElementById('author').value=localStorage.getItem('forge-author')
 // Which action applies to which status — the same table the server holds. The
 // server is still the authority: it re-checks and answers 409 if this is stale.
 const ACTS={cancel:['queued','running'],merge:['done','cancelled','nochanges'],
-            retry:['failed','exhausted','nochanges','cancelled']};
+            retry:['failed','exhausted','nochanges','cancelled','interrupted']};
 let ACTIONS_ON=false;
 function actions(a){
   const avail=Object.keys(ACTS).filter(k=>ACTS[k].includes(a.status));

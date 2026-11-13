@@ -574,6 +574,43 @@ class TestActionsEnabled(DashboardCase):
         # drop must not be reachable: it discards work irreversibly.
         self.assertEqual(["cancel", "merge", "retry"], d["allowed"])
 
+    def test_client_and_server_action_tables_agree(self):
+        """The page gates its buttons on its own copy of the status table.
+
+        The server is the authority — it re-checks and answers 409 — but a
+        client copy missing a status simply never offers the button, so the
+        action becomes unreachable from the page with no error anywhere. That
+        is how `interrupted` was first added to ACTION_CMDS and not to the
+        page's ACTS, leaving an interrupted worker with no retry button.
+        Compared mechanically so the two cannot drift again.
+
+        Both sides are read out of the source: the server table via ast, the
+        page's via a regex over the embedded JS, because the page is a string
+        literal and not Python.
+        """
+        with open(DASHBOARD, encoding="utf-8") as f:
+            src = f.read()
+
+        server = {}
+        for node in ast.walk(ast.parse(src)):
+            if not isinstance(node, ast.Assign):
+                continue
+            if not any(getattr(t, "id", "") == "ACTION_CMDS" for t in node.targets):
+                continue
+            for key, val in zip(node.value.keys, node.value.values):
+                # value is (command, (status, ...)); only the statuses matter.
+                server[ast.literal_eval(key)] = set(ast.literal_eval(val)[1])
+        self.assertTrue(server, "ACTION_CMDS was not found in forge-dashboard")
+
+        m = re.search(r"const ACTS=\{(.*?)\};", src, re.S)
+        self.assertIsNotNone(m, "the page's ACTS table was not found")
+        client = {}
+        for action, body in re.findall(r"(\w+):\[([^\]]*)\]", m.group(1)):
+            client[action] = set(re.findall(r"'([^']+)'", body))
+
+        self.assertEqual(server, client,
+                         "the page's ACTS and the server's ACTION_CMDS disagree")
+
     def test_drop_is_not_an_available_action(self):
         code, _ = self.post("/api/action",
                             {"action": "drop", "agent": "alpha"})

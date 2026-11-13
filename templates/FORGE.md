@@ -76,6 +76,10 @@ told to change code will change code it should only have read.
    - `cancelled` → stopped mid-task, so its acceptance check never ran. Read the
      partial diff: salvage it with `forge-merge` only if it stands on its own,
      otherwise re-brief the remaining work as a new task.
+   - `interrupted` → the run never finished: its tmux window is gone (reboot,
+     tmux crash, machine asleep), so nothing was left alive to write a status.
+     The brief was never the problem and the log explains nothing, so do NOT
+     re-brief. `forge-retry <name>` continues from whatever is in the worktree.
    When an analysis worker is meant to check another worker's output
    **independently**, spawn it with `--base` pointing at the original base rather
    than at that worker's branch, so it does not inherit its reasoning — give it

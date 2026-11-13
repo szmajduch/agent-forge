@@ -35,12 +35,15 @@ status="$(agent_get "$name" status)"
 # A running worker must not be restarted underneath itself: two processes in one
 # worktree would interleave their writes. Cancel it first, deliberately.
 case "$status" in
-  failed|exhausted|nochanges|cancelled) ;;
+  # `interrupted` is a worker whose run never finished (window killed, reboot,
+  # machine asleep). Retrying it is the normal response, and the default
+  # continue-mode is right: its worktree still holds whatever it had written.
+  failed|exhausted|nochanges|cancelled|interrupted) ;;
   queued|running) die "agent '$name' is still $status — forge-cancel it first, then retry" ;;
   done)   die "agent '$name' finished successfully — forge-review it, or forge-drop and respawn to redo the task" ;;
   merged) die "agent '$name' is already merged — spawn a new agent for follow-up work" ;;
   dropped) die "agent '$name' was dropped: its worktree and branch are gone, so there is nothing to continue" ;;
-  *) die "agent '$name' has status '${status:-unknown}' — only failed/exhausted/nochanges/cancelled workers can be retried" ;;
+  *) die "agent '$name' has status '${status:-unknown}' — only failed/exhausted/nochanges/cancelled/interrupted workers can be retried" ;;
 esac
 
 wt="$(agent_get "$name" worktree)"
@@ -114,20 +117,17 @@ agent_set "$name" status=queued attempt="$attempt" \
   retried="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
 ensure_session
-# Same whitelist as forge-spawn: tmux new-window inherits the tmux server's
-# environment, not this shell's, so worker-facing variables are passed with -e
-# or they never arrive.
+# The same worker environment forge-spawn passes, from the one list in
+# forge-lib.sh: tmux new-window inherits the tmux server's environment, not
+# this shell's, so these are passed with -e or they never arrive.
 tmux_env=()
-for v in FORGE_CODEX_CMD FORGE_CODEX_ARGS FORGE_CLAUDE_CMD FORGE_CLAUDE_ARGS \
-         FORGE_AGY_CMD FORGE_AGY_ARGS FORGE_AGY_COMMANDS \
-         FORGE_REPORT_DIR FORGE_KEEP_WINDOW FORGE_NO_PLAN \
-         FORGE_MODELS_FILE FORGE_COMMANDS_FILE FORGE_WT_ROOT FORGE_SESSION; do
-  [[ -n "${!v:-}" ]] && tmux_env+=(-e "$v=${!v}")
-done
+while IFS= read -r _line; do
+  [[ -n "$_line" ]] && tmux_env+=("$_line")
+done < <(tmux_worker_env)
 # Guarded expansion, not "${tmux_env[@]}": under set -u bash 3.2 (macOS) treats
 # an empty array as unbound and aborts. It happens to be non-empty today only
-# because forge-lib.sh always defines FORGE_SESSION and that is on the list
-# above — remove it from the list and the bare form would break every spawn.
+# because forge-lib.sh always defines FORGE_SESSION and that is on the list —
+# remove it from the list and the bare form would break every spawn.
 tmux new-window -d ${tmux_env[@]+"${tmux_env[@]}"} -t "$FORGE_SESSION:" -n "$name" -c "$wt" \
   "$FORGE_HOME/bin/forge-run '$name'"
 
