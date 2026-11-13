@@ -135,17 +135,33 @@ fi
 head2 "worker visibility (what a fresh worktree would contain)"
 # Workers start from a commit, so an uncommitted role file does not exist for
 # them — this is the single most common "but I wrote the rules" surprise.
-uncommitted=()
+uncommitted=(); absent=()
 for f in PROJECT.md CLAUDE.md AGENTS.md FORGE.md .claude/settings.json; do
-  [[ -e "$f" ]] || continue
+  # A file that does not exist used to be skipped, which made the whole
+  # section pass by vacuum: with no role files at all the list stayed empty and
+  # this printed "workers will see them". Measured on a partial setup — three
+  # role files committed and AGENTS.md (the WORKER's own rules) missing — the
+  # section reported ok while "project files" above reported BROKEN for the
+  # same file. This section answers "will a worker see the rules", so a missing
+  # rule file is the strongest possible no.
+  #
+  # Tracked apart from the uncommitted ones because the fix differs: a missing
+  # file needs forge-init, an uncommitted one needs a commit.
+  [[ -e "$f" ]] || { absent+=("$f"); continue; }
   git -C "$ROOT" ls-files --error-unmatch "$f" >/dev/null 2>&1 || { uncommitted+=("$f"); continue; }
   git -C "$ROOT" diff --quiet -- "$f" 2>/dev/null || uncommitted+=("$f (modified)")
 done
-if [[ ${#uncommitted[@]} -eq 0 ]]; then
+if [[ ${#absent[@]} -eq 0 && ${#uncommitted[@]} -eq 0 ]]; then
   ok "role files are committed — workers will see them"
 else
-  caution "not committed, so invisible to workers: ${uncommitted[*]}"
-  note "git add -A && git commit -m 'forge setup'"
+  if [[ ${#absent[@]} -gt 0 ]]; then
+    caution "missing, so no worker can read them: ${absent[*]}"
+    note "run: forge-init"
+  fi
+  if [[ ${#uncommitted[@]} -gt 0 ]]; then
+    caution "not committed, so invisible to workers: ${uncommitted[*]}"
+    note "git add -A && git commit -m 'forge setup'"
+  fi
 fi
 
 head2 "git state"
@@ -203,9 +219,18 @@ else
     caution "models.conf lists no models — --model is disabled, codex uses its default"
   else
     ok "$count model(s) configured ($(models_workers | grep -c . || true) usable as workers)"
-    # A typo in the provider column makes every spawn of that model fail, and
-    # the message would otherwise come from deep inside forge-run.
-    while IFS=$'\t' read -r mname mprov mrole mdesc; do
+    # Read models.conf RAW, not through models_list. models_list sanitizes:
+    # an unrecognised provider or role is silently rewritten to codex/worker
+    # (forge-lib.sh), so a check fed from it can never see a typo — these two
+    # nope() calls were unreachable. Measured: a line naming provider
+    # "badprov" was reported as "ok 1 model(s) configured", and the model then
+    # ran on codex. The old comment here claimed such a typo "makes every
+    # spawn of that model fail"; in fact the spawn succeeds on the wrong
+    # provider, which is worse, because nothing says so.
+    #
+    # Parsing mirrors models_list's own skip rules: comments, blank lines, and
+    # the `default`/`slug` keyword lines, which are not models.
+    while read -r mname mprov mrole _rest; do
       [[ -n "$mname" ]] || continue
       provider_known "$mprov" \
         || nope "model '$mname' names unknown provider '$mprov' (use codex, claude or antigravity)"
@@ -213,7 +238,7 @@ else
         worker|orchestrator|both) ;;
         *) nope "model '$mname' has invalid role '$mrole' (use worker, orchestrator or both)" ;;
       esac
-    done <<< "$(models_list)"
+    done < <(awk '/^[[:space:]]*(#|$)/ {next} $1=="default" || $1=="slug" {next} {print}' "$MODELS_FILE")
     if [[ -z "$def" ]]; then
       caution "no 'default' line — a spawn without --model uses codex's default"
     elif model_allowed "$def"; then
@@ -305,7 +330,14 @@ else
       claude) pargs=(-p ${FORGE_CLAUDE_ARGS:---permission-mode acceptEdits} "Reply with exactly: FORGE_OK") ;;
       antigravity)
         aslug="$(provider_slug antigravity "$(models_workers | awk -F'\t' '$2=="antigravity"{print $1; exit}')")"
-        pargs=(${FORGE_AGY_ARGS:---output-format json} ${aslug:+--model "$aslug"} -p="Reply with exactly: FORGE_OK") ;;
+        # stream-json, matching forge-run's default. This said `json`, so the
+        # one check that claims to verify "the flags forge actually passes"
+        # verified a format forge does not use — and json vs stream-json is
+        # precisely the difference that cost four workers' worth of diagnosis
+        # on agy denials. Same drift the duplicated worker-env list and the
+        # client/server action tables already had, so the suite now asserts
+        # the two defaults agree.
+        pargs=(${FORGE_AGY_ARGS:---output-format stream-json} ${aslug:+--model "$aslug"} -p="Reply with exactly: FORGE_OK") ;;
     esac
     note "running: $cmd ${pargs[*]:0:4} ..."
     out="$("$cmd" "${pargs[@]}" 2>&1 </dev/null || true)"

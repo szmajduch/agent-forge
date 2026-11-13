@@ -1111,6 +1111,102 @@ EOF
   assert_contains "$OUT" "role files are committed" "doctor confirms worker visibility"
 }
 
+t_doctor_does_not_pass_without_role_files() {
+  # The section is headed "what a fresh worktree would contain" and answers
+  # "will a worker see the rules". A missing file used to be SKIPPED, so with
+  # no role files the list stayed empty and it printed "workers will see them"
+  # — passing by vacuum. No forge init here on purpose: this is a bare repo.
+  forge doctor
+  case "$OUT" in
+    *"role files are committed"*)
+      no "doctor claimed workers will see role files that do not exist" ;;
+    *) ok ;;
+  esac
+  assert_contains "$OUT" "missing, so no worker can read them" \
+    "doctor says the role files are absent"
+}
+
+t_doctor_reports_a_partial_role_setup() {
+  # The dangerous shape, because it does not look broken: most role files
+  # present and committed, AGENTS.md — the WORKER's own rules — missing.
+  # Measured before the fix: "project files" reported BROKEN for AGENTS.md
+  # while "worker visibility" reported ok for the same file in the same run.
+  forge init >/dev/null 2>&1
+  rm -f "$REPO/AGENTS.md"
+  (cd "$REPO" && git add -A >/dev/null 2>&1 && git commit -qm "drop AGENTS.md" >/dev/null 2>&1)
+  forge doctor
+  case "$OUT" in
+    *"role files are committed"*)
+      no "doctor passed worker visibility with AGENTS.md missing" ;;
+    *) ok ;;
+  esac
+  assert_contains "$OUT" "AGENTS.md" "the missing worker rule file is named"
+}
+
+t_doctor_rejects_an_unknown_provider_in_models_conf() {
+  # These checks were unreachable: forge-doctor read models.conf through
+  # models_list, which silently rewrites an unrecognised provider to codex, so
+  # the validator only ever saw sanitized values. Measured: a line naming
+  # "badprov" was reported "ok 1 model(s) configured" and the model then ran
+  # on codex — the typo changed the provider instead of failing.
+  printf 'mx	badprov	worker	desc
+' > "$TMPROOT/$CURRENT_TEST/bad-models.conf"
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" \
+         FORGE_MODELS_FILE="$TMPROOT/$CURRENT_TEST/bad-models.conf" \
+         "$BIN/forge-doctor" 2>&1)"
+  RC=$?
+  set -e
+  assert_contains "$OUT" "names unknown provider 'badprov'" \
+    "a typo in the provider column is reported"
+  assert_rc 1 "$RC" "an unusable models.conf is broken, not a warning"
+}
+
+t_doctor_rejects_an_invalid_role_in_models_conf() {
+  printf 'mx	codex	badrole	desc
+' > "$TMPROOT/$CURRENT_TEST/bad-role.conf"
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" \
+         FORGE_MODELS_FILE="$TMPROOT/$CURRENT_TEST/bad-role.conf" \
+         "$BIN/forge-doctor" 2>&1)"
+  set -e
+  assert_contains "$OUT" "has invalid role 'badrole'" \
+    "a typo in the role column is reported"
+}
+
+t_doctor_accepts_the_shipped_models_conf() {
+  # The other direction: reading models.conf raw must not invent complaints
+  # about the real file. Its own format (comments, blank lines, default and
+  # slug keyword lines) has to be skipped exactly as models_list skips it.
+  set +e
+  OUT="$(cd "$REPO" && PATH="$FAKEBIN:$PATH" \
+         FORGE_MODELS_FILE="$FORGE_HOME/models.conf" "$BIN/forge-doctor" 2>&1)"
+  set -e
+  case "$OUT" in
+    *"names unknown provider"*|*"has invalid role"*)
+      no "doctor complained about the shipped models.conf" ;;
+    *) ok ;;
+  esac
+}
+
+t_doctor_smoke_test_uses_the_real_agy_format() {
+  # forge-doctor --spawn calls itself "the flags forge actually passes", so its
+  # agy default must be forge-run's. It was --output-format json while
+  # forge-run sends stream-json, and that exact difference is what hid which
+  # command agy had denied, at four workers' worth of diagnosis. Asserted
+  # against the sources because running it would call a real model.
+  #
+  # Same drift as the duplicated worker-env list and the client/server action
+  # tables, both of which now have a mechanical check; this is that check.
+  local run_fmt doc_fmt
+  run_fmt="$(grep -o 'FORGE_AGY_ARGS:---output-format [a-z-]*' "$FORGE_HOME/bin/forge-run" | head -1)"
+  doc_fmt="$(grep -o 'FORGE_AGY_ARGS:---output-format [a-z-]*' "$FORGE_HOME/bin/forge-doctor" | head -1)"
+  [[ -n "$run_fmt" ]] || no "could not find forge-run's agy output-format default"
+  [[ -n "$doc_fmt" ]] || no "could not find forge-doctor's agy output-format default"
+  assert_eq "$run_fmt" "$doc_fmt" \
+    "forge-doctor --spawn tests the same agy output format forge-run uses"
+}
+
 t_doctor_detects_uncommitted_role_files() {
   forge init >/dev/null 2>&1
   forge doctor
@@ -2304,6 +2400,12 @@ echo "forge-doctor"
 run_test doctor-flags-missing-roles     t_doctor_flags_missing_role_files
 run_test doctor-passes-after-init       t_doctor_passes_after_init
 run_test doctor-detects-uncommitted     t_doctor_detects_uncommitted_role_files
+run_test doctor-no-roles-not-ok         t_doctor_does_not_pass_without_role_files
+run_test doctor-partial-role-setup      t_doctor_reports_a_partial_role_setup
+run_test doctor-bad-provider            t_doctor_rejects_an_unknown_provider_in_models_conf
+run_test doctor-bad-role                t_doctor_rejects_an_invalid_role_in_models_conf
+run_test doctor-accepts-shipped-models  t_doctor_accepts_the_shipped_models_conf
+run_test doctor-spawn-agy-format        t_doctor_smoke_test_uses_the_real_agy_format
 run_test doctor-crlf-only-unprotected   t_doctor_warns_only_about_unprotected_crlf
 run_test doctor-rejects-unknown-option  t_doctor_rejects_unknown_option
 
