@@ -726,6 +726,38 @@ t_agent_set_survives_concurrent_writers() {
     && ok || no "a lock or temp file was left behind"
 }
 
+t_agent_set_trap_does_not_free_another_writers_lock() {
+  # The cause of three CI failures on 2026-11-13 (19, 16 and 17 of 20 keys
+  # surviving, ubuntu only). agent_set released its lock and cleared its EXIT
+  # trap as two separate statements, so in between it no longer owned the lock
+  # while its trap still said to delete it. A writer exiting in that window
+  # removed the lock a DIFFERENT writer had just taken, so two writers sat in
+  # the critical section, both read the same file, and the later mv dropped the
+  # earlier one's key — valid JSON, no leftover locks, N keys missing, which is
+  # precisely what CI reported.
+  #
+  # Asserted on the mechanism rather than by running 20 writers and hoping: the
+  # concurrent test above never reproduced it locally in 15 consecutive runs,
+  # so a count-based test here would pass whether or not the bug were present.
+  local d="$TMPROOT/$CURRENT_TEST/trap" lock
+  mkdir -p "$d"; lock="$d/thelock"
+  (
+    mkdir "$lock" 2>/dev/null
+    local lock_held=1
+    trap '[[ -n "${lock_held:-}" ]] && rm -rf "$lock"' EXIT
+    lock_held=""
+    rm -rf "$lock"
+    sleep 0.4          # exit happens inside the release/`trap -` window
+  ) &
+  local apid=$!
+  sleep 0.15
+  mkdir "$lock" 2>/dev/null   # a second writer takes the lock
+  wait "$apid"
+  [[ -d "$lock" ]] && ok \
+    || no "a writer's EXIT trap deleted a lock another writer held"
+  rm -rf "$lock"
+}
+
 t_agent_set_reclaims_a_dead_holders_lock() {
   # A worker killed mid-write (Ctrl-C, tmux window closed) leaves the lock
   # directory on disk. Without reclaim every later write would block forever.
@@ -2420,6 +2452,7 @@ echo "state, isolation, reporting"
 run_test forge-state-git-excluded       t_forge_state_is_git_excluded
 run_test agent-set-concurrent           t_agent_set_survives_concurrent_writers
 run_test agent-set-reclaims-dead-lock   t_agent_set_reclaims_a_dead_holders_lock
+run_test agent-set-trap-keeps-ownership t_agent_set_trap_does_not_free_another_writers_lock
 run_test agent-set-waits-live-holder    t_agent_set_waits_for_a_live_holder
 run_test refuses-tool-directory         t_refuses_to_run_in_the_tool_directory
 run_test works-from-worktree            t_works_from_inside_a_worktree

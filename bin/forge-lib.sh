@@ -121,13 +121,34 @@ agent_set() {
   # The trap covers a kill between here and the release below: without it the
   # directory would outlive the process and every later write would pay the
   # full timeout before stealing it.
-  trap 'rm -rf "$lock"; rm -f "$tmp"' EXIT INT TERM
+  #
+  # It must NOT remove the lock unconditionally. The release and `trap -` are
+  # two statements, so between them this process no longer owns the lock while
+  # its trap still says to delete it — and an EXIT in that window deleted the
+  # lock a DIFFERENT writer had just taken, putting two writers in the critical
+  # section at once. Both then read the same $f and the later mv won, losing
+  # the earlier writer's key. That is exactly the signature CI showed: valid
+  # JSON, no leftover locks, N of 20 keys missing (19, 16 and 17 in three runs),
+  # on ubuntu only, with no reclaim or timeout message in the log because
+  # neither path was involved.
+  #
+  # Proven directly: a subshell that released its lock, then exited before
+  # clearing its trap, deleted a second process's freshly taken lock.
+  #
+  # $lock_held is the guard. It is set while this process owns the lock and
+  # cleared the instant it lets go, so the trap can only ever remove a lock
+  # that is still ours.
+  local lock_held=1
+  trap '[[ -n "${lock_held:-}" ]] && rm -rf "$lock"; rm -f "$tmp"' EXIT INT TERM
   # Inside the lock, so a concurrent writer cannot create it between the test
   # and the write.
   [[ -f "$f" ]] || echo '{}' > "$f"
   jq "${args[@]}" "$filter" "$f" > "$tmp" && mv "$tmp" "$f"
   local rc=$?
   rm -f "$tmp"
+  # Cleared BEFORE the directory goes away, never after: the ownership flag has
+  # to stop being true no later than the moment the lock stops being ours.
+  lock_held=""
   rm -rf "$lock"
   trap - EXIT INT TERM
   return $rc
