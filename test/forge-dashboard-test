@@ -503,6 +503,82 @@ class TestTokenAuth(DashboardCase):
         self.assertIn("authed", [f["text"] for f in self.feedback_lines()])
 
 
+class TestMalformedRequestBody(DashboardCase):
+    """Content-Length is caller-supplied and need not describe the body.
+
+    Both hazards were reachable by anyone who could reach the port, and
+    neither needed a token to be set:
+
+    - A non-numeric Content-Length made int() raise. On /api/action that was
+      outside the try block, so the handler died with a traceback instead of
+      answering.
+    - A Content-Length LARGER than the body made rfile.read(n) block waiting
+      for bytes that never arrive. Measured with curl: the request never
+      returned and the serving thread stayed parked, one leaked thread per
+      request, with no token and no actions needed to do it.
+
+    Written against a raw socket because urllib always sends a Content-Length
+    that matches the body it is given, so it cannot express either case.
+    """
+
+    env_extra = {"FORGE_DASH_ACTIONS": "1"}
+
+    def raw_request(self, head, body=b"", timeout=25):
+        """Send head+body verbatim and return the status line, or "" on a
+        closed connection."""
+        with socket.create_connection(("127.0.0.1", self.port), timeout) as sk:
+            sk.settimeout(timeout)
+            sk.sendall(head.encode() + body)
+            chunk = b""
+            try:
+                while b"\r\n" not in chunk:
+                    part = sk.recv(4096)
+                    if not part:
+                        break
+                    chunk += part
+            except socket.timeout:
+                return "TIMEOUT"
+        return chunk.split(b"\r\n")[0].decode(errors="replace")
+
+    def test_non_numeric_content_length_on_action_is_answered(self):
+        line = self.raw_request(
+            "POST /api/action HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: abc\r\nConnection: close\r\n\r\n")
+        # 400 for the unparseable body; what matters is that it ANSWERS.
+        self.assertIn("400", line, "got %r" % line)
+
+    def test_non_numeric_content_length_on_feedback_is_answered(self):
+        line = self.raw_request(
+            "POST /api/feedback HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 12x\r\nConnection: close\r\n\r\n")
+        self.assertIn("400", line, "got %r" % line)
+
+    def test_overstated_content_length_on_action_does_not_hang(self):
+        # The handler's socket timeout is 10s, deliberately shorter than a
+        # client's patience; 25s here leaves room for it without being
+        # indefinite. Before the fix this blocked until the client gave up.
+        line = self.raw_request(
+            "POST /api/action HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 500\r\nConnection: close\r\n\r\n", b"{}")
+        self.assertNotEqual("TIMEOUT", line, "the request hung")
+
+    def test_overstated_content_length_on_feedback_does_not_hang(self):
+        line = self.raw_request(
+            "POST /api/feedback HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 500\r\nConnection: close\r\n\r\n",
+            b'{"text":"hi"}')
+        self.assertNotEqual("TIMEOUT", line, "the request hung")
+
+    def test_server_survives_a_stalled_body(self):
+        # The point of the timeout: the thread is released, so later requests
+        # are served normally rather than queueing behind a parked one.
+        self.raw_request(
+            "POST /api/feedback HTTP/1.1\r\nHost: t\r\n"
+            "Content-Length: 500\r\nConnection: close\r\n\r\n", b"{")
+        code, _, _ = self.get("/api/state")
+        self.assertEqual(200, code)
+
+
 class TestLogsHidden(DashboardCase):
     """FORGE_DASH_LOGS=0 — what a client-facing dashboard must not leak.
 

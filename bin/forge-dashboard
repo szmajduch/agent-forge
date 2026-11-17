@@ -417,6 +417,20 @@ def build_state():
 class H(BaseHTTPRequestHandler):
     server_version = "forge"
 
+    # socketserver passes this to the connection socket, so a caller that
+    # opens a connection and then sends nothing — or sends fewer body bytes
+    # than its Content-Length promised — releases the serving thread instead
+    # of holding it forever. Without it the server leaked one thread per such
+    # request: measured, a POST with Content-Length 5 and a 2-byte body never
+    # returned and left its thread parked on the read.
+    #
+    # 10s, not 30: the number has to be shorter than the caller's own patience
+    # or the fix is invisible to them. At 30 a browser or curl gives up first
+    # and the request still looks hung from the outside, even though the
+    # server does recover. 10s is far longer than a real body takes to arrive
+    # over a tunnel and short enough that the client sees the answer.
+    timeout = 10
+
     def log_message(self, *a):
         pass
 
@@ -448,16 +462,54 @@ class H(BaseHTTPRequestHandler):
         return (hmac.compare_digest(q.encode("utf-8", "surrogatepass"), tok)
                 or hmac.compare_digest(h.encode("utf-8", "surrogatepass"), tok))
 
+    def read_body(self, limit=20_000):
+        """The request body, or b"" when there is nothing trustworthy to read.
+
+        Two hazards, both triggerable by any caller:
+
+        - Content-Length need not be a number. int("abc") raises ValueError,
+          and on /api/action that was outside the try block, so the handler
+          died with a traceback instead of answering 400.
+        - Content-Length may OVERSTATE the body. rfile.read(n) blocks until it
+          has n bytes, so a header claiming 5 bytes with 2 bytes sent left the
+          request hanging; measured with curl, it never returned, and the
+          serving thread stayed parked on the read. Reading exactly what the
+          header claims is only safe with a socket timeout (set on the class
+          below) AND by accepting a short read, which read1-style looping does
+          not guarantee either — so the read is capped and a short body is
+          simply what it is.
+        """
+        raw = self.headers.get("Content-Length", "")
+        try:
+            n = int(raw)
+        except (TypeError, ValueError):
+            return b""
+        if n <= 0:
+            return b""
+        try:
+            return self.rfile.read(min(n, limit))
+        except Exception:
+            return b""
+
     def send(self, code, body, ctype="application/json"):
         b = body if isinstance(body, bytes) else body.encode()
-        self.send_response(code)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.send_header("Referrer-Policy", "no-referrer")
-        self.send_header("Content-Length", str(len(b)))
-        self.end_headers()
-        self.wfile.write(b)
+        # A client that has already hung up is an ordinary event, not a fault:
+        # a browser tab closed mid-poll, or a caller that timed out waiting.
+        # Unguarded, the write raised BrokenPipeError (or ConnectionResetError)
+        # and socketserver printed a full traceback per occurrence, so normal
+        # use filled the dashboard log with noise that looks like a defect and
+        # buries a real one.
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", ctype + "; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("Content-Length", str(len(b)))
+            self.end_headers()
+            self.wfile.write(b)
+        except (BrokenPipeError, ConnectionResetError):
+            self.close_connection = True
 
     def do_GET(self):
         if not self.authed():
@@ -575,8 +627,7 @@ class H(BaseHTTPRequestHandler):
             return self.send(401, '{"error":"unauthorized"}')
         path = urlparse(self.path).path
         if path == "/api/action":
-            n = min(int(self.headers.get("Content-Length", 0)), 20_000)
-            return self.run_action(self.rfile.read(n))
+            return self.run_action(self.read_body())
         if path != "/api/feedback":
             return self.send(404, '{"error":"not found"}')
         # One note every couple of seconds per caller is plenty for a human and
@@ -584,8 +635,7 @@ class H(BaseHTTPRequestHandler):
         if not self.take_rate_token():
             return self.send(429, '{"error":"too many requests"}')
         try:
-            n = min(int(self.headers.get("Content-Length", 0)), 20_000)
-            d = json.loads(self.rfile.read(n))
+            d = json.loads(self.read_body())
             text = str(d.get("text", "")).strip()[:4000]
             if not text:
                 return self.send(400, '{"error":"empty"}')
