@@ -68,6 +68,18 @@ if [[ $fresh -eq 1 ]]; then
   # irreversible for anything uncommitted, so it is never the default.
   git -C "$wt" reset -q --hard "$base_sha"
   git -C "$wt" clean -qfd
+  # The brief has to be reset as well, not just the tree. A continuing retry
+  # REWRITES $task_file in place with its continuation note and keeps the
+  # pristine text in $task_file.orig, so after `forge-retry x` the file on disk
+  # says "CONTINUE from that state" and quotes the previous attempt's git
+  # status. A later `forge-retry x --fresh` wiped that state from the worktree
+  # but served the brief as it stood, handing the worker a note describing work
+  # that no longer existed — the one thing --fresh exists to avoid.
+  # Unreachable with a single retry, which is why the --fresh test above
+  # (spawn, fail, --fresh) passed throughout.
+  if [[ -f "$task_file.orig" ]]; then
+    cp "$task_file.orig" "$task_file"
+  fi
   # Previous attempts live on the branch; keep them reachable for review rather
   # than resetting the branch ref itself.
   info "reset $wt to $base_sha (attempt $attempt, fresh start)"

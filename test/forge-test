@@ -1430,6 +1430,54 @@ XEOF
   assert_contains "$seen" "the original brief line" "original brief preserved"
 }
 
+t_retry_fresh_after_a_continue_restores_the_brief() {
+  # --fresh means "the original brief, unchanged". A plain retry rewrites
+  # $STATE/tasks/<name>.md in place with its continuation note, keeping the
+  # pristine copy in <name>.md.orig. A later --fresh reset the worktree but
+  # read the brief straight off disk, so it handed the worker the PREVIOUS
+  # attempt's note — telling it to continue from work that --fresh had just
+  # deleted, and quoting a git status that no longer described the tree.
+  #
+  # Only reachable in this order (continue, then fresh), which is why the
+  # single-retry --fresh test above never caught it.
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+printf '%s' "$*" > "$PWD/prompt-seen.txt"
+echo "junk" > junk.txt
+exit 7
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge spawn rt7 "the only brief that is real"
+  assert_eq "failed" "$(await rt7)" "first attempt failed"
+
+  forge retry rt7
+  assert_eq "failed" "$(await rt7)" "continuing retry failed too"
+  local seen; seen="$(cat "$FORGE_WT_ROOT/rt7/prompt-seen.txt" 2>/dev/null || true)"
+  assert_contains "$seen" "RETRY — attempt 2" "the continuing retry did carry a note"
+
+  cat > "$FAKEBIN/codex" <<'XEOF'
+#!/usr/bin/env bash
+printf '%s' "$*" > "$PWD/prompt-seen.txt"
+mkdir -p reports; echo "# fresh" > reports/rt7.md
+XEOF
+  chmod +x "$FAKEBIN/codex"
+  forge retry rt7 --fresh
+  assert_rc 0 "$RC" "forge-retry --fresh after a continue"
+  assert_eq "done" "$(await rt7)" "fresh retry finished"
+  assert_no_file "$FORGE_WT_ROOT/rt7/junk.txt" "junk discarded by --fresh"
+
+  seen="$(cat "$FORGE_WT_ROOT/rt7/prompt-seen.txt" 2>/dev/null || true)"
+  assert_contains "$seen" "the only brief that is real" "fresh brief keeps the task"
+  case "$seen" in
+    *"RETRY — attempt"*) no "--fresh served the previous attempt's continuation note" ;;
+    *) ok ;;
+  esac
+  case "$seen" in
+    *"CONTINUE from that state"*) no "--fresh told the worker to continue from deleted work" ;;
+    *) ok ;;
+  esac
+}
+
 t_retry_refuses_running_worker() {
   cat > "$FAKEBIN/codex" <<'XEOF'
 #!/usr/bin/env bash
@@ -2412,6 +2460,7 @@ echo "forge-retry"
 run_test retry-continues-partial-work   t_retry_continues_and_keeps_partial_work
 run_test retry-fresh-resets-worktree    t_retry_fresh_resets_the_worktree
 run_test retry-does-not-stack-notes     t_retry_does_not_stack_notes
+run_test retry-fresh-after-continue     t_retry_fresh_after_a_continue_restores_the_brief
 run_test retry-refuses-running          t_retry_refuses_running_worker
 run_test retry-refuses-done-unknown     t_retry_refuses_done_and_unknown
 run_test retry-rejects-bad-options      t_retry_rejects_bad_options
