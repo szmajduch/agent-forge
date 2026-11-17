@@ -143,6 +143,25 @@ class DashboardCase(unittest.TestCase):
         for v in ("FORGE_DASH_TOKEN", "FORGE_DASH_LOGS", "FORGE_DASH_ACTIONS",
                   "FORGE_TUNNEL", "FORGE_REPORT_DIR"):
             env.pop(v, None)
+        # No plan readings. The dashboard refreshes plan quota from a
+        # BACKGROUND THREAD, which calls forge-plan, which runs the real
+        # provider CLIs — `claude -p /usage` and `agy -p /usage` against the
+        # operator's own account. Nothing here stubs them: the redirected HOME
+        # above only hides the on-disk codex cache, while claude and agy are
+        # taken from the developer's PATH and asked over the network.
+        #
+        # Observed while this suite ran: `agy -p /usage` started and prompted
+        # the operator to log in, mid-test-run. That spends real plan quota and
+        # waits on a sign-in that no test can answer, so a suite run could hang
+        # on a machine where a provider's session had expired.
+        #
+        # test/forge-test has set this from the start, for the same reason
+        # stated there ("a test suite must not touch the operator's account").
+        # This one did not, so the isolation was only half present.
+        #
+        # Set before env_extra so a test that specifically wants a reading can
+        # still override it.
+        env["FORGE_NO_PLAN"] = "1"
         env.update(cls.env_extra)
         # Output goes to a FILE, not a PIPE. A pipe nobody drains deadlocks the
         # server the moment it fills — and an interpreter that emits a warning
