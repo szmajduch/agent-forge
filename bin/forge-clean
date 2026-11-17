@@ -122,8 +122,22 @@ for n in "${names[@]}"; do
     git -C "$ROOT" branch -q -D "$br" 2>/dev/null || true
   fi
 
-  rm -f "$STATE/agents/$n.json" "$STATE/tasks/$n.md" \
-        "$STATE/logs/$n.log" "$STATE/logs/$n.report.md"
+  # Every per-worker file, not just the four this once listed. forge writes
+  # more than that and the rest were left behind, so a "cleaned" worker still
+  # owned files under .forge and the directories grew with every round:
+  #   tasks/<n>.md.orig      the pristine brief, saved by the first forge-retry
+  #   usage/<n>.json         the antigravity token/denial record
+  #   usage/<n>.plan.json    the plan delta computed around the run
+  #   usage/<n>.plan-*.json  the before/after readings, left if the run died
+  #                          between them (forge-run only removes them on the
+  #                          path where it computes the delta)
+  # Listed by exact name rather than with a <n>* glob: a worker named "api"
+  # must not take "api-tests" with it, and a glob is one typo away from that.
+  rm -f "$STATE/agents/$n.json" \
+        "$STATE/tasks/$n.md" "$STATE/tasks/$n.md.orig" \
+        "$STATE/logs/$n.log" "$STATE/logs/$n.report.md" \
+        "$STATE/usage/$n.json" "$STATE/usage/$n.plan.json" \
+        "$STATE/usage/$n.plan-before.json" "$STATE/usage/$n.plan-after.json"
   removed=$((removed+1))
   echo "removed $n ($st)"
 done

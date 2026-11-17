@@ -1095,6 +1095,43 @@ t_clean_removes_failed_worker_leftovers() {
   assert_no_file "$FORGE_WT_ROOT/cl6" "failed worker's worktree cleaned"
 }
 
+t_clean_leaves_no_state_behind() {
+  # forge-clean removed four files per worker by name — agents/<n>.json,
+  # tasks/<n>.md, logs/<n>.log, logs/<n>.report.md — and forge writes more
+  # than that. Left behind:
+  #   tasks/<n>.md.orig    the pristine brief, saved by the first forge-retry
+  #   usage/<n>.json       the antigravity token/denial record
+  #   usage/<n>.plan*.json the plan readings taken around the run
+  # So a cleaned worker still owned files in .forge, its name could not be
+  # fully reused, and the directories grew without bound across rounds. The
+  # whole point of forge-clean is that a cleaned worker leaves nothing.
+  write_fake_codex "$FAKEBIN/codex" fail
+  forge spawn cl8 "will fail"
+  assert_eq "failed" "$(await cl8)" "worker failed"
+
+  # A retry creates the .orig copy; the usage files are written by providers
+  # this test does not run, so they are created directly — the question here
+  # is whether forge-clean removes what is in those directories, not which
+  # provider put it there.
+  forge retry cl8
+  assert_eq "failed" "$(await cl8)" "retried worker failed again"
+  assert_file "$REPO/.forge/tasks/cl8.md.orig" "retry saved the pristine brief"
+  mkdir -p "$REPO/.forge/usage"
+  echo '{}' > "$REPO/.forge/usage/cl8.json"
+  echo '{}' > "$REPO/.forge/usage/cl8.plan.json"
+  echo '{}' > "$REPO/.forge/usage/cl8.plan-before.json"
+
+  forge clean --finished --yes
+  assert_rc 0 "$RC" "clean after a retry"
+  assert_no_file "$REPO/.forge/agents/cl8.json" "agent state removed"
+  assert_no_file "$REPO/.forge/tasks/cl8.md" "brief removed"
+  assert_no_file "$REPO/.forge/tasks/cl8.md.orig" "pristine brief removed"
+  assert_no_file "$REPO/.forge/logs/cl8.log" "log removed"
+  assert_no_file "$REPO/.forge/usage/cl8.json" "usage record removed"
+  assert_no_file "$REPO/.forge/usage/cl8.plan.json" "plan delta removed"
+  assert_no_file "$REPO/.forge/usage/cl8.plan-before.json" "partial plan reading removed"
+}
+
 t_clean_rejects_unknown_option() {
   forge clean --bogus
   assert_rc 1 "$RC" "forge-clean --bogus"
@@ -2474,6 +2511,7 @@ run_test clean-nothing-to-do            t_clean_reports_nothing_to_do
 run_test clean-confirms-unmerged        t_clean_requires_confirmation_for_unmerged
 run_test clean-finished-with-yes        t_clean_finished_scope_with_yes
 run_test clean-removes-failed-leftovers t_clean_removes_failed_worker_leftovers
+run_test clean-leaves-no-state           t_clean_leaves_no_state_behind
 run_test clean-rejects-unknown-option   t_clean_rejects_unknown_option
 
 echo
