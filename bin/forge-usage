@@ -169,6 +169,60 @@ def _check_total(rec, claimed):
     rec["note"] = f"provider total {claimed} != parts {rec['total']}"
 
 
+# Fields an aggregate sums. `sessions` is a count, not a sum, and is handled
+# separately; `reasoning` is carried for display only and is NOT part of TOTAL
+# (see _TOTAL_PARTS) — it is summed here so a caller can show it, never so it
+# can be added in.
+AGG_FIELDS = ("total", "input", "output", "cached", "cache_write", "reasoning")
+
+
+def aggregate(recs, key=None):
+    """Sum records into groups, newest-heaviest first.
+
+    One implementation, because there were two: this command's table and the
+    dashboard's usage panel each had their own copy of the same loop, and they
+    had already drifted — the CLI summed `reasoning`, the dashboard did not,
+    and only the dashboard counted `sessions`. The same reason ACTION_CMDS is
+    a single table in forge-dashboard: one rule per operation, not two that
+    can disagree about what a number means.
+
+    `key` maps a record to its group key and defaults to (provider, model as
+    displayed). The group key's parts are copied onto the aggregate under the
+    names `provider` and `model` for the default key, so a caller can render a
+    row without unpacking the tuple.
+
+    Returns a list of dicts, sorted by total descending — the order both
+    callers want, since the expensive model is the one worth seeing first.
+    """
+    if key is None:
+        def key(r):
+            return (r.get("provider", ""), display_model(r.get("model")))
+    per = {}
+    for r in recs:
+        k = key(r)
+        agg = per.get(k)
+        if agg is None:
+            agg = per[k] = {f: 0 for f in AGG_FIELDS}
+            agg["sessions"] = 0
+            # Convenience for the common 2-tuple key: its parts are copied
+            # out under the names a caller renders by. Anything else keeps
+            # the key itself under "key".
+            #
+            # Only one of the two is set, deliberately. These rows are
+            # serialised straight into the dashboard's /api/state, where a
+            # redundant field is one more thing for the page to misread — and
+            # a tuple key would arrive there as a JSON array, i.e. a second,
+            # differently-typed copy of provider and model.
+            if isinstance(k, tuple) and len(k) == 2:
+                agg["provider"], agg["model"] = k
+            else:
+                agg["key"] = k
+        for f in AGG_FIELDS:
+            agg[f] += _n(r.get(f))
+        agg["sessions"] += 1
+    return sorted(per.values(), key=lambda a: -a["total"])
+
+
 def _codex_sessions(since):
     """Read codex rollout logs.
 
@@ -376,15 +430,26 @@ def _short_model(model):
     return m
 
 
-def _display_model(model):
+def display_model(model):
     """The name to show, which is not always the context-window key.
 
     _short_model deliberately collapses ids onto a window key; for display
     that would erase the distinction the operator needs most — agy-sonnet
     (Google credits) vs sonnet (Claude subscription) are the same model on
     two different bills.
+
+    Public, unlike its neighbours: forge-dashboard imports this module and
+    needs this name, so the underscore was a lie about the boundary. The
+    module's API for a consumer is collect / aggregate / display_model /
+    derived_total; everything else is a provider detail that may change with
+    the provider.
     """
     return model or "unknown"
+
+
+# The old private name, kept so nothing that still imports it breaks. New
+# callers use display_model.
+_display_model = display_model
 
 
 def _in_scope(rec, root):
@@ -456,20 +521,13 @@ def main():
         return 0
 
     # Per model, because that is what the question "how much did this cost"
-    # actually turns on — a provider total hides an expensive model.
-    per = {}
-    for r in recs:
-        key = (r["provider"], _display_model(r["model"]))
-        agg = per.setdefault(key, {"total": 0, "input": 0, "output": 0,
-                                   "cached": 0, "reasoning": 0, "sessions": 0})
-        for f in ("total", "input", "output", "cached", "reasoning"):
-            agg[f] += r[f]
-        agg["sessions"] += 1
-
+    # actually turns on — a provider total hides an expensive model. The
+    # grouping itself lives in aggregate(), shared with the dashboard.
     print(f"{'PROVIDER':11} {'MODEL':20} {'SESS':>4} {'TOTAL':>8} {'IN':>8} "
           f"{'OUT':>8} {'CACHED':>8} {'REASON':>8}")
-    for (prov, model), agg in sorted(per.items(), key=lambda kv: -kv[1]["total"]):
-        print(f"{prov:11} {model[:20]:20} {agg['sessions']:>4} {_fmt(agg['total']):>8} "
+    for agg in aggregate(recs):
+        print(f"{agg['provider']:11} {agg['model'][:20]:20} {agg['sessions']:>4} "
+              f"{_fmt(agg['total']):>8} "
               f"{_fmt(agg['input']):>8} {_fmt(agg['output']):>8} "
               f"{_fmt(agg['cached']):>8} {_fmt(agg['reasoning']):>8}")
 
@@ -483,7 +541,7 @@ def main():
     print(f"{'PROVIDER':11} {'MODEL':20} {'CONTEXT HELD':>13}  SESSION")
     for r in recs[:15]:
         ctx = _pct(r["last_total"], r["context_window"])
-        print(f"{r['provider']:11} {_display_model(r['model'])[:20]:20} {ctx:>13} "
+        print(f"{r['provider']:11} {display_model(r['model'])[:20]:20} {ctx:>13} "
               f"  {r['session'][:20]}")
 
     # A disagreement between the provider's total and the parts means the CLI

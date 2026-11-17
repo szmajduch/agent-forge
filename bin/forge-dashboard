@@ -318,16 +318,14 @@ def usage_summary():
     else:
         try:
             recs = _USAGE_MOD.collect(root=ROOT, all_scope=False, since_days=0)
-            per = {}
-            for r in recs:
-                key = (r["provider"], _USAGE_MOD._display_model(r["model"]))
-                agg = per.setdefault(key, {"provider": key[0], "model": key[1],
-                                           "total": 0, "input": 0, "output": 0,
-                                           "cached": 0, "sessions": 0})
-                for f in ("total", "input", "output", "cached"):
-                    agg[f] += r[f]
-                agg["sessions"] += 1
-            value["models"] = sorted(per.values(), key=lambda a: -a["total"])
+            # Grouped by forge-usage, not here. This was a second copy of that
+            # command's loop, and the two had already drifted — only the CLI
+            # summed `reasoning` — so the same records could be described one
+            # way on the page and another in a terminal. The module owns what
+            # a token figure means; the page only renders it. The rows carry
+            # more fields than the panel draws, which is fine: an unread field
+            # in /api/state costs nothing, a disagreeing total costs trust.
+            value["models"] = _USAGE_MOD.aggregate(recs)
             for r in recs[:8]:
                 win = r["context_window"]
                 held = r["last_total"]
@@ -339,7 +337,7 @@ def usage_summary():
                 # now lives in plan_summary(), read once, newest wins.
                 value["sessions"].append({
                     "provider": r["provider"],
-                    "model": _USAGE_MOD._display_model(r["model"]),
+                    "model": _USAGE_MOD.display_model(r["model"]),
                     "session": r["session"][:20],
                     "context_pct": pct,
                     "context_window": win,

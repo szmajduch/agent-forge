@@ -3011,6 +3011,98 @@ run_test worker-env-spaces-survive      t_worker_env_forwards_values_with_spaces
 
 # The dashboard is an HTTP server, so its tests start the real process and
 # speak HTTP to it; that reads far better in Python than in bash assertions.
+# --- token accounting: one aggregation, not two -----------------------------
+# forge-usage owns what a token figure means; forge-dashboard renders it. The
+# grouping loop used to exist twice, once in each, and the copies had already
+# drifted (only the CLI summed `reasoning`, only the page counted `sessions`),
+# so the same records could be described two ways. These tests pin the shared
+# entry point and the boundary, because a drift like that is invisible until
+# someone compares a number on the page with the same number in a terminal.
+
+t_usage_aggregate_is_the_shared_grouping() {
+  local out
+  out="$(python3 -I - "$FORGE_HOME/bin/forge-usage" <<'PYEOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("fu", sys.argv[1])
+spec = importlib.util.spec_from_loader("fu", loader)
+m = importlib.util.module_from_spec(spec)
+sys.argv = ["forge-usage"]
+loader.exec_module(m)
+
+# Two providers, the same model name under one of them twice: grouping must
+# merge the pair and keep the providers apart.
+recs = [
+    {"provider": "codex", "model": "gpt-6-astra", "total": 100, "input": 60,
+     "output": 10, "cached": 30, "cache_write": 0, "reasoning": 7},
+    {"provider": "codex", "model": "gpt-6-astra", "total": 50, "input": 30,
+     "output": 5, "cached": 15, "cache_write": 0, "reasoning": 3},
+    {"provider": "claude", "model": "claude-opus-5", "total": 400, "input": 1,
+     "output": 99, "cached": 200, "cache_write": 100, "reasoning": 0},
+]
+rows = m.aggregate(recs)
+
+assert [r["total"] for r in rows] == [400, 150], rows          # biggest first
+assert rows[1]["sessions"] == 2, rows[1]                        # pair merged
+assert rows[1]["reasoning"] == 10, rows[1]                      # reasoning summed
+assert rows[1]["cached"] == 45, rows[1]
+assert rows[0]["cache_write"] == 100, rows[0]                   # and cache_write
+assert {r["provider"] for r in rows} == {"codex", "claude"}
+# Totals are conserved: a grouping that loses or doubles tokens is the whole
+# failure mode this layer exists to prevent.
+assert sum(r["total"] for r in rows) == sum(r["total"] for r in recs)
+# The dashboard serialises these rows into /api/state, so each must carry the
+# names the page renders by, and no tuple for the default grouping.
+assert "key" not in rows[0], rows[0]
+import json; json.dumps(rows)
+print("ok")
+PYEOF
+)" || { no "aggregate() raised: $out"; return; }
+  assert_eq "ok" "$out" "forge-usage.aggregate groups, sums and stays JSON-safe"
+}
+
+t_usage_display_model_is_public() {
+  local out
+  out="$(python3 -I - "$FORGE_HOME/bin/forge-usage" <<'PYEOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("fu", sys.argv[1])
+spec = importlib.util.spec_from_loader("fu", loader)
+m = importlib.util.module_from_spec(spec)
+sys.argv = ["forge-usage"]
+loader.exec_module(m)
+# The name forge-dashboard imports. Public because another command depends on
+# it; the underscore version stays only so nothing already calling it breaks.
+assert m.display_model("claude-opus-5") == "claude-opus-5"
+assert m.display_model("") == "unknown"
+assert m.display_model(None) == "unknown"
+assert m._display_model is m.display_model
+print("ok")
+PYEOF
+)" || { no "display_model raised: $out"; return; }
+  assert_eq "ok" "$out" "forge-usage.display_model is public and handles no model"
+}
+
+t_dashboard_does_not_reimplement_grouping() {
+  # A grep, deliberately: the defect this guards against is a SECOND copy of
+  # the loop appearing, which no behavioural assertion can see while both
+  # copies happen to agree.
+  if grep -q 'setdefault(key' "$FORGE_HOME/bin/forge-dashboard"; then
+    no "forge-dashboard groups usage records itself again — call forge-usage.aggregate"
+    return
+  fi
+  if grep -q '_USAGE_MOD\._display_model' "$FORGE_HOME/bin/forge-dashboard"; then
+    no "forge-dashboard reaches for the private _display_model — use display_model"
+    return
+  fi
+  assert_contains "$(cat "$FORGE_HOME/bin/forge-dashboard")" \
+    "_USAGE_MOD.aggregate(recs)" "the dashboard groups usage via forge-usage"
+}
+
+echo
+echo "token accounting (one aggregation)"
+run_test usage-aggregate-shared          t_usage_aggregate_is_the_shared_grouping
+run_test usage-display-model-public      t_usage_display_model_is_public
+run_test dashboard-no-second-grouping    t_dashboard_does_not_reimplement_grouping
+
 # They live in their own file but run from here, so `test/forge-test` stays the
 # single entry point and one summary covers everything. A failure there must
 # fail this suite — a green "0 failures" beside a red dashboard would be a lie.
