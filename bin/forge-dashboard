@@ -433,7 +433,20 @@ class H(BaseHTTPRequestHandler):
             return True
         q = parse_qs(urlparse(self.path).query).get("t", [""])[0]
         h = self.headers.get("X-Forge-Token", "")
-        return hmac.compare_digest(q, TOKEN) or hmac.compare_digest(h, TOKEN)
+        # Compared as BYTES, not as str. hmac.compare_digest refuses two str
+        # arguments unless both are ASCII-only and raises TypeError otherwise
+        # ("comparing strings with non-ASCII characters is not supported") —
+        # and the candidate here is whatever the caller sent. Measured: a
+        # request for /api/state?t=%C5%BC raised that TypeError out of
+        # authed(), so no 401 was ever sent; socketserver logged a traceback
+        # and closed the connection, which curl reports as rc 52, empty reply
+        # from server. Any visitor could crash their own request that way, and
+        # a tunnel visitor sending a non-ASCII token saw a broken page rather
+        # than "unauthorized". Encoding both sides keeps the comparison
+        # constant-time while making every possible input comparable.
+        tok = TOKEN.encode("utf-8", "surrogatepass")
+        return (hmac.compare_digest(q.encode("utf-8", "surrogatepass"), tok)
+                or hmac.compare_digest(h.encode("utf-8", "surrogatepass"), tok))
 
     def send(self, code, body, ctype="application/json"):
         b = body if isinstance(body, bytes) else body.encode()

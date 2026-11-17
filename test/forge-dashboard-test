@@ -456,6 +456,36 @@ class TestTokenAuth(DashboardCase):
         code, _, _ = self.get("/api/state?t=s3cret")
         self.assertEqual(401, code)
 
+    def test_non_ascii_query_token_is_401_not_a_crash(self):
+        # hmac.compare_digest refuses two str arguments unless both are
+        # ASCII-only, and the candidate is whatever the caller sent. Comparing
+        # as str raised TypeError out of authed(), so no 401 was ever sent:
+        # socketserver logged a traceback and dropped the connection (curl
+        # reported rc 52, empty reply). Any visitor could do it to themselves,
+        # and the page just looked broken instead of saying "unauthorized".
+        code, _, _ = self.get("/api/state?t=%C5%BC")
+        self.assertEqual(401, code)
+
+    def test_non_ascii_header_token_is_401_not_a_crash(self):
+        # Same defect through the header, which is the OTHER arm of the `or`
+        # and could raise on its own.
+        #
+        # The byte is picked to be latin-1 encodable: http.client encodes
+        # header values as latin-1, so a value like U+017C raises
+        # UnicodeEncodeError in the CLIENT and never reaches the server, which
+        # tests nothing. 0xFF decodes to U+00FF on the server side, which is
+        # non-ASCII and so still unusable by compare_digest as a str.
+        code, _, _ = self.get("/api/state",
+                              headers={"X-Forge-Token": "\u00ff"})
+        self.assertEqual(401, code)
+
+    def test_server_still_serves_after_a_non_ascii_token(self):
+        # The crash killed one connection, so this proves the recovery is real
+        # and not just that the request itself happened to return something.
+        self.get("/api/state?t=%C5%BC")
+        code, _, _ = self.get("/api/state?t=s3cret-token")
+        self.assertEqual(200, code)
+
     def test_query_token_is_accepted(self):
         code, _, _ = self.get("/api/state?t=s3cret-token")
         self.assertEqual(200, code)
