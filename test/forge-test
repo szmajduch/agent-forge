@@ -3012,6 +3012,11 @@ run_test worker-env-spaces-survive      t_worker_env_forwards_values_with_spaces
 # The dashboard is an HTTP server, so its tests start the real process and
 # speak HTTP to it; that reads far better in Python than in bash assertions.
 # --- token accounting: one aggregation, not two -----------------------------
+# NB for anyone adding a test below: these bodies are heredocs inside $( ... ),
+# so bash scans them for quotes. An apostrophe in a Python comment ("the
+# record's total") is an unterminated quote and breaks the whole FILE's parse,
+# with the error reported at the function's opening line rather than the stray
+# quote. Write around it, and run `bash -n test/forge-test` after editing.
 # forge-usage owns what a token figure means; forge-dashboard renders it. The
 # grouping loop used to exist twice, once in each, and the copies had already
 # drifted (only the CLI summed `reasoning`, only the page counted `sessions`),
@@ -3060,6 +3065,58 @@ PYEOF
   assert_eq "ok" "$out" "forge-usage.aggregate groups, sums and stays JSON-safe"
 }
 
+t_usage_reasoning_is_not_billed_volume() {
+  # The reasoning field must never reach TOTAL. Every provider reports it as a
+  # SUBSET of output_tokens rather than alongside it (measured on agy 1.4.11:
+  # Gemini Flash output=55 with thinking=54), so adding it in would double-count
+  # the thinking tokens -- quietly, and only for providers that report them.
+  #
+  # aggregate() sums reasoning so a caller can DISPLAY it, which puts the
+  # field one careless edit away from the sum it must stay out of. The comment
+  # on AGG_FIELDS says so and _TOTAL_PARTS defines it, but nothing enforced it:
+  # this is the assertion that complains.
+  local out
+  out="$(python3 -I - "$FORGE_HOME/bin/forge-usage" <<'PYEOF'
+import importlib.machinery, importlib.util, sys
+loader = importlib.machinery.SourceFileLoader("fu", sys.argv[1])
+spec = importlib.util.spec_from_loader("fu", loader)
+m = importlib.util.module_from_spec(spec)
+sys.argv = ["forge-usage"]
+loader.exec_module(m)
+
+# The invariant at its source: reasoning is not one of the billed buckets.
+assert "reasoning" not in m._TOTAL_PARTS, m._TOTAL_PARTS
+assert m.derived_total({"input": 10, "output": 55, "cached": 0,
+                        "cache_write": 0, "reasoning": 54}) == 65
+
+# And through the grouping, where the field IS summed for display. Two records
+# whose reasoning is large next to their volume: if it were folded in, these
+# totals could only come out too high.
+recs = [
+    {"provider": "agy", "model": "flash", "total": 65, "input": 10,
+     "output": 55, "cached": 0, "cache_write": 0, "reasoning": 54},
+    {"provider": "agy", "model": "flash", "total": 65, "input": 10,
+     "output": 55, "cached": 0, "cache_write": 0, "reasoning": 54},
+]
+row = m.aggregate(recs)[0]
+assert row["total"] == 130, row          # 2x the per-record total
+assert row["reasoning"] == 108, row      # carried, for display
+assert row["total"] == sum(r["total"] for r in recs), row
+# The sum of the billed parts, with reasoning excluded, is what TOTAL means.
+assert row["total"] == row["input"] + row["output"] + row["cached"] \
+                       + row["cache_write"], row
+# A record carrying ONLY reasoning adds nothing to the billed volume.
+only = m.aggregate([{"provider": "agy", "model": "t", "total": 0, "input": 0,
+                     "output": 0, "cached": 0, "cache_write": 0,
+                     "reasoning": 999}])[0]
+assert only["total"] == 0, only
+assert only["reasoning"] == 999, only
+print("ok")
+PYEOF
+)" || { no "reasoning invariant raised: $out"; return; }
+  assert_eq "ok" "$out" "reasoning is displayed but never added into TOTAL"
+}
+
 t_usage_display_model_is_public() {
   local out
   out="$(python3 -I - "$FORGE_HOME/bin/forge-usage" <<'PYEOF'
@@ -3100,6 +3157,7 @@ t_dashboard_does_not_reimplement_grouping() {
 echo
 echo "token accounting (one aggregation)"
 run_test usage-aggregate-shared          t_usage_aggregate_is_the_shared_grouping
+run_test usage-reasoning-not-billed      t_usage_reasoning_is_not_billed_volume
 run_test usage-display-model-public      t_usage_display_model_is_public
 run_test dashboard-no-second-grouping    t_dashboard_does_not_reimplement_grouping
 
